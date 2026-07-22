@@ -1,0 +1,11 @@
+torch
+torchvision
+transformers>=4.57
+accelerate
+huggingface_hub
+segyio
+pillow
+numpy
+scipy
+streamlit
+safetensors
