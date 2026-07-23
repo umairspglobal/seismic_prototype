@@ -33,6 +33,12 @@ class Sam3SeismicSegmenter:
         from transformers import Sam3Model, Sam3Processor  # deferred: heavy import
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but this Python environment has no CUDA-enabled "
+                "PyTorch build. Install a CUDA PyTorch wheel in the active environment "
+                "or select CPU."
+            )
         self.prompts = prompts or config.SEISMIC_PROMPTS
 
         self.model = Sam3Model.from_pretrained(checkpoint).to(self.device)

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import streamlit as st
+import torch
 
 from seismic_app import config
 from seismic_app.inference import Sam3SeismicSegmenter
@@ -50,7 +51,12 @@ def main() -> None:
         options = [str(p) for p in sgy_files] or ["(no .sgy files found in data/)"]
         selected = st.selectbox("Seismic section", options)
         checkpoint = st.text_input("SAM 3 checkpoint", value=config.DEFAULT_CHECKPOINT)
-        device = st.selectbox("Device", ["auto", "cuda", "cpu"], index=0)
+        device_options = ["auto", "cpu"]
+        if torch.cuda.is_available():
+            device_options.insert(1, "cuda")
+        device = st.selectbox("Device", device_options, index=0)
+        if not torch.cuda.is_available():
+            st.caption("CUDA is unavailable in the active Python environment; using CPU.")
         threshold = st.slider(
             "Mask probability threshold", 0.0, 1.0, config.MASK_THRESHOLD, 0.05
         )
@@ -90,10 +96,10 @@ def main() -> None:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Original section")
-        st.image(result.rgb, use_container_width=True)
+        st.image(result.rgb, width="stretch")
     with col2:
         st.subheader("Segmentation overlay")
-        st.image(np.array(overlay.convert("RGB")), use_container_width=True)
+        st.image(np.array(overlay.convert("RGB")), width="stretch")
 
     st.subheader("Detected coverage per feature")
     cols = st.columns(len(config.LABEL_STYLES))
