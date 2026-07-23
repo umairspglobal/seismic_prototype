@@ -16,6 +16,7 @@ from .preprocessing import sgy_to_tiles
 from .sgy_loader import load_2d_section
 from .stitching import binarize, stitch_tiles
 from .visualization import overlay_masks, save_masks_npz, save_overlay_png
+from .vtk_export import export_vti
 
 
 @dataclass
@@ -55,8 +56,10 @@ def process_and_export(
     checkpoint: str = config.DEFAULT_CHECKPOINT,
     device: str | None = None,
     threshold: float = config.MASK_THRESHOLD,
+    trace_spacing: float = 25.0,
+    sample_interval: float = 4.0,
 ) -> SegmentationResult:
-    """Convenience wrapper: run the pipeline and write PNG + NPZ outputs."""
+    """Convenience wrapper: run the pipeline and write PNG + NPZ + VTI outputs."""
     if segmenter is None:
         segmenter = Sam3SeismicSegmenter(checkpoint=checkpoint, device=device)
 
@@ -68,5 +71,11 @@ def process_and_export(
     overlay = overlay_masks(result.rgb, result.masks)
     save_overlay_png(overlay, out_dir / f"{stem}_overlay.png")
     save_masks_npz(result.masks, out_dir / f"{stem}_masks.npz")
+    export_vti(
+        result.masks,
+        out_dir / f"{stem}_masks",
+        trace_spacing=trace_spacing,
+        sample_interval=sample_interval,
+    )
 
     return result

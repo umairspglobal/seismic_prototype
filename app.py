@@ -12,6 +12,7 @@ prompts are fixed in seismic_app/config.py and applied automatically.
 from __future__ import annotations
 
 import io
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ from seismic_app import config
 from seismic_app.inference import Sam3SeismicSegmenter
 from seismic_app.pipeline import run_on_file
 from seismic_app.visualization import overlay_masks
+from seismic_app.vtk_export import export_vti
 
 DATA_DIR = Path("data")
 
@@ -62,6 +64,19 @@ def main() -> None:
         )
         alpha = st.slider("Overlay opacity", 0.0, 1.0, 0.45, 0.05)
         run_clicked = st.button("Run segmentation", type="primary")
+
+        st.divider()
+        st.subheader("ParaView export geometry")
+        st.caption(
+            "Must match the .sgy geometry loaded via ParaView's SegYReader, "
+            "or the mask overlay will appear offset from the seismic."
+        )
+        trace_spacing = st.number_input(
+            "Trace spacing (m)", min_value=0.01, value=25.0, step=1.0
+        )
+        sample_interval = st.number_input(
+            "Sample interval (ms)", min_value=0.01, value=4.0, step=0.5
+        )
 
         st.divider()
         st.subheader("Layers")
@@ -127,6 +142,23 @@ def main() -> None:
         data=npz_buffer.getvalue(),
         file_name=f"{Path(st.session_state.result_path).stem}_masks.npz",
         mime="application/octet-stream",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        vti_path = export_vti(
+            result.masks,
+            Path(tmp_dir) / "masks",
+            trace_spacing=trace_spacing,
+            sample_interval=sample_interval,
+        )
+        vti_bytes = vti_path.read_bytes()
+    st.download_button(
+        "Download masks (.vti for ParaView)",
+        data=vti_bytes,
+        file_name=f"{Path(st.session_state.result_path).stem}_masks.vti",
+        mime="application/octet-stream",
+        help="Open in ParaView, then Threshold by label ID (1=fault, 2=channel, "
+        "3=facies, 4=salt, 5=horizon) to color and toggle each feature.",
     )
 
 

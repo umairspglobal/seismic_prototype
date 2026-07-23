@@ -51,6 +51,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=config.MASK_THRESHOLD,
         help=f"Probability threshold for binarizing masks (default: {config.MASK_THRESHOLD}).",
     )
+    parser.add_argument(
+        "--trace-spacing",
+        type=float,
+        default=25.0,
+        help="Physical spacing between traces in metres, for the exported "
+        ".vti file (default: 25.0). Must match the .sgy geometry loaded in "
+        "ParaView's SegYReader or the mask overlay will appear offset.",
+    )
+    parser.add_argument(
+        "--sample-interval",
+        type=float,
+        default=4.0,
+        help="Sample interval in ms, for the exported .vti file (default: 4.0).",
+    )
     return parser
 
 
@@ -80,12 +94,15 @@ def main(argv: list[str] | None = None) -> int:
                 out_dir,
                 segmenter=segmenter,
                 threshold=args.threshold,
+                trace_spacing=args.trace_spacing,
+                sample_interval=args.sample_interval,
             )
         except Exception as exc:  # noqa: BLE001 - surface per-file failures, keep going
             print(f"  FAILED: {exc}", file=sys.stderr)
             continue
         print(f"  wrote {out_dir / (Path(path).stem + '_overlay.png')}")
         print(f"  wrote {out_dir / (Path(path).stem + '_masks.npz')}")
+        print(f"  wrote {out_dir / (Path(path).stem + '_masks.vti')}")
 
     return 0
 

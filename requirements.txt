@@ -9,3 +9,4 @@ numpy
 scipy
 streamlit
 safetensors
+pyevtk
