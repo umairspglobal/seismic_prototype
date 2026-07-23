@@ -1,0 +1,23 @@
+# Output files
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+ENV/
+env/
+
+# Caches
+.cache/
+.pytest_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# SEG-Y / temporary data outputs
+*.vti
+*.npz
