@@ -20,4 +20,5 @@ env/
 
 # SEG-Y / temporary data outputs
 *.vti
+*.vts
 *.npz

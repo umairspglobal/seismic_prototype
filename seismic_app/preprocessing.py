@@ -36,11 +36,29 @@ def normalize_to_uint8(
 def to_rgb(data_uint8: np.ndarray) -> np.ndarray:
     """Channel-duplication strategy: copy the amplitude channel into R=G=B.
 
-    This is the "first pass" strategy from the guide. Swap this out for a
-    multi-attribute stack (amplitude/coherence/curvature) once those
-    volumes are available.
+    Used for 2D lines, which have no neighboring sections to stack. For
+    3D volumes use inline_to_rgb_25d instead.
     """
     return np.stack([data_uint8, data_uint8, data_uint8], axis=-1)
+
+
+def inline_to_rgb_25d(cube_uint8: np.ndarray, iline_idx: int) -> np.ndarray:
+    """True 2.5D RGB for a 3D volume: adjacent inlines in R/G/B.
+
+    R = previous inline, G = the inline itself, B = next inline (clamped
+    at the volume edges), giving SAM local 3D context for free. Input is
+    the normalized uint8 cube in segyio order (n_ilines, n_xlines,
+    n_samples); output is a (n_samples, n_xlines, 3) section-oriented
+    image (time down), matching the 2D display convention.
+    """
+    n_il = cube_uint8.shape[0]
+    prev_idx = max(0, iline_idx - 1)
+    next_idx = min(n_il - 1, iline_idx + 1)
+    # .T flips each (n_xlines, n_samples) slice to (n_samples, n_xlines).
+    return np.stack(
+        [cube_uint8[prev_idx].T, cube_uint8[iline_idx].T, cube_uint8[next_idx].T],
+        axis=-1,
+    )
 
 
 @dataclass

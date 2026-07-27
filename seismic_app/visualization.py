@@ -10,11 +10,17 @@ from PIL import Image
 from . import config
 
 
+# Masks whose names are not in the fixed vocabulary (e.g. interactively
+# point-picked objects) are drawn magenta by default.
+DEFAULT_EXTRA_COLOR = (255, 0, 255)
+
+
 def overlay_masks(
     rgb_uint8: np.ndarray,
     masks: dict[str, np.ndarray],
     alpha: float = 0.45,
     only: list[str] | None = None,
+    colors: dict[str, tuple[int, int, int]] | None = None,
 ) -> Image.Image:
     """Alpha-blend colored label masks on top of the base seismic image.
 
@@ -25,6 +31,7 @@ def overlay_masks(
     masks: noun_phrase -> boolean array (H, W).
     only: optional subset of noun_phrases to draw (for layer toggling in
         the viewer); defaults to all labels in masks.
+    colors: optional per-label color overrides on top of config.LABEL_COLORS.
     """
     base = Image.fromarray(rgb_uint8).convert("RGBA")
     composite = base
@@ -34,7 +41,9 @@ def overlay_masks(
         mask = masks.get(label)
         if mask is None or not mask.any():
             continue
-        color = config.LABEL_COLORS.get(label, (255, 255, 255))
+        color = (colors or {}).get(
+            label, config.LABEL_COLORS.get(label, DEFAULT_EXTRA_COLOR)
+        )
         overlay = Image.new("RGBA", base.size, color + (0,))
         alpha_channel = (mask.astype(np.uint8) * int(255 * alpha))
         overlay.putalpha(Image.fromarray(alpha_channel, mode="L"))

@@ -70,3 +70,79 @@ class Sam3SeismicSegmenter:
         probs = torch.sigmoid(logits)[:, 0].float().cpu().numpy()  # (num_prompts, h, w)
 
         return {prompt: probs[i] for i, prompt in enumerate(self.prompts)}
+
+
+class Sam3PointSegmenter:
+    """Interactive point-prompted segmentation (SAM3 Tracker / PVS head).
+
+    This is the SAM2-style promptable-visual-segmentation interface of
+    SAM 3: the user clicks positive/negative points on the section and
+    the model segments the one object they indicated. The *whole*
+    section image is passed in one go (seismic lines are small compared
+    to SAM's 1024 input; the processor resizes internally), so click
+    coordinates are plain full-resolution array indices - no tile
+    bookkeeping required.
+    """
+
+    def __init__(
+        self,
+        checkpoint: str = config.DEFAULT_CHECKPOINT,
+        device: str | None = None,
+    ):
+        from transformers import Sam3TrackerModel, Sam3TrackerProcessor  # deferred
+
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but this Python environment has no CUDA-enabled "
+                "PyTorch build. Install a CUDA PyTorch wheel in the active environment "
+                "or select CPU."
+            )
+        self.model = Sam3TrackerModel.from_pretrained(checkpoint).to(self.device)
+        self.model.eval()
+        self.processor = Sam3TrackerProcessor.from_pretrained(checkpoint)
+
+    @torch.no_grad()
+    def segment(
+        self,
+        rgb: np.ndarray,
+        points: list[tuple[int, int]],
+        labels: list[int],
+    ) -> np.ndarray:
+        """Segment one object indicated by clicked points.
+
+        Parameters
+        ----------
+        rgb : (H, W, 3) uint8 full-resolution section image, time down.
+        points : (trace_idx, sample_idx) array-index pairs, i.e. (x, y)
+            pixel coordinates on the section image.
+        labels : 1 for positive (inside the object), 0 for negative.
+
+        Returns
+        -------
+        (H, W) boolean mask at full section resolution.
+        """
+        if len(points) != len(labels) or not points:
+            raise ValueError("points and labels must be equal-length and non-empty")
+
+        image = Image.fromarray(rgb)
+        # 4D: (image, object, point, xy) - one image, one object.
+        input_points = [[[[float(x), float(y)] for x, y in points]]]
+        input_labels = [[[int(l) for l in labels]]]
+
+        inputs = self.processor(
+            images=image,
+            input_points=input_points,
+            input_labels=input_labels,
+            return_tensors="pt",
+        ).to(self.device)
+
+        outputs = self.model(**inputs)
+
+        # post_process_masks -> list per image of (n_objects, n_masks, H, W).
+        masks = self.processor.post_process_masks(
+            outputs.pred_masks.cpu(), inputs["original_sizes"]
+        )[0]
+        iou = outputs.iou_scores.cpu().numpy().reshape(-1)
+        best = int(iou.argmax())
+        return np.asarray(masks[0, best], dtype=bool)

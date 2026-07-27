@@ -54,16 +54,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trace-spacing",
         type=float,
-        default=25.0,
-        help="Physical spacing between traces in metres, for the exported "
-        ".vti file (default: 25.0). Must match the .sgy geometry loaded in "
-        "ParaView's SegYReader or the mask overlay will appear offset.",
+        default=None,
+        help="Override the trace spacing (metres) for VTK export. By "
+        "default it is measured from the trace world coordinates in the "
+        "SEG-Y headers.",
     )
     parser.add_argument(
         "--sample-interval",
         type=float,
-        default=4.0,
-        help="Sample interval in ms, for the exported .vti file (default: 4.0).",
+        default=None,
+        help="Override the sample interval (ms) for VTK export. By default "
+        "it is read from the SEG-Y headers.",
     )
     return parser
 
@@ -100,9 +101,11 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 - surface per-file failures, keep going
             print(f"  FAILED: {exc}", file=sys.stderr)
             continue
-        print(f"  wrote {out_dir / (Path(path).stem + '_overlay.png')}")
-        print(f"  wrote {out_dir / (Path(path).stem + '_masks.npz')}")
-        print(f"  wrote {out_dir / (Path(path).stem + '_masks.vti')}")
+        stem = Path(path).stem
+        print(f"  wrote {out_dir / (stem + '_overlay.png')}")
+        print(f"  wrote {out_dir / (stem + '_masks.npz')}")
+        print(f"  wrote {out_dir / (stem + '_masks.vts')} (world coords, for ParaView)")
+        print(f"  wrote {out_dir / (stem + '_masks.vti')}")
 
     return 0
 

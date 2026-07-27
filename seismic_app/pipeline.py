@@ -1,6 +1,10 @@
-"""Top-level orchestration: .sgy -> preprocess -> tile -> SAM 3 infer ->
-stitch -> export. This is the "no prompts at inference time" entry point:
-callers just supply a file path and get all five feature masks back.
+"""Top-level orchestration: .sgy -> geometry + preprocess -> tile ->
+SAM 3 infer -> stitch -> geometry-aware export.
+
+Geometry is extracted once at load time and threaded through every stage
+so the exported masks land exactly where the seismic sits in ParaView.
+Array orientation everywhere: 2D sections and per-inline slices are
+(n_samples, n_traces) - time down, traces across.
 """
 
 from __future__ import annotations
@@ -11,19 +15,105 @@ from pathlib import Path
 import numpy as np
 
 from . import config
+from .geometry import SectionGeometry
 from .inference import Sam3SeismicSegmenter
-from .preprocessing import sgy_to_tiles
-from .sgy_loader import load_2d_section
+from .preprocessing import inline_to_rgb_25d, normalize_to_uint8, tile_image, to_rgb
+from .sgy_loader import load_any
 from .stitching import binarize, stitch_tiles
 from .visualization import overlay_masks, save_masks_npz, save_overlay_png
-from .vtk_export import export_vti
+from .vtk_export import export_masks
 
 
 @dataclass
 class SegmentationResult:
-    rgb: np.ndarray  # (H, W, 3) uint8 base image
-    prob_maps: dict[str, np.ndarray]  # noun_phrase -> float32 (H, W)
-    masks: dict[str, np.ndarray]  # noun_phrase -> bool (H, W)
+    """Masks plus the geometry needed to place them in the real world.
+
+    For 2D lines (geometry.kind == "2d"), every array is a
+    (n_samples, n_traces) section. For 3D volumes ("3d"), masks and
+    prob_maps are (n_ilines, n_samples, n_xlines) stacks - one section
+    per inline - and rgb/amplitude hold the middle inline for preview.
+    """
+
+    geometry: SectionGeometry
+    rgb: np.ndarray  # (H, W, 3) uint8 preview image
+    amplitude: np.ndarray  # float32 raw amplitudes (section or cube)
+    prob_maps: dict[str, np.ndarray]
+    masks: dict[str, np.ndarray]
+
+
+def _segment_section_rgb(
+    rgb: np.ndarray,
+    segmenter: Sam3SeismicSegmenter,
+    prompts: list[str],
+) -> dict[str, np.ndarray]:
+    """Tile one (H, W, 3) image, run SAM 3, stitch back to full size."""
+    tiling = tile_image(rgb)
+    tile_scores = [(tile, segmenter.segment_tile(tile.image)) for tile in tiling.tiles]
+    return stitch_tiles(tile_scores, tiling, prompts)
+
+
+def run_on_section(
+    section: np.ndarray,
+    geometry: SectionGeometry,
+    segmenter: Sam3SeismicSegmenter,
+    prompts: list[str] | None = None,
+    threshold: float = config.MASK_THRESHOLD,
+) -> SegmentationResult:
+    """Run the text-prompt pipeline on a loaded (n_samples, n_traces) section."""
+    prompts = prompts or config.SEISMIC_PROMPTS
+
+    rgb = to_rgb(normalize_to_uint8(section))
+    prob_maps = _segment_section_rgb(rgb, segmenter, prompts)
+    masks = binarize(prob_maps, threshold)
+
+    return SegmentationResult(
+        geometry=geometry,
+        rgb=rgb,
+        amplitude=section,
+        prob_maps=prob_maps,
+        masks=masks,
+    )
+
+
+def run_on_volume(
+    cube: np.ndarray,
+    geometry: SectionGeometry,
+    segmenter: Sam3SeismicSegmenter,
+    prompts: list[str] | None = None,
+    threshold: float = config.MASK_THRESHOLD,
+) -> SegmentationResult:
+    """Run the pipeline inline-by-inline over a 3D cube with 2.5D RGB.
+
+    Each inline is presented to SAM as an RGB image whose channels are
+    the previous/current/next inlines, so the model sees local 3D
+    context. Masks are stacked to (n_ilines, n_samples, n_xlines).
+    """
+    prompts = prompts or config.SEISMIC_PROMPTS
+
+    cube_u8 = normalize_to_uint8(cube)
+    n_il = cube.shape[0]
+
+    prob_stacks: dict[str, list[np.ndarray]] = {p: [] for p in prompts}
+    preview_rgb: np.ndarray | None = None
+
+    for il in range(n_il):
+        rgb = inline_to_rgb_25d(cube_u8, il)
+        if il == n_il // 2:
+            preview_rgb = rgb
+        prob_maps = _segment_section_rgb(rgb, segmenter, prompts)
+        for p in prompts:
+            prob_stacks[p].append(prob_maps[p])
+
+    prob_maps_3d = {p: np.stack(prob_stacks[p], axis=0) for p in prompts}
+    masks_3d = binarize(prob_maps_3d, threshold)
+
+    return SegmentationResult(
+        geometry=geometry,
+        rgb=preview_rgb,
+        amplitude=cube,
+        prob_maps=prob_maps_3d,
+        masks=masks_3d,
+    )
 
 
 def run_on_file(
@@ -32,21 +122,11 @@ def run_on_file(
     prompts: list[str] | None = None,
     threshold: float = config.MASK_THRESHOLD,
 ) -> SegmentationResult:
-    """Run the full pipeline on a single .sgy file, no user prompts needed."""
-    prompts = prompts or config.SEISMIC_PROMPTS
-
-    data = load_2d_section(path)
-    tiling, rgb = sgy_to_tiles(data)
-
-    tile_scores = []
-    for tile in tiling.tiles:
-        scores = segmenter.segment_tile(tile.image)
-        tile_scores.append((tile, scores))
-
-    prob_maps = stitch_tiles(tile_scores, tiling, prompts)
-    masks = binarize(prob_maps, threshold)
-
-    return SegmentationResult(rgb=rgb, prob_maps=prob_maps, masks=masks)
+    """Load a .sgy file (auto-detecting 2D vs 3D) and segment it."""
+    data, geometry = load_any(path)
+    if geometry.kind == "3d":
+        return run_on_volume(data, geometry, segmenter, prompts, threshold)
+    return run_on_section(data, geometry, segmenter, prompts, threshold)
 
 
 def process_and_export(
@@ -56,26 +136,39 @@ def process_and_export(
     checkpoint: str = config.DEFAULT_CHECKPOINT,
     device: str | None = None,
     threshold: float = config.MASK_THRESHOLD,
-    trace_spacing: float = 25.0,
-    sample_interval: float = 4.0,
+    trace_spacing: float | None = None,
+    sample_interval: float | None = None,
 ) -> SegmentationResult:
-    """Convenience wrapper: run the pipeline and write PNG + NPZ + VTI outputs."""
+    """Run the pipeline and write PNG + NPZ + VTK outputs.
+
+    trace_spacing (m) and sample_interval (ms) are optional *overrides*;
+    by default both are read from the SEG-Y headers.
+    """
     if segmenter is None:
         segmenter = Sam3SeismicSegmenter(checkpoint=checkpoint, device=device)
 
     result = run_on_file(path, segmenter, threshold=threshold)
 
+    geometry = result.geometry
+    if trace_spacing is not None:
+        geometry.trace_spacing_m = trace_spacing
+    if sample_interval is not None:
+        geometry.dt_ms = sample_interval
+
     out_dir = Path(out_dir)
     stem = Path(path).stem
 
-    overlay = overlay_masks(result.rgb, result.masks)
-    save_overlay_png(overlay, out_dir / f"{stem}_overlay.png")
+    if geometry.kind == "2d":
+        overlay = overlay_masks(result.rgb, result.masks)
+        save_overlay_png(overlay, out_dir / f"{stem}_overlay.png")
+    else:
+        # 3D: preview overlay of the middle inline.
+        mid = result.amplitude.shape[0] // 2
+        mid_masks = {p: m[mid] for p, m in result.masks.items()}
+        overlay = overlay_masks(result.rgb, mid_masks)
+        save_overlay_png(overlay, out_dir / f"{stem}_overlay_il{mid}.png")
+
     save_masks_npz(result.masks, out_dir / f"{stem}_masks.npz")
-    export_vti(
-        result.masks,
-        out_dir / f"{stem}_masks",
-        trace_spacing=trace_spacing,
-        sample_interval=sample_interval,
-    )
+    export_masks(result.masks, result.amplitude, geometry, out_dir / f"{stem}_masks")
 
     return result
