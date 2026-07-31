@@ -158,6 +158,28 @@ def place_slice_mask_in_volume(
     return vol
 
 
+def store_interactive_mask(
+    mask: np.ndarray,
+    name: str,
+    data: np.ndarray,
+    geometry: SectionGeometry,
+    slice_axis: str,
+    slice_idx: int,
+) -> str:
+    """Save a point-picked mask into session state so Export can use it."""
+    name = name.strip() or "picked object"
+    if geometry.kind == "3d":
+        vol_shape = (data.shape[0], data.shape[2], data.shape[1])
+        st.session_state.interactive_masks[name] = place_slice_mask_in_volume(
+            mask, vol_shape, slice_axis, slice_idx
+        )
+    else:
+        st.session_state.interactive_masks[name] = mask
+    coverage = 100.0 * float(mask.mean())
+    log.info("Saved interactive mask '%s' for export (coverage=%.2f%%)", name, coverage)
+    return name
+
+
 # --------------------------------------------------------------------------
 # Point-picking helpers
 # --------------------------------------------------------------------------
@@ -462,16 +484,15 @@ def main() -> None:
                     f"{describe_pick(geometry, slice_axis, slice_idx, pt['col'], pt['row'])}"
                 )
 
-            seg1, seg2, seg3 = st.columns([1, 2, 1])
+            seg1, seg2 = st.columns([1, 2])
             with seg1:
                 segment_clicked = st.button("Segment from points", type="primary")
             with seg2:
                 mask_name = st.text_input(
-                    "Label name", value="picked object", label_visibility="collapsed",
-                    placeholder="Name for this mask (e.g. 'salt dome')",
+                    "Label name for this mask",
+                    value="picked object",
+                    help="Used as the layer name in Export / ParaView.",
                 )
-            with seg3:
-                add_clicked = st.button("Add to layers")
 
             if segment_clicked:
                 log.info(
@@ -488,7 +509,24 @@ def main() -> None:
                     ):
                         mask = tracker.segment(slice_rgb, points_xy, labels)
                     st.session_state.point_mask = mask
-                    log.info("Point segmentation complete")
+                    # Auto-save into export layers so ParaView downloads appear
+                    # immediately - no separate "Add to layers" step required.
+                    saved_name = store_interactive_mask(
+                        mask,
+                        mask_name,
+                        data,
+                        geometry,
+                        slice_axis,
+                        slice_idx,
+                    )
+                    st.session_state.points = [
+                        p for p in st.session_state.points if p["slice"] != skey
+                    ]
+                    st.success(
+                        f"Mask '{saved_name}' ready. Scroll down to **Export** for "
+                        "PNG / NPZ / ParaView (.vts / .vti) downloads."
+                    )
+                    log.info("Point segmentation complete; export unlocked")
                 except Exception as exc:
                     log.error("Point segmentation FAILED: %s", exc)
                     log.error(traceback.format_exc())
@@ -496,30 +534,18 @@ def main() -> None:
                     st.caption("Check the terminal for the full traceback.")
                 else:
                     st.rerun()
-
-            if add_clicked and st.session_state.point_mask is not None:
-                name = mask_name.strip() or "picked object"
-                if geometry.kind == "3d":
-                    vol_shape = (data.shape[0], data.shape[2], data.shape[1])
-                    st.session_state.interactive_masks[name] = place_slice_mask_in_volume(
-                        st.session_state.point_mask, vol_shape, slice_axis, slice_idx
-                    )
-                else:
-                    st.session_state.interactive_masks[name] = st.session_state.point_mask
-                coverage = 100.0 * float(st.session_state.point_mask.mean())
-                log.info("Added interactive mask '%s' (coverage=%.2f%%)", name, coverage)
-                st.session_state.point_mask = None
-                st.session_state.points = [
-                    p for p in st.session_state.points if p["slice"] != skey
-                ]
-                st.success(f"Added mask '{name}' to the export layers.")
-                st.rerun()
         else:
             st.info("No points on this slice yet - click on the image above.")
 
+        if st.session_state.point_mask is not None and not st.session_state.interactive_masks:
+            st.warning(
+                "A mask was segmented but not saved for export. "
+                "Click **Segment from points** again (it now saves automatically)."
+            )
+
         if st.session_state.interactive_masks:
             st.markdown(
-                "**Saved interactive masks:** "
+                "**Saved interactive masks (available in Export):** "
                 + ", ".join(f"`{k}`" for k in st.session_state.interactive_masks)
             )
             if st.button("Discard all interactive masks"):
@@ -528,6 +554,7 @@ def main() -> None:
                     list(st.session_state.interactive_masks),
                 )
                 st.session_state.interactive_masks = {}
+                st.session_state.point_mask = None
                 st.rerun()
 
     # ======================================================================
@@ -542,7 +569,11 @@ def main() -> None:
     export_masks_dict.update(st.session_state.interactive_masks)
 
     if not export_masks_dict:
-        st.info("Run the automatic segmentation and/or add interactive masks to export.")
+        st.info(
+            "No masks to export yet. Either run **Automatic** segmentation, or in "
+            "**Interactive** pick points and click **Segment from points** "
+            "(that step also saves the mask for ParaView export)."
+        )
         return
 
     log.info(
