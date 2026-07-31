@@ -13,12 +13,17 @@ but quality against natural-image-trained weights will vary per concept.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 
 from . import config
+from .logutil import get_logger
+
+log = get_logger("inference")
 
 
 class Sam3SeismicSegmenter:
@@ -41,9 +46,22 @@ class Sam3SeismicSegmenter:
             )
         self.prompts = prompts or config.SEISMIC_PROMPTS
 
+        log.info(
+            "Loading Sam3Model from '%s' onto device=%s (first run may download "
+            "weights from Hugging Face - this can take several minutes)...",
+            checkpoint,
+            self.device,
+        )
+        t0 = time.perf_counter()
         self.model = Sam3Model.from_pretrained(checkpoint).to(self.device)
         self.model.eval()
+        log.info("Sam3Model weights loaded in %.1fs; loading processor...", time.perf_counter() - t0)
         self.processor = Sam3Processor.from_pretrained(checkpoint)
+        log.info(
+            "Text-prompt segmenter ready on %s (prompts=%s)",
+            self.device,
+            self.prompts,
+        )
 
     @torch.no_grad()
     def segment_tile(self, tile_image: Image.Image) -> dict[str, np.ndarray]:
@@ -98,9 +116,21 @@ class Sam3PointSegmenter:
                 "PyTorch build. Install a CUDA PyTorch wheel in the active environment "
                 "or select CPU."
             )
+        log.info(
+            "Loading Sam3TrackerModel from '%s' onto device=%s (first run may "
+            "download weights - can take several minutes on CPU)...",
+            checkpoint,
+            self.device,
+        )
+        t0 = time.perf_counter()
         self.model = Sam3TrackerModel.from_pretrained(checkpoint).to(self.device)
         self.model.eval()
+        log.info(
+            "Sam3TrackerModel weights loaded in %.1fs; loading processor...",
+            time.perf_counter() - t0,
+        )
         self.processor = Sam3TrackerProcessor.from_pretrained(checkpoint)
+        log.info("Point-prompt tracker ready on %s", self.device)
 
     @torch.no_grad()
     def segment(
@@ -125,11 +155,25 @@ class Sam3PointSegmenter:
         if len(points) != len(labels) or not points:
             raise ValueError("points and labels must be equal-length and non-empty")
 
+        h, w = rgb.shape[:2]
+        n_pos = sum(1 for lab in labels if lab == 1)
+        n_neg = len(labels) - n_pos
+        log.info(
+            "Point segmentation: image %dx%d, %d positive / %d negative points, device=%s",
+            w,
+            h,
+            n_pos,
+            n_neg,
+            self.device,
+        )
+        t0 = time.perf_counter()
+
         image = Image.fromarray(rgb)
         # 4D: (image, object, point, xy) - one image, one object.
         input_points = [[[[float(x), float(y)] for x, y in points]]]
         input_labels = [[[int(l) for l in labels]]]
 
+        log.info("Encoding image + points...")
         inputs = self.processor(
             images=image,
             input_points=input_points,
@@ -137,6 +181,7 @@ class Sam3PointSegmenter:
             return_tensors="pt",
         ).to(self.device)
 
+        log.info("Running tracker forward pass (CPU can take 1-5+ minutes)...")
         outputs = self.model(**inputs)
 
         # post_process_masks -> list per image of (n_objects, n_masks, H, W).
@@ -145,4 +190,12 @@ class Sam3PointSegmenter:
         )[0]
         iou = outputs.iou_scores.cpu().numpy().reshape(-1)
         best = int(iou.argmax())
-        return np.asarray(masks[0, best], dtype=bool)
+        mask = np.asarray(masks[0, best], dtype=bool)
+        coverage = 100.0 * float(mask.mean())
+        log.info(
+            "Point segmentation done in %.1fs (best IoU=%.3f, mask coverage=%.2f%%)",
+            time.perf_counter() - t0,
+            float(iou[best]),
+            coverage,
+        )
+        return mask

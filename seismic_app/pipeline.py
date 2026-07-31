@@ -9,6 +9,7 @@ Array orientation everywhere: 2D sections and per-inline slices are
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,11 +18,14 @@ import numpy as np
 from . import config
 from .geometry import SectionGeometry
 from .inference import Sam3SeismicSegmenter
+from .logutil import get_logger
 from .preprocessing import inline_to_rgb_25d, normalize_to_uint8, tile_image, to_rgb
 from .sgy_loader import load_any
 from .stitching import binarize, stitch_tiles
 from .visualization import overlay_masks, save_masks_npz, save_overlay_png
 from .vtk_export import export_masks
+
+log = get_logger("pipeline")
 
 
 @dataclass
@@ -48,7 +52,20 @@ def _segment_section_rgb(
 ) -> dict[str, np.ndarray]:
     """Tile one (H, W, 3) image, run SAM 3, stitch back to full size."""
     tiling = tile_image(rgb)
-    tile_scores = [(tile, segmenter.segment_tile(tile.image)) for tile in tiling.tiles]
+    n_tiles = len(tiling.tiles)
+    log.info(
+        "Tiled section %dx%d into %d tiles; running text prompts on each...",
+        rgb.shape[1],
+        rgb.shape[0],
+        n_tiles,
+    )
+    tile_scores = []
+    for i, tile in enumerate(tiling.tiles, start=1):
+        t0 = time.perf_counter()
+        log.info("  tile %d/%d at (y=%d, x=%d)...", i, n_tiles, tile.y, tile.x)
+        scores = segmenter.segment_tile(tile.image)
+        log.info("  tile %d/%d done in %.1fs", i, n_tiles, time.perf_counter() - t0)
+        tile_scores.append((tile, scores))
     return stitch_tiles(tile_scores, tiling, prompts)
 
 
@@ -61,10 +78,20 @@ def run_on_section(
 ) -> SegmentationResult:
     """Run the text-prompt pipeline on a loaded (n_samples, n_traces) section."""
     prompts = prompts or config.SEISMIC_PROMPTS
+    log.info(
+        "Text-prompt segmentation on 2D section shape=%s (time x traces), threshold=%.2f",
+        section.shape,
+        threshold,
+    )
+    t0 = time.perf_counter()
 
     rgb = to_rgb(normalize_to_uint8(section))
     prob_maps = _segment_section_rgb(rgb, segmenter, prompts)
     masks = binarize(prob_maps, threshold)
+
+    for name, mask in masks.items():
+        log.info("  mask '%s': %.2f%% coverage", name, 100.0 * float(mask.mean()))
+    log.info("Section segmentation finished in %.1fs", time.perf_counter() - t0)
 
     return SegmentationResult(
         geometry=geometry,
@@ -92,11 +119,19 @@ def run_on_volume(
 
     cube_u8 = normalize_to_uint8(cube)
     n_il = cube.shape[0]
+    log.info(
+        "Text-prompt segmentation on 3D volume shape=%s (%d inlines), threshold=%.2f",
+        cube.shape,
+        n_il,
+        threshold,
+    )
+    t0 = time.perf_counter()
 
     prob_stacks: dict[str, list[np.ndarray]] = {p: [] for p in prompts}
     preview_rgb: np.ndarray | None = None
 
     for il in range(n_il):
+        log.info("Inline %d/%d...", il + 1, n_il)
         rgb = inline_to_rgb_25d(cube_u8, il)
         if il == n_il // 2:
             preview_rgb = rgb
@@ -106,6 +141,7 @@ def run_on_volume(
 
     prob_maps_3d = {p: np.stack(prob_stacks[p], axis=0) for p in prompts}
     masks_3d = binarize(prob_maps_3d, threshold)
+    log.info("Volume segmentation finished in %.1fs", time.perf_counter() - t0)
 
     return SegmentationResult(
         geometry=geometry,

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import tempfile
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -32,11 +33,14 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 from seismic_app import config
 from seismic_app.geometry import SectionGeometry
 from seismic_app.inference import Sam3PointSegmenter, Sam3SeismicSegmenter
+from seismic_app.logutil import get_logger
 from seismic_app.pipeline import run_on_section, run_on_volume
 from seismic_app.preprocessing import inline_to_rgb_25d, normalize_to_uint8, to_rgb
 from seismic_app.sgy_loader import load_any
 from seismic_app.visualization import overlay_masks
 from seismic_app.vtk_export import export_masks
+
+log = get_logger("app")
 
 DATA_DIR = Path("data")
 
@@ -51,17 +55,38 @@ NEGATIVE_COLOR = (255, 40, 40)
 
 @st.cache_resource(show_spinner="Loading SAM 3 text-prompt model (first run only)...")
 def load_segmenter(checkpoint: str, device: str | None) -> Sam3SeismicSegmenter:
+    log.info("App requested text-prompt model (checkpoint=%s, device=%s)", checkpoint, device)
     return Sam3SeismicSegmenter(checkpoint=checkpoint, device=device)
 
 
 @st.cache_resource(show_spinner="Loading SAM 3 tracker (point prompts, first run only)...")
 def load_point_segmenter(checkpoint: str, device: str | None) -> Sam3PointSegmenter:
+    log.info("App requested point-tracker model (checkpoint=%s, device=%s)", checkpoint, device)
     return Sam3PointSegmenter(checkpoint=checkpoint, device=device)
 
 
 @st.cache_resource(show_spinner="Reading SEG-Y file...")
 def load_file(path: str) -> tuple[np.ndarray, SectionGeometry]:
-    return load_any(path)
+    log.info("Loading SEG-Y file: %s", path)
+    data, geometry = load_any(path)
+    if geometry.kind == "2d":
+        log.info(
+            "Loaded 2D line shape=%s, dt=%.3g ms, spacing=%.1f m, CDP %s-%s",
+            data.shape,
+            geometry.dt_ms,
+            geometry.trace_spacing_m,
+            geometry.cdp[0],
+            geometry.cdp[-1],
+        )
+    else:
+        log.info(
+            "Loaded 3D volume shape=%s, dt=%.3g ms, %d inlines x %d crosslines",
+            data.shape,
+            geometry.dt_ms,
+            len(geometry.ilines),
+            len(geometry.xlines),
+        )
+    return data, geometry
 
 
 def list_sgy_files() -> list[Path]:
@@ -199,6 +224,7 @@ def main() -> None:
     # ---- load file, reset per-file state -----------------------------------
     data, geometry = load_file(selected)
     if st.session_state.get("loaded_path") != selected:
+        log.info("Active file changed to %s", selected)
         st.session_state.loaded_path = selected
         st.session_state.text_result = None
         st.session_state.points = []
@@ -280,13 +306,25 @@ def main() -> None:
     with tab_auto:
         run_clicked = st.button("Run segmentation", type="primary")
         if run_clicked:
-            segmenter = load_segmenter(checkpoint, device_arg)
-            with st.spinner(f"Segmenting {selected} ..."):
-                if geometry.kind == "3d":
-                    result = run_on_volume(data, geometry, segmenter, threshold=threshold)
-                else:
-                    result = run_on_section(data, geometry, segmenter, threshold=threshold)
-            st.session_state.text_result = result
+            log.info("=== Automatic text-prompt segmentation requested for %s ===", selected)
+            try:
+                segmenter = load_segmenter(checkpoint, device_arg)
+                with st.spinner(f"Segmenting {selected} ... (see terminal for progress)"):
+                    if geometry.kind == "3d":
+                        result = run_on_volume(
+                            data, geometry, segmenter, threshold=threshold
+                        )
+                    else:
+                        result = run_on_section(
+                            data, geometry, segmenter, threshold=threshold
+                        )
+                st.session_state.text_result = result
+                log.info("Automatic segmentation complete for %s", selected)
+            except Exception as exc:
+                log.error("Automatic segmentation FAILED: %s", exc)
+                log.error(traceback.format_exc())
+                st.error(f"Segmentation failed: {exc}")
+                st.caption("Check the terminal for the full traceback.")
 
         result = st.session_state.text_result
         if result is None:
@@ -345,10 +383,12 @@ def main() -> None:
             )
         with ctl2:
             if st.button("Undo point") and st.session_state.points:
-                st.session_state.points.pop()
+                removed = st.session_state.points.pop()
+                log.info("Undid point at col=%s row=%s", removed["col"], removed["row"])
                 st.session_state.point_mask = None
         with ctl3:
             if st.button("Clear points"):
+                log.info("Cleared %d points", len(st.session_state.points))
                 st.session_state.points = []
                 st.session_state.point_mask = None
         with ctl4:
@@ -392,13 +432,23 @@ def main() -> None:
             st.session_state.last_click = click
             col = int(np.clip(round(click["x"] / scale_x), 0, slice_w - 1))
             row = int(np.clip(round(click["y"] / scale_y), 0, slice_h - 1))
+            label = 1 if click_label == "positive point" else 0
             st.session_state.points.append(
                 {
                     "col": col,
                     "row": row,
-                    "label": 1 if click_label == "positive point" else 0,
+                    "label": label,
                     "slice": skey,
                 }
+            )
+            log.info(
+                "Point pick: %s at %s (display %d,%d -> col=%d row=%d)",
+                "positive" if label == 1 else "negative",
+                describe_pick(geometry, slice_axis, slice_idx, col, row),
+                click["x"],
+                click["y"],
+                col,
+                row,
             )
             st.session_state.point_mask = None
             st.rerun()
@@ -424,13 +474,28 @@ def main() -> None:
                 add_clicked = st.button("Add to layers")
 
             if segment_clicked:
-                tracker = load_point_segmenter(checkpoint, device_arg)
-                points_xy = [(p["col"], p["row"]) for p in slice_points]
-                labels = [p["label"] for p in slice_points]
-                with st.spinner("Segmenting from points..."):
-                    mask = tracker.segment(slice_rgb, points_xy, labels)
-                st.session_state.point_mask = mask
-                st.rerun()
+                log.info(
+                    "=== Point segmentation requested (%d points on %s) ===",
+                    len(slice_points),
+                    selected,
+                )
+                try:
+                    tracker = load_point_segmenter(checkpoint, device_arg)
+                    points_xy = [(p["col"], p["row"]) for p in slice_points]
+                    labels = [p["label"] for p in slice_points]
+                    with st.spinner(
+                        "Segmenting from points... (see terminal for progress)"
+                    ):
+                        mask = tracker.segment(slice_rgb, points_xy, labels)
+                    st.session_state.point_mask = mask
+                    log.info("Point segmentation complete")
+                except Exception as exc:
+                    log.error("Point segmentation FAILED: %s", exc)
+                    log.error(traceback.format_exc())
+                    st.error(f"Point segmentation failed: {exc}")
+                    st.caption("Check the terminal for the full traceback.")
+                else:
+                    st.rerun()
 
             if add_clicked and st.session_state.point_mask is not None:
                 name = mask_name.strip() or "picked object"
@@ -441,6 +506,8 @@ def main() -> None:
                     )
                 else:
                     st.session_state.interactive_masks[name] = st.session_state.point_mask
+                coverage = 100.0 * float(st.session_state.point_mask.mean())
+                log.info("Added interactive mask '%s' (coverage=%.2f%%)", name, coverage)
                 st.session_state.point_mask = None
                 st.session_state.points = [
                     p for p in st.session_state.points if p["slice"] != skey
@@ -456,6 +523,10 @@ def main() -> None:
                 + ", ".join(f"`{k}`" for k in st.session_state.interactive_masks)
             )
             if st.button("Discard all interactive masks"):
+                log.info(
+                    "Discarded interactive masks: %s",
+                    list(st.session_state.interactive_masks),
+                )
                 st.session_state.interactive_masks = {}
                 st.rerun()
 
@@ -474,6 +545,11 @@ def main() -> None:
         st.info("Run the automatic segmentation and/or add interactive masks to export.")
         return
 
+    log.info(
+        "Export ready with %d mask layer(s): %s",
+        len(export_masks_dict),
+        list(export_masks_dict),
+    )
     stem = Path(selected).stem
 
     # Overlay PNG (2D only - a volume has no single overlay image).
