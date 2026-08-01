@@ -107,6 +107,23 @@ def _read_dt_ms(f: segyio.SegyFile) -> float:
     return _DEFAULT_DT_US / 1000.0
 
 
+def _maybe_decode_ieee(vals: np.ndarray) -> np.ndarray:
+    """Undo the 'IEEE float stored in an int header field' vendor quirk.
+
+    Some exports write coordinates as raw float32 bit patterns into the
+    4-byte integer SourceX/SourceY fields; read as ints they look like
+    huge numbers (e.g. 1148846080 == float 1000.0). If every value is
+    implausibly large but reinterprets to a sane finite float, use that.
+    """
+    nonzero = vals[vals != 0]
+    if nonzero.size == 0 or np.abs(nonzero).min() < 1e7:
+        return vals
+    as_float = vals.astype(np.int64).astype(np.int32).view(np.float32).astype(np.float64)
+    if np.all(np.isfinite(as_float)) and np.all(np.abs(as_float) < 1e9):
+        return as_float
+    return vals
+
+
 def _read_world_coords(f: segyio.SegyFile) -> tuple[np.ndarray, np.ndarray]:
     """Per-trace world (x, y), preferring CDP_X/Y over SourceX/Y."""
     cdp_x = np.asarray(f.attributes(segyio.TraceField.CDP_X)[:], dtype=np.float64)
@@ -117,6 +134,7 @@ def _read_world_coords(f: segyio.SegyFile) -> tuple[np.ndarray, np.ndarray]:
         x = np.asarray(f.attributes(segyio.TraceField.SourceX)[:], dtype=np.float64)
         y = np.asarray(f.attributes(segyio.TraceField.SourceY)[:], dtype=np.float64)
 
+    x, y = _maybe_decode_ieee(x), _maybe_decode_ieee(y)
     scalar = _coordinate_scalar(int(f.header[0][segyio.TraceField.SourceGroupScalar]))
     return x * scalar, y * scalar
 

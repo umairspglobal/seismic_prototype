@@ -1,6 +1,9 @@
 # Output files
 outputs/
 
+# Seismic data (large binary files - keep local only)
+data/
+
 # Python
 __pycache__/
 *.pyc
@@ -22,3 +25,7 @@ env/
 *.vti
 *.vts
 *.npz
+*.sgy
+*.SGY
+*.uko
+*.UKO

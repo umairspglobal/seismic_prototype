@@ -32,7 +32,11 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 
 from seismic_app import config
 from seismic_app.geometry import SectionGeometry
-from seismic_app.inference import Sam3PointSegmenter, Sam3SeismicSegmenter
+from seismic_app.inference import (
+    Sam3PointSegmenter,
+    Sam3SeismicSegmenter,
+    Sam3VolumePropagator,
+)
 from seismic_app.logutil import get_logger
 from seismic_app.pipeline import run_on_section, run_on_volume
 from seismic_app.preprocessing import inline_to_rgb_25d, normalize_to_uint8, to_rgb
@@ -63,6 +67,20 @@ def load_segmenter(checkpoint: str, device: str | None) -> Sam3SeismicSegmenter:
 def load_point_segmenter(checkpoint: str, device: str | None) -> Sam3PointSegmenter:
     log.info("App requested point-tracker model (checkpoint=%s, device=%s)", checkpoint, device)
     return Sam3PointSegmenter(checkpoint=checkpoint, device=device)
+
+
+@st.cache_resource(show_spinner="Loading SAM 3 video tracker (volume propagation)...")
+def load_propagator(checkpoint: str, device: str | None) -> Sam3VolumePropagator:
+    log.info("App requested volume propagator (checkpoint=%s, device=%s)", checkpoint, device)
+    return Sam3VolumePropagator(checkpoint=checkpoint, device=device)
+
+
+@st.cache_resource(show_spinner="Normalizing amplitudes...")
+def load_normalized(path: str) -> np.ndarray:
+    """Percentile-normalized uint8 copy of the file, cached per path."""
+    data, _ = load_file(path)
+    log.info("Normalizing amplitudes for display (%s values)...", data.size)
+    return normalize_to_uint8(data)
 
 
 @st.cache_resource(show_spinner="Reading SEG-Y file...")
@@ -101,21 +119,36 @@ def list_sgy_files() -> list[Path]:
 
 
 def current_slice_rgb(
-    data: np.ndarray,
+    data_u8: np.ndarray,
     geometry: SectionGeometry,
     slice_axis: str,
     slice_idx: int,
 ) -> np.ndarray:
-    """(H, W, 3) uint8 display image of the active slice, time down."""
-    if geometry.kind == "2d":
-        return to_rgb(normalize_to_uint8(data))
+    """(H, W, 3) uint8 display image of the active slice, time down.
 
-    cube_u8 = normalize_to_uint8(data)
+    data_u8 is the pre-normalized uint8 array from load_normalized().
+    """
+    if geometry.kind == "2d":
+        return to_rgb(data_u8)
+
     if slice_axis == "inline":
-        return inline_to_rgb_25d(cube_u8, slice_idx)
+        return inline_to_rgb_25d(data_u8, slice_idx)
     if slice_axis == "crossline":
-        return to_rgb(cube_u8[:, slice_idx, :].T)  # (n_samples, n_ilines)
-    return to_rgb(cube_u8[:, :, slice_idx])  # time slice: (n_ilines, n_xlines)
+        return to_rgb(data_u8[:, slice_idx, :].T)  # (n_samples, n_ilines)
+    return to_rgb(data_u8[:, :, slice_idx])  # time slice: (n_ilines, n_xlines)
+
+
+def slice_volume_mask(
+    vol_mask: np.ndarray,  # (n_il, n_samples, n_xl)
+    slice_axis: str,
+    slice_idx: int,
+) -> np.ndarray:
+    """Cut a saved 3D mask down to the currently displayed slice."""
+    if slice_axis == "inline":
+        return vol_mask[slice_idx]  # (n_samples, n_xl)
+    if slice_axis == "crossline":
+        return vol_mask[:, :, slice_idx].T  # (n_samples, n_il)
+    return vol_mask[:, slice_idx, :]  # time slice: (n_il, n_xl)
 
 
 def describe_pick(
@@ -180,6 +213,23 @@ def store_interactive_mask(
     return name
 
 
+def place_frames_in_volume(
+    frame_masks: np.ndarray,  # (n_frames, H, W) from the propagator
+    volume_shape: tuple[int, int, int],  # (n_il, n_samples, n_xl)
+    slice_axis: str,
+) -> np.ndarray:
+    """Stack propagated per-slice masks back into a full-volume mask."""
+    vol = np.zeros(volume_shape, dtype=bool)
+    if slice_axis == "inline":
+        vol[:] = frame_masks  # frames are (n_samples, n_xl)
+    elif slice_axis == "crossline":
+        # frames are (n_samples, n_il) -> (n_il, n_samples) per crossline
+        vol[:] = np.transpose(frame_masks, (2, 1, 0))
+    else:  # time slices: frames are (n_il, n_xl)
+        vol[:] = np.transpose(frame_masks, (1, 0, 2))
+    return vol
+
+
 # --------------------------------------------------------------------------
 # Point-picking helpers
 # --------------------------------------------------------------------------
@@ -229,7 +279,12 @@ def main() -> None:
         if not sgy_files:
             st.warning(f"No .sgy files found in {DATA_DIR}/. Add some and reload.")
             return
-        selected = st.selectbox("Seismic file", [str(p) for p in sgy_files])
+        options = [str(p) for p in sgy_files]
+        # Default to the 3D volume so slice navigation/propagation show up.
+        default_idx = next(
+            (i for i, p in enumerate(options) if "SEGY0000" in p), 0
+        )
+        selected = st.selectbox("Seismic file", options, index=default_idx)
         checkpoint = st.text_input("SAM 3 checkpoint", value=config.DEFAULT_CHECKPOINT)
         device_options = ["auto", "cpu"]
         if torch.cuda.is_available():
@@ -243,6 +298,24 @@ def main() -> None:
         )
         alpha = st.slider("Overlay opacity", 0.0, 1.0, 0.45, 0.05)
 
+    # ---- session defaults ---------------------------------------------------
+    for key, default in (
+        ("text_result", None),
+        ("points", None),
+        ("last_click", None),
+        ("point_mask", None),
+        ("interactive_masks", None),
+        ("propagation_review", None),
+        ("prop_frame", None),
+    ):
+        if key not in st.session_state:
+            if key == "points":
+                st.session_state[key] = []
+            elif key == "interactive_masks":
+                st.session_state[key] = {}
+            else:
+                st.session_state[key] = default
+
     # ---- load file, reset per-file state -----------------------------------
     data, geometry = load_file(selected)
     if st.session_state.get("loaded_path") != selected:
@@ -253,6 +326,8 @@ def main() -> None:
         st.session_state.last_click = None
         st.session_state.point_mask = None
         st.session_state.interactive_masks = {}
+        st.session_state.propagation_review = None
+        st.session_state.prop_frame = None
 
     # ---- sidebar: geometry read from the headers ---------------------------
     with st.sidebar:
@@ -315,7 +390,8 @@ def main() -> None:
                 st.caption(f"t = {geometry.sample_to_time_ms(i):.0f} ms")
             slice_idx = i
 
-    slice_rgb = current_slice_rgb(data, geometry, slice_axis, slice_idx)
+    data_u8 = load_normalized(selected)
+    slice_rgb = current_slice_rgb(data_u8, geometry, slice_axis, slice_idx)
     slice_h, slice_w = slice_rgb.shape[:2]
 
     tab_auto, tab_pick = st.tabs(
@@ -397,11 +473,80 @@ def main() -> None:
     # Tab 2: interactive point picking
     # ======================================================================
     with tab_pick:
+        # ---- Propagation review (SAM2-style frame scrubber) -----------------
+        # After "Propagate through volume", the per-slice masks are kept as a
+        # frame stack so you can scrub forward/backward and see the tracking
+        # result - the sidebar alone was easy to miss and went through a
+        # volume reshape that did not feel like video playback.
+        review = st.session_state.get("propagation_review")
+        display_axis = slice_axis
+        display_idx = slice_idx
+        if review is not None:
+            st.subheader("Review propagation")
+            st.caption(
+                f"Scrub along **{review['axis']}** to see how the mask "
+                f"tracked across the volume (SAM 2 video-style). "
+                f"Anchor was frame {review['anchor']}."
+            )
+            n_rev = int(review["masks"].shape[0])
+            default_frame = st.session_state.get("prop_frame")
+            if default_frame is None or not (0 <= default_frame < n_rev):
+                default_frame = int(review["anchor"])
+            display_idx = st.slider(
+                f"Propagated frame ({review['axis']})",
+                0,
+                n_rev - 1,
+                value=default_frame,
+                key="prop_review_scrub",
+            )
+            st.session_state.prop_frame = display_idx
+            display_axis = review["axis"]
+            frame_cov = 100.0 * float(review["masks"][display_idx].mean())
+            st.caption(
+                f"Frame {display_idx} / {n_rev - 1} — coverage on this slice "
+                f"{frame_cov:.2f}% (total volume "
+                f"{100.0 * float(review['masks'].mean()):.2f}%)"
+            )
+            if st.button("Clear propagation review"):
+                st.session_state.propagation_review = None
+                st.session_state.prop_frame = None
+                st.rerun()
+
+        # Recompute the displayed slice when the review scrubber overrides
+        # the sidebar navigation (same file, different frame index/axis).
+        if display_axis != slice_axis or display_idx != slice_idx:
+            slice_rgb = current_slice_rgb(data_u8, geometry, display_axis, display_idx)
+            slice_h, slice_w = slice_rgb.shape[:2]
+            slice_axis, slice_idx = display_axis, display_idx
+
+        if geometry.kind == "2d":
+            st.caption(
+                "This file is a single 2D line: one cross-section whose "
+                "vertical axis is the **entire time range** "
+                f"({geometry.n_samples} samples x {geometry.dt_ms:g} ms = "
+                f"{geometry.sample_to_time_ms(geometry.n_samples - 1):,.0f} ms). "
+                "It is the seismic equivalent of one video frame, so there is "
+                "nothing to propagate through - the mask you make here already "
+                "covers all of time and all traces on this line. Propagation "
+                "through inlines (like SAM 2 video) applies to 3D volumes."
+            )
+
         ctl1, ctl2, ctl3, ctl4 = st.columns([2, 1, 1, 2])
         with ctl1:
             click_label = st.radio(
                 "Click adds", ["positive point", "negative point"],
                 horizontal=True, label_visibility="collapsed",
+            )
+            live_preview = st.checkbox(
+                "Live mask preview (segment on every click)", value=True,
+                help="Like the SAM 2 demo: the mask updates as soon as you "
+                "click. The image is encoded once and cached, so the first "
+                "click is slow (full encoder) and later clicks are fast.",
+            )
+            mask_name = st.text_input(
+                "Mask label (used in Export / ParaView)",
+                value="picked object",
+                key="mask_label_name",
             )
         with ctl2:
             if st.button("Undo point") and st.session_state.points:
@@ -426,19 +571,77 @@ def main() -> None:
                 "coordinates are mapped back to true samples either way.",
             )
 
-        # Only picks on the current slice are shown/used.
-        skey = slice_state_key(slice_axis, slice_idx)
+        # Only picks on the current slice are shown/used. The key includes
+        # the file stem so switching files never reuses another file's
+        # click-component state (which used to replay a stale click onto
+        # the newly selected file).
+        skey = f"{Path(selected).stem}:{slice_state_key(slice_axis, slice_idx)}"
+
+        def _segment_current_points() -> bool:
+            """Segment from all points on this slice; save mask for export."""
+            pts = [p for p in st.session_state.points if p["slice"] == skey]
+            if not pts:
+                return False
+            log.info(
+                "=== Point segmentation (%d point(s) on %s) ===", len(pts), selected
+            )
+            try:
+                tracker = load_point_segmenter(checkpoint, device_arg)
+                with st.spinner(
+                    "Segmenting from points... (see terminal for progress)"
+                ):
+                    mask = tracker.segment(
+                        slice_rgb,
+                        [(p["col"], p["row"]) for p in pts],
+                        [p["label"] for p in pts],
+                    )
+            except Exception as exc:
+                log.error("Point segmentation FAILED: %s", exc)
+                log.error(traceback.format_exc())
+                st.error(f"Point segmentation failed: {exc}")
+                st.caption("Check the terminal for the full traceback.")
+                return False
+            st.session_state.point_mask = mask
+            st.session_state.point_mask_slice = skey
+            store_interactive_mask(
+                mask, mask_name, data, geometry, slice_axis, slice_idx
+            )
+            return True
+
         slice_points = [p for p in st.session_state.points if p["slice"] == skey]
 
         # --- render the clickable section at a known display scale ---------
+        # Overlay every saved interactive mask (sliced to the current view,
+        # so a propagated volume mask stays visible while you browse
+        # inlines/crosslines/time slices), plus the live pick preview.
+        # When a propagation review stack is active, prefer its per-frame
+        # mask for that frame - that is the SAM2-style scrubbing view.
         scale_x = display_width / slice_w
         scale_y = display_height / slice_h
-        base_img = Image.fromarray(slice_rgb)
-        if st.session_state.point_mask is not None:
-            base_img = overlay_masks(
-                slice_rgb, {"picked object": st.session_state.point_mask},
-                alpha=alpha,
-            ).convert("RGB")
+        overlay_dict: dict[str, np.ndarray] = {}
+        review = st.session_state.get("propagation_review")
+        if (
+            review is not None
+            and review["axis"] == slice_axis
+            and 0 <= slice_idx < review["masks"].shape[0]
+        ):
+            overlay_dict[review["name"]] = review["masks"][slice_idx]
+        for name, m in st.session_state.interactive_masks.items():
+            if name in overlay_dict:
+                continue  # already showing the review-frame version
+            if geometry.kind == "3d" and getattr(m, "ndim", 0) == 3:
+                overlay_dict[name] = slice_volume_mask(m, slice_axis, slice_idx)
+            elif geometry.kind != "3d":
+                overlay_dict[name] = m
+        if (
+            st.session_state.point_mask is not None
+            and st.session_state.get("point_mask_slice") == skey
+        ):
+            overlay_dict["current pick"] = st.session_state.point_mask
+        if overlay_dict:
+            base_img = overlay_masks(slice_rgb, overlay_dict, alpha=alpha).convert("RGB")
+        else:
+            base_img = Image.fromarray(slice_rgb)
         disp_img = base_img.resize(
             (display_width, display_height), Image.Resampling.BILINEAR
         )
@@ -473,6 +676,9 @@ def main() -> None:
                 row,
             )
             st.session_state.point_mask = None
+            if live_preview:
+                # SAM2-demo behavior: refresh the mask on every click.
+                _segment_current_points()
             st.rerun()
 
         if slice_points:
@@ -484,64 +690,109 @@ def main() -> None:
                     f"{describe_pick(geometry, slice_axis, slice_idx, pt['col'], pt['row'])}"
                 )
 
-            seg1, seg2 = st.columns([1, 2])
+            seg1, seg2 = st.columns([1, 1])
             with seg1:
-                segment_clicked = st.button("Segment from points", type="primary")
-            with seg2:
-                mask_name = st.text_input(
-                    "Label name for this mask",
-                    value="picked object",
-                    help="Used as the layer name in Export / ParaView.",
+                segment_clicked = st.button(
+                    "Segment from points", type="primary",
+                    help="Re-runs the mask from all current points. With live "
+                    "preview on, this happens automatically per click.",
                 )
+            with seg2:
+                propagate_clicked = False
+                if geometry.kind == "3d":
+                    propagate_clicked = st.button(
+                        f"Propagate through volume ({slice_axis} direction)",
+                        help="SAM 2 video-style: treats the slices along this "
+                        "axis as consecutive frames and tracks the picked "
+                        "object through the whole cube, both directions.",
+                    )
 
             if segment_clicked:
+                if _segment_current_points():
+                    st.success(
+                        f"Mask '{mask_name}' updated and saved. Keep clicking to "
+                        "refine, or scroll down to **Export** for PNG / NPZ / "
+                        "ParaView (.vts / .vti) downloads."
+                    )
+                    st.rerun()
+
+            if propagate_clicked:
                 log.info(
-                    "=== Point segmentation requested (%d points on %s) ===",
-                    len(slice_points),
-                    selected,
+                    "=== Volume propagation requested along %s from slice %d ===",
+                    slice_axis,
+                    slice_idx,
                 )
                 try:
-                    tracker = load_point_segmenter(checkpoint, device_arg)
-                    points_xy = [(p["col"], p["row"]) for p in slice_points]
-                    labels = [p["label"] for p in slice_points]
+                    propagator = load_propagator(checkpoint, device_arg)
+                    if slice_axis == "inline":
+                        n_frames = data.shape[0]
+                    elif slice_axis == "crossline":
+                        n_frames = data.shape[1]
+                    else:
+                        n_frames = data.shape[2]
                     with st.spinner(
-                        "Segmenting from points... (see terminal for progress)"
+                        f"Propagating through {n_frames} slices... "
+                        "(one tracker pass per slice - watch the terminal)"
                     ):
-                        mask = tracker.segment(slice_rgb, points_xy, labels)
-                    st.session_state.point_mask = mask
-                    # Auto-save into export layers so ParaView downloads appear
-                    # immediately - no separate "Add to layers" step required.
-                    saved_name = store_interactive_mask(
-                        mask,
-                        mask_name,
-                        data,
-                        geometry,
-                        slice_axis,
-                        slice_idx,
+                        frames = [
+                            current_slice_rgb(data_u8, geometry, slice_axis, i)
+                            for i in range(n_frames)
+                        ]
+                        frame_masks = propagator.propagate(
+                            frames,
+                            anchor_idx=slice_idx,
+                            points=[(p["col"], p["row"]) for p in slice_points],
+                            labels=[p["label"] for p in slice_points],
+                        )
+                    vol_shape = (data.shape[0], data.shape[2], data.shape[1])
+                    base_name = mask_name.strip() or "picked object"
+                    name = f"{base_name} (volume)"
+                    # Drop the single-slice preview of the same label so
+                    # scrubbing is not confused with a one-frame-only mask.
+                    st.session_state.interactive_masks.pop(base_name, None)
+                    st.session_state.interactive_masks[name] = place_frames_in_volume(
+                        frame_masks, vol_shape, slice_axis
                     )
+                    # Keep the raw per-frame stack for SAM2-style scrubbing
+                    # in the Interactive tab (does not depend on volume reshape).
+                    n_live = int(np.count_nonzero(frame_masks.reshape(n_frames, -1).any(axis=1)))
+                    st.session_state.propagation_review = {
+                        "axis": slice_axis,
+                        "masks": frame_masks,
+                        "name": name,
+                        "anchor": int(slice_idx),
+                    }
+                    st.session_state.prop_frame = int(slice_idx)
+                    st.session_state.point_mask = None
                     st.session_state.points = [
                         p for p in st.session_state.points if p["slice"] != skey
                     ]
-                    st.success(
-                        f"Mask '{saved_name}' ready. Scroll down to **Export** for "
-                        "PNG / NPZ / ParaView (.vts / .vti) downloads."
+                    log.info(
+                        "Volume propagation saved as '%s' "
+                        "(%d/%d frames have a non-empty mask)",
+                        name,
+                        n_live,
+                        n_frames,
                     )
-                    log.info("Point segmentation complete; export unlocked")
-                except Exception as exc:
-                    log.error("Point segmentation FAILED: %s", exc)
-                    log.error(traceback.format_exc())
-                    st.error(f"Point segmentation failed: {exc}")
-                    st.caption("Check the terminal for the full traceback.")
-                else:
+                    st.success(
+                        f"Propagated through {n_frames} slices ({n_live} with "
+                        f"mask). Use the **Review propagation** slider above "
+                        "to scrub forward/backward like a video."
+                    )
                     st.rerun()
+                except Exception as exc:
+                    log.error("Volume propagation FAILED: %s", exc)
+                    log.error(traceback.format_exc())
+                    st.error(f"Volume propagation failed: {exc}")
+                    st.caption("Check the terminal for the full traceback.")
         else:
-            st.info("No points on this slice yet - click on the image above.")
-
-        if st.session_state.point_mask is not None and not st.session_state.interactive_masks:
-            st.warning(
-                "A mask was segmented but not saved for export. "
-                "Click **Segment from points** again (it now saves automatically)."
-            )
+            if review is None:
+                st.info(
+                    "No points on this slice yet - click on the image above. "
+                    "With live preview on, the mask appears right after your "
+                    "first click. After you Propagate, a review slider appears "
+                    "so you can scrub through every frame."
+                )
 
         if st.session_state.interactive_masks:
             st.markdown(
@@ -555,6 +806,8 @@ def main() -> None:
                 )
                 st.session_state.interactive_masks = {}
                 st.session_state.point_mask = None
+                st.session_state.propagation_review = None
+                st.session_state.prop_frame = None
                 st.rerun()
 
     # ======================================================================

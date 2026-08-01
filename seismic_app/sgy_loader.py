@@ -20,15 +20,61 @@ import numpy as np
 import segyio
 
 from .geometry import SectionGeometry, extract_2d_geometry, extract_3d_geometry
+from .logutil import get_logger
+
+log = get_logger("sgy_loader")
+
+# Header byte positions that may carry inline/crossline numbering. The
+# SEG-Y standard says bytes 189/193, but many vendor exports put the grid
+# elsewhere (e.g. SEGY0000.sgy stores inline in EnergySourcePoint byte 17
+# and crossline in CDP_TRACE byte 25). Tried in order; first pair that
+# yields a consistent sorted grid wins.
+_ILINE_XLINE_CANDIDATES: list[tuple[int, int]] = [
+    (int(segyio.TraceField.INLINE_3D), int(segyio.TraceField.CROSSLINE_3D)),  # 189/193
+    (int(segyio.TraceField.EnergySourcePoint), int(segyio.TraceField.CDP_TRACE)),  # 17/25
+    (int(segyio.TraceField.FieldRecord), int(segyio.TraceField.TraceNumber)),  # 9/13
+    (int(segyio.TraceField.FieldRecord), int(segyio.TraceField.CDP)),  # 9/21
+]
+
+
+def _open_3d(path: str | Path):
+    """Try to open a file as a sorted 3D volume, scanning header layouts.
+
+    Returns an open segyio file (caller must close) or None if no
+    candidate inline/crossline byte pair produces a valid grid.
+    """
+    for il_byte, xl_byte in _ILINE_XLINE_CANDIDATES:
+        try:
+            f = segyio.open(str(path), iline=il_byte, xline=xl_byte)
+        except (RuntimeError, ValueError):
+            continue
+        try:
+            n_il, n_xl = len(f.ilines), len(f.xlines)
+        except (RuntimeError, ValueError):
+            f.close()
+            continue
+        if n_il > 1 and n_xl > 1 and n_il * n_xl == f.tracecount:
+            log.info(
+                "Opened %s as 3D volume (%d inlines x %d crosslines) using "
+                "header bytes iline=%d, xline=%d",
+                path,
+                n_il,
+                n_xl,
+                il_byte,
+                xl_byte,
+            )
+            return f
+        f.close()
+    return None
 
 
 def is_3d_volume(path: str | Path) -> bool:
-    """True when segyio can open the file as a sorted 3D volume."""
-    try:
-        with segyio.open(str(path), ignore_geometry=False):
-            return True
-    except (RuntimeError, ValueError):
+    """True when the file can be opened as a sorted 3D volume."""
+    f = _open_3d(path)
+    if f is None:
         return False
+    f.close()
+    return True
 
 
 def load_section(path: str | Path) -> tuple[np.ndarray, SectionGeometry]:
@@ -68,9 +114,17 @@ def load_volume(path: str | Path) -> tuple[np.ndarray, SectionGeometry]:
     if not path.exists():
         raise FileNotFoundError(f"SEG-Y file not found: {path}")
 
-    with segyio.open(str(path), ignore_geometry=False) as f:
+    f = _open_3d(path)
+    if f is None:
+        raise RuntimeError(
+            f"{path} could not be opened as a sorted 3D volume with any "
+            "known inline/crossline header layout."
+        )
+    try:
         cube = np.asarray(segyio.tools.cube(f), dtype=np.float32)
         geometry = extract_3d_geometry(f)
+    finally:
+        f.close()
 
     return cube, geometry
 
@@ -84,4 +138,5 @@ def load_any(path: str | Path) -> tuple[np.ndarray, SectionGeometry]:
     """
     if is_3d_volume(path):
         return load_volume(path)
+    log.info("Loading %s as a 2D line (no 3D grid found in headers)", path)
     return load_section(path)
