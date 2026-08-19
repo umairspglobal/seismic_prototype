@@ -40,15 +40,21 @@ export interface ErrorEvent {
 
 export type PropagationEvent = FrameEvent | DoneEvent | ErrorEvent;
 
+const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "http://127.0.0.1:8000";
+
+function apiUrl(path: string): string {
+  return `${API_BASE}${path}`;
+}
+
 export async function listFiles(): Promise<FileInfo[]> {
-  const res = await fetch("/api/files");
+  const res = await fetch(apiUrl("/api/files"));
   if (!res.ok) throw new Error(`Failed to list files: ${res.status}`);
   return res.json();
 }
 
 export function sliceUrl(file: string, axis: Axis, index: number): string {
   const params = new URLSearchParams({ file, axis, index: String(index) });
-  return `/api/slice?${params}`;
+  return apiUrl(`/api/slice?${params}`);
 }
 
 export async function prepareSlice(
@@ -56,7 +62,7 @@ export async function prepareSlice(
   axis: Axis,
   index: number,
 ): Promise<void> {
-  await fetch("/api/prepare", {
+  await fetch(apiUrl("/api/prepare"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ file, axis, index }),
@@ -70,7 +76,7 @@ export async function segment(
   points: Point[],
   signal?: AbortSignal,
 ): Promise<SegmentResult> {
-  const res = await fetch("/api/segment", {
+  const res = await fetch(apiUrl("/api/segment"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     signal,
@@ -94,7 +100,7 @@ export async function propagate(
   onEvent: (event: PropagationEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const res = await fetch("/api/propagate", {
+  const res = await fetch(apiUrl("/api/propagate"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     signal,
