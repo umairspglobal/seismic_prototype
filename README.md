@@ -114,12 +114,50 @@ streamlit run app.py
 - Pick a `.sgy` file; the sidebar shows the geometry read from its
   headers (type, sample interval, trace spacing, CDP range).
 - **Automatic tab**: run the five fixed text prompts, toggle layers.
-- **Point picking tab**: choose positive/negative, click points on the
-  section (each pick is echoed as CDP + time), press *Segment from
-  points*, then *Add to layers* with a name of your choosing. Interactive
-  masks are exported alongside the automatic ones.
+- **Point picking tab**: the active slice is encoded before clicking, then
+  positive/negative clicks update the mask from cached features. The last
+  click-to-preview and decoder timings are shown below the picker.
 - For 3D volumes the sidebar gains a slice navigator
   (inline / crossline / time slice); picking operates on the active slice.
+- Live masks stay lightweight until **Prepare export files** is clicked.
+  This avoids rebuilding compressed NPZ and ParaView payloads on every pick.
+
+### CUDA point and propagation benchmark
+
+The non-Streamlit benchmark harness measures interactive point inference on
+2D or 3D SEG-Y data and volume propagation on 3D data:
+
+```powershell
+python benchmarks/point_propagation_benchmark.py data/SEGY0000.sgy `
+  --checkpoint facebook/sam3 `
+  --device cuda `
+  --axis inline `
+  --anchor 10 `
+  --warm-runs 5
+```
+
+`--anchor` is zero-based and defaults to the middle slice. `--axis` accepts
+`inline`, `crossline`, or `time`. Use `--mode point`, `--mode propagation`,
+or the default `--mode both`. For a 2D line, point inference uses the full
+section and propagation is reported as skipped.
+
+The harness writes a JSON report to standard output. Model loading is timed
+separately from inference. Point results include the first (cold,
+vision-encoder) call, every cached warm call, warm p50/p95, and stage timings.
+Propagation reports frame preparation, video-session setup, tracker inference,
+cold/warm total time, p50/p95, and FPS. Use `--max-frames 15` for a quick
+centered sample, `--float32` for the unoptimized precision comparison, or
+`--compile` to evaluate `torch.compile` on a supported runtime. On CUDA, peak
+allocated and reserved VRAM are reported after model load.
+
+For automatic device selection, pass `--device auto`. It selects CUDA when
+available and otherwise runs on CPU with a note in the report. An explicit
+CUDA request also falls back to CPU when this PyTorch installation has no
+CUDA support. The checkpoint must already be available locally or accessible
+through an authenticated Hugging Face session; running the benchmark may
+otherwise download it. For the most comparable results, close other GPU
+workloads and keep the SEG-Y file, checkpoint, device, axis, anchor, and warm
+run count unchanged.
 
 ## Notes
 

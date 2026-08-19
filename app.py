@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -199,13 +200,17 @@ def store_interactive_mask(
     slice_axis: str,
     slice_idx: int,
 ) -> str:
-    """Save a point-picked mask into session state so Export can use it."""
+    """Store a point-picked mask without allocating a full volume per click."""
     name = name.strip() or "picked object"
     if geometry.kind == "3d":
         vol_shape = (data.shape[0], data.shape[2], data.shape[1])
-        st.session_state.interactive_masks[name] = place_slice_mask_in_volume(
-            mask, vol_shape, slice_axis, slice_idx
-        )
+        st.session_state.interactive_masks[name] = {
+            "kind": "slice",
+            "mask": mask,
+            "axis": slice_axis,
+            "index": int(slice_idx),
+            "volume_shape": vol_shape,
+        }
     else:
         st.session_state.interactive_masks[name] = mask
     coverage = 100.0 * float(mask.mean())
@@ -213,21 +218,45 @@ def store_interactive_mask(
     return name
 
 
-def place_frames_in_volume(
-    frame_masks: np.ndarray,  # (n_frames, H, W) from the propagator
-    volume_shape: tuple[int, int, int],  # (n_il, n_samples, n_xl)
+def materialize_interactive_mask(value: object) -> np.ndarray:
+    """Convert a lightweight saved slice into its exportable volume mask."""
+    if isinstance(value, np.ndarray):
+        return value
+    if isinstance(value, dict) and value.get("kind") == "slice":
+        return place_slice_mask_in_volume(
+            value["mask"],
+            tuple(value["volume_shape"]),
+            value["axis"],
+            int(value["index"]),
+        )
+    if isinstance(value, dict) and value.get("kind") == "frames":
+        frames = value["masks"]
+        if value["axis"] == "inline":
+            return frames
+        if value["axis"] == "crossline":
+            return np.transpose(frames, (2, 1, 0))
+        return np.transpose(frames, (1, 0, 2))
+    raise TypeError(f"Unsupported interactive mask value: {type(value)!r}")
+
+
+def saved_mask_for_slice(
+    value: object,
     slice_axis: str,
-) -> np.ndarray:
-    """Stack propagated per-slice masks back into a full-volume mask."""
-    vol = np.zeros(volume_shape, dtype=bool)
-    if slice_axis == "inline":
-        vol[:] = frame_masks  # frames are (n_samples, n_xl)
-    elif slice_axis == "crossline":
-        # frames are (n_samples, n_il) -> (n_il, n_samples) per crossline
-        vol[:] = np.transpose(frame_masks, (2, 1, 0))
-    else:  # time slices: frames are (n_il, n_xl)
-        vol[:] = np.transpose(frame_masks, (1, 0, 2))
-    return vol
+    slice_idx: int,
+) -> np.ndarray | None:
+    """Return only the visible 2D cut of a saved mask."""
+    if isinstance(value, dict) and value.get("kind") == "slice":
+        if value["axis"] == slice_axis and int(value["index"]) == slice_idx:
+            return value["mask"]
+        return None
+    if isinstance(value, dict) and value.get("kind") == "frames":
+        volume_view = materialize_interactive_mask(value)
+        return slice_volume_mask(volume_view, slice_axis, slice_idx)
+    if isinstance(value, np.ndarray):
+        if value.ndim == 3:
+            return slice_volume_mask(value, slice_axis, slice_idx)
+        return value
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +285,22 @@ def draw_point_markers(
 
 def slice_state_key(slice_axis: str, slice_idx: int) -> str:
     return f"{slice_axis}:{slice_idx}"
+
+
+def display_to_slice_coordinates(
+    x: float,
+    y: float,
+    display_size: tuple[int, int],
+    slice_size: tuple[int, int],
+) -> tuple[int, int]:
+    """Map displayed image pixels to clamped full-resolution (col, row)."""
+    display_width, display_height = display_size
+    slice_width, slice_height = slice_size
+    scale_x = display_width / slice_width
+    scale_y = display_height / slice_height
+    col = int(np.clip(round(x / scale_x), 0, slice_width - 1))
+    row = int(np.clip(round(y / scale_y), 0, slice_height - 1))
+    return col, row
 
 
 # --------------------------------------------------------------------------
@@ -307,11 +352,17 @@ def main() -> None:
         ("interactive_masks", None),
         ("propagation_review", None),
         ("prop_frame", None),
+        ("display_base_cache", None),
+        ("point_preview_started", None),
+        ("point_preview_latency", None),
+        ("export_payloads", None),
     ):
         if key not in st.session_state:
             if key == "points":
                 st.session_state[key] = []
             elif key == "interactive_masks":
+                st.session_state[key] = {}
+            elif key == "display_base_cache":
                 st.session_state[key] = {}
             else:
                 st.session_state[key] = default
@@ -328,6 +379,8 @@ def main() -> None:
         st.session_state.interactive_masks = {}
         st.session_state.propagation_review = None
         st.session_state.prop_frame = None
+        st.session_state.display_base_cache = {}
+        st.session_state.export_payloads = None
 
     # ---- sidebar: geometry read from the headers ---------------------------
     with st.sidebar:
@@ -417,6 +470,7 @@ def main() -> None:
                             data, geometry, segmenter, threshold=threshold
                         )
                 st.session_state.text_result = result
+                st.session_state.export_payloads = None
                 log.info("Automatic segmentation complete for %s", selected)
             except Exception as exc:
                 log.error("Automatic segmentation FAILED: %s", exc)
@@ -576,6 +630,18 @@ def main() -> None:
         # click-component state (which used to replay a stale click onto
         # the newly selected file).
         skey = f"{Path(selected).stem}:{slice_state_key(slice_axis, slice_idx)}"
+        image_key = (str(Path(selected).resolve()), slice_axis, int(slice_idx))
+
+        point_tracker: Sam3PointSegmenter | None = None
+        if live_preview:
+            try:
+                point_tracker = load_point_segmenter(checkpoint, device_arg)
+                with st.spinner("Preparing active slice for instant point prompts..."):
+                    point_tracker.prepare_image(slice_rgb, image_key=image_key)
+                st.caption("Interactive model ready; point clicks use cached image features.")
+            except Exception as exc:
+                log.error("Interactive model preparation failed: %s", exc)
+                st.warning(f"Live preview is not ready: {exc}")
 
         def _segment_current_points() -> bool:
             """Segment from all points on this slice; save mask for export."""
@@ -586,7 +652,7 @@ def main() -> None:
                 "=== Point segmentation (%d point(s) on %s) ===", len(pts), selected
             )
             try:
-                tracker = load_point_segmenter(checkpoint, device_arg)
+                tracker = point_tracker or load_point_segmenter(checkpoint, device_arg)
                 with st.spinner(
                     "Segmenting from points... (see terminal for progress)"
                 ):
@@ -594,7 +660,9 @@ def main() -> None:
                         slice_rgb,
                         [(p["col"], p["row"]) for p in pts],
                         [p["label"] for p in pts],
+                        image_key=image_key,
                     )
+                st.session_state.point_inference_timings = dict(tracker.last_timings)
             except Exception as exc:
                 log.error("Point segmentation FAILED: %s", exc)
                 log.error(traceback.format_exc())
@@ -606,6 +674,7 @@ def main() -> None:
             store_interactive_mask(
                 mask, mask_name, data, geometry, slice_axis, slice_idx
             )
+            st.session_state.export_payloads = None
             return True
 
         slice_points = [p for p in st.session_state.points if p["slice"] == skey]
@@ -629,23 +698,53 @@ def main() -> None:
         for name, m in st.session_state.interactive_masks.items():
             if name in overlay_dict:
                 continue  # already showing the review-frame version
-            if geometry.kind == "3d" and getattr(m, "ndim", 0) == 3:
-                overlay_dict[name] = slice_volume_mask(m, slice_axis, slice_idx)
-            elif geometry.kind != "3d":
-                overlay_dict[name] = m
+            shown = saved_mask_for_slice(m, slice_axis, slice_idx)
+            if shown is not None:
+                overlay_dict[name] = shown
         if (
             st.session_state.point_mask is not None
             and st.session_state.get("point_mask_slice") == skey
         ):
             overlay_dict["current pick"] = st.session_state.point_mask
-        if overlay_dict:
-            base_img = overlay_masks(slice_rgb, overlay_dict, alpha=alpha).convert("RGB")
-        else:
-            base_img = Image.fromarray(slice_rgb)
-        disp_img = base_img.resize(
-            (display_width, display_height), Image.Resampling.BILINEAR
+        display_cache_key = (
+            str(Path(selected).resolve()),
+            slice_axis,
+            int(slice_idx),
+            int(display_width),
+            int(display_height),
         )
+        display_cache = st.session_state.display_base_cache
+        if display_cache_key not in display_cache:
+            display_cache[display_cache_key] = Image.fromarray(slice_rgb).resize(
+                (display_width, display_height), Image.Resampling.BILINEAR
+            )
+            while len(display_cache) > 8:
+                display_cache.pop(next(iter(display_cache)))
+        base_img = display_cache[display_cache_key]
+        if overlay_dict:
+            display_masks = {
+                name: np.asarray(
+                    Image.fromarray(mask).resize(
+                        (display_width, display_height), Image.Resampling.NEAREST
+                    ),
+                    dtype=bool,
+                )
+                for name, mask in overlay_dict.items()
+            }
+            disp_img = overlay_masks(
+                np.asarray(base_img), display_masks, alpha=alpha
+            ).convert("RGB")
+        else:
+            disp_img = base_img.copy()
         disp_img = draw_point_markers(disp_img, slice_points, scale_x, scale_y)
+        if (
+            st.session_state.point_preview_started is not None
+            and st.session_state.point_mask is not None
+        ):
+            latency = time.perf_counter() - st.session_state.point_preview_started
+            st.session_state.point_preview_latency = latency
+            st.session_state.point_preview_started = None
+            log.info("Click-to-rendered-preview path completed in %.3fs", latency)
 
         st.caption(
             "Click on the section to add points. Time runs down, traces "
@@ -655,8 +754,12 @@ def main() -> None:
 
         if click is not None and click != st.session_state.last_click:
             st.session_state.last_click = click
-            col = int(np.clip(round(click["x"] / scale_x), 0, slice_w - 1))
-            row = int(np.clip(round(click["y"] / scale_y), 0, slice_h - 1))
+            col, row = display_to_slice_coordinates(
+                click["x"],
+                click["y"],
+                (display_width, display_height),
+                (slice_w, slice_h),
+            )
             label = 1 if click_label == "positive point" else 0
             st.session_state.points.append(
                 {
@@ -678,8 +781,17 @@ def main() -> None:
             st.session_state.point_mask = None
             if live_preview:
                 # SAM2-demo behavior: refresh the mask on every click.
+                st.session_state.point_preview_started = time.perf_counter()
                 _segment_current_points()
             st.rerun()
+
+        if st.session_state.point_preview_latency is not None:
+            timings = st.session_state.get("point_inference_timings", {})
+            st.caption(
+                f"Last preview: {st.session_state.point_preview_latency:.2f}s end-to-end "
+                f"(decoder {timings.get('prompt_decode', 0.0):.2f}s, "
+                f"post-process {timings.get('post_process', 0.0):.2f}s)"
+            )
 
         if slice_points:
             st.markdown("**Picked points (physical coordinates):**")
@@ -734,25 +846,56 @@ def main() -> None:
                         f"Propagating through {n_frames} slices... "
                         "(one tracker pass per slice - watch the terminal)"
                     ):
+                        progress_bar = st.progress(0.0, text="Preparing frame stack...")
+                        progress_slot = st.empty()
+                        prep_started = time.perf_counter()
                         frames = [
                             current_slice_rgb(data_u8, geometry, slice_axis, i)
                             for i in range(n_frames)
                         ]
+                        prep_elapsed = time.perf_counter() - prep_started
+
+                        def _update_progress(
+                            done: int,
+                            total: int,
+                            frame_idx: int,
+                            frame_mask: np.ndarray,
+                        ) -> None:
+                            progress_bar.progress(
+                                done / total,
+                                text=f"Tracked {done}/{total} slices",
+                            )
+                            if done == 1 or done == total or done % max(1, total // 20) == 0:
+                                progress_slot.caption(
+                                    f"Latest frame {frame_idx}: "
+                                    f"{100.0 * float(frame_mask.mean()):.2f}% coverage"
+                                )
+
                         frame_masks = propagator.propagate(
                             frames,
                             anchor_idx=slice_idx,
                             points=[(p["col"], p["row"]) for p in slice_points],
                             labels=[p["label"] for p in slice_points],
+                            progress=_update_progress,
                         )
+                        progress_bar.progress(1.0, text="Propagation complete")
+                        st.session_state.propagation_timings = {
+                            "frame_prep": prep_elapsed,
+                            **propagator.last_timings,
+                        }
                     vol_shape = (data.shape[0], data.shape[2], data.shape[1])
                     base_name = mask_name.strip() or "picked object"
                     name = f"{base_name} (volume)"
                     # Drop the single-slice preview of the same label so
                     # scrubbing is not confused with a one-frame-only mask.
                     st.session_state.interactive_masks.pop(base_name, None)
-                    st.session_state.interactive_masks[name] = place_frames_in_volume(
-                        frame_masks, vol_shape, slice_axis
-                    )
+                    st.session_state.interactive_masks[name] = {
+                        "kind": "frames",
+                        "masks": frame_masks,
+                        "axis": slice_axis,
+                        "volume_shape": vol_shape,
+                    }
+                    st.session_state.export_payloads = None
                     # Keep the raw per-frame stack for SAM2-style scrubbing
                     # in the Interactive tab (does not depend on volume reshape).
                     n_live = int(np.count_nonzero(frame_masks.reshape(n_frames, -1).any(axis=1)))
@@ -808,6 +951,7 @@ def main() -> None:
                 st.session_state.point_mask = None
                 st.session_state.propagation_review = None
                 st.session_state.prop_frame = None
+                st.session_state.export_payloads = None
                 st.rerun()
 
     # ======================================================================
@@ -816,12 +960,11 @@ def main() -> None:
     st.divider()
     st.subheader("Export")
 
-    export_masks_dict: dict[str, np.ndarray] = {}
-    if st.session_state.text_result is not None:
-        export_masks_dict.update(st.session_state.text_result.masks)
-    export_masks_dict.update(st.session_state.interactive_masks)
-
-    if not export_masks_dict:
+    has_export_masks = (
+        st.session_state.text_result is not None
+        or bool(st.session_state.interactive_masks)
+    )
+    if not has_export_masks:
         st.info(
             "No masks to export yet. Either run **Automatic** segmentation, or in "
             "**Interactive** pick points and click **Segment from points** "
@@ -829,51 +972,62 @@ def main() -> None:
         )
         return
 
-    log.info(
-        "Export ready with %d mask layer(s): %s",
-        len(export_masks_dict),
-        list(export_masks_dict),
-    )
     stem = Path(selected).stem
+    if st.button(
+        "Prepare export files",
+        help="Build compressed NPZ and ParaView files only when requested, "
+        "so live point clicks stay responsive.",
+    ):
+        with st.spinner("Materializing masks and preparing export files..."):
+            export_masks_dict: dict[str, np.ndarray] = {}
+            if st.session_state.text_result is not None:
+                export_masks_dict.update(st.session_state.text_result.masks)
+            export_masks_dict.update(
+                {
+                    name: materialize_interactive_mask(value)
+                    for name, value in st.session_state.interactive_masks.items()
+                }
+            )
+            prepared: list[tuple[str, bytes, str]] = []
+            if geometry.kind == "2d":
+                overlay_all = overlay_masks(slice_rgb, export_masks_dict, alpha=alpha)
+                png_buffer = io.BytesIO()
+                overlay_all.convert("RGB").save(png_buffer, format="PNG")
+                prepared.append((".png", png_buffer.getvalue(), "image/png"))
 
-    # Overlay PNG (2D only - a volume has no single overlay image).
-    if geometry.kind == "2d":
-        overlay_all = overlay_masks(slice_rgb, export_masks_dict, alpha=alpha)
-        png_buffer = io.BytesIO()
-        overlay_all.convert("RGB").save(png_buffer, format="PNG")
-        st.download_button(
-            "Download overlay PNG",
-            data=png_buffer.getvalue(),
-            file_name=f"{stem}_overlay.png",
-            mime="image/png",
-        )
+            npz_buffer = io.BytesIO()
+            np.savez_compressed(
+                npz_buffer,
+                **{k.replace(" ", "_"): v for k, v in export_masks_dict.items()},
+            )
+            prepared.append(
+                (".npz", npz_buffer.getvalue(), "application/octet-stream")
+            )
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                written = export_masks(
+                    export_masks_dict, data, geometry, Path(tmp_dir) / "masks"
+                )
+                prepared.extend(
+                    (p.suffix, p.read_bytes(), "application/octet-stream")
+                    for p in written
+                )
+            st.session_state.export_payloads = prepared
+            log.info("Prepared %d export payload(s)", len(prepared))
 
-    npz_buffer = io.BytesIO()
-    np.savez_compressed(
-        npz_buffer, **{k.replace(" ", "_"): v for k, v in export_masks_dict.items()}
-    )
-    st.download_button(
-        "Download masks (.npz)",
-        data=npz_buffer.getvalue(),
-        file_name=f"{stem}_masks.npz",
-        mime="application/octet-stream",
-    )
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        written = export_masks(
-            export_masks_dict, data, geometry, Path(tmp_dir) / "masks"
-        )
-        payloads = [(p.suffix, p.read_bytes()) for p in written]
-    for suffix, blob in payloads:
+    for suffix, blob, mime in st.session_state.export_payloads or []:
         label = {
+            ".png": "Download overlay PNG",
+            ".npz": "Download masks (.npz)",
             ".vts": "Download masks (.vts - world coordinates, for ParaView)",
             ".vti": "Download masks (.vti - regular grid, for ParaView)",
         }.get(suffix, f"Download masks ({suffix})")
         st.download_button(
             label,
             data=blob,
-            file_name=f"{stem}_masks{suffix}",
-            mime="application/octet-stream",
+            file_name=(
+                f"{stem}_overlay.png" if suffix == ".png" else f"{stem}_masks{suffix}"
+            ),
+            mime=mime,
             help="Geometry (trace positions, sample interval, delay time) is "
             "read from the SEG-Y headers, so the masks land exactly on the "
             "seismic in ParaView. Threshold by 'label' to isolate features.",

@@ -13,6 +13,10 @@ but quality against natural-image-trained weights will vary per concept.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from collections.abc import Callable, Hashable, Sequence
+from contextlib import nullcontext
+import importlib.util
 import time
 
 import numpy as np
@@ -43,6 +47,15 @@ class Sam3SeismicSegmenter:
                 "CUDA was requested, but this Python environment has no CUDA-enabled "
                 "PyTorch build. Install a CUDA PyTorch wheel in the active environment "
                 "or select CPU."
+            )
+        if (
+            compile_model
+            and hasattr(torch, "compile")
+            and importlib.util.find_spec("triton") is None
+        ):
+            raise RuntimeError(
+                "torch.compile requires Triton, which is unavailable in this "
+                "environment; run without compile_model."
             )
         self.prompts = prompts or config.SEISMIC_PROMPTS
 
@@ -106,6 +119,7 @@ class Sam3PointSegmenter:
         self,
         checkpoint: str = config.DEFAULT_CHECKPOINT,
         device: str | None = None,
+        embedding_cache_size: int = 2,
     ):
         from transformers import Sam3TrackerModel, Sam3TrackerProcessor  # deferred
 
@@ -132,27 +146,55 @@ class Sam3PointSegmenter:
         self.processor = Sam3TrackerProcessor.from_pretrained(checkpoint)
         log.info("Point-prompt tracker ready on %s", self.device)
 
-        # SAM2-demo-style interactivity: the heavy vision encoder runs once
-        # per image and is cached; every subsequent click only re-runs the
-        # lightweight prompt encoder + mask decoder.
-        self._embed_key: tuple | None = None
-        self._embeddings = None
+        # Keep only a few sections resident: embeddings are large GPU tensors.
+        self.embedding_cache_size = max(1, int(embedding_cache_size))
+        self._prepared: OrderedDict[Hashable, dict] = OrderedDict()
+        self.last_timings: dict[str, float] = {}
 
-    def _image_embeddings(self, rgb: np.ndarray, pixel_values: torch.Tensor):
-        """Return cached vision-encoder features for this exact image."""
-        key = (rgb.shape, hash(rgb.tobytes()))
-        if self._embed_key != key:
-            log.info(
-                "Encoding image with the vision backbone (one-time per section; "
-                "later clicks reuse the cache and are much faster)..."
-            )
-            t0 = time.perf_counter()
-            self._embeddings = self.model.get_image_embeddings(pixel_values)
-            self._embed_key = key
-            log.info("Image encoded in %.1fs (cached)", time.perf_counter() - t0)
-        else:
-            log.info("Using cached image embeddings (fast path)")
-        return self._embeddings
+    def _sync_cuda(self) -> None:
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize()
+
+    def _autocast(self):
+        if self.device.startswith("cuda") and torch.cuda.is_bf16_supported():
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
+
+    @torch.no_grad()
+    def prepare_image(
+        self,
+        rgb: np.ndarray,
+        image_key: Hashable | None = None,
+    ) -> Hashable:
+        """Preprocess and encode a section before the first point is clicked."""
+        key = image_key if image_key is not None else ("array", id(rgb), rgb.shape)
+        if key in self._prepared:
+            self._prepared.move_to_end(key)
+            self.last_timings["prepare_image"] = 0.0
+            return key
+
+        log.info("Preparing image features for %r...", key)
+        self._sync_cuda()
+        started = time.perf_counter()
+        inputs = self.processor(
+            images=Image.fromarray(rgb),
+            return_tensors="pt",
+        ).to(self.device)
+        with self._autocast():
+            embeddings = self.model.get_image_embeddings(inputs["pixel_values"])
+        self._sync_cuda()
+        elapsed = time.perf_counter() - started
+        self._prepared[key] = {
+            "embeddings": embeddings,
+            "original_sizes": inputs["original_sizes"].detach().cpu(),
+            "shape": rgb.shape[:2],
+        }
+        self._prepared.move_to_end(key)
+        while len(self._prepared) > self.embedding_cache_size:
+            self._prepared.popitem(last=False)
+        self.last_timings["prepare_image"] = elapsed
+        log.info("Image features ready in %.3fs (%d cached)", elapsed, len(self._prepared))
+        return key
 
     @torch.no_grad()
     def segment(
@@ -160,6 +202,7 @@ class Sam3PointSegmenter:
         rgb: np.ndarray,
         points: list[tuple[int, int]],
         labels: list[int],
+        image_key: Hashable | None = None,
     ) -> np.ndarray:
         """Segment one object indicated by clicked points.
 
@@ -190,34 +233,44 @@ class Sam3PointSegmenter:
         )
         t0 = time.perf_counter()
 
-        image = Image.fromarray(rgb)
+        key = self.prepare_image(rgb, image_key=image_key)
+        prepared = self._prepared[key]
         # 4D: (image, object, point, xy) - one image, one object.
         input_points = [[[[float(x), float(y)] for x, y in points]]]
         input_labels = [[[int(l) for l in labels]]]
 
+        self._sync_cuda()
+        prompt_started = time.perf_counter()
         inputs = self.processor(
-            images=image,
             input_points=input_points,
             input_labels=input_labels,
+            original_sizes=prepared["original_sizes"],
             return_tensors="pt",
         ).to(self.device)
 
-        # Swap raw pixels for cached embeddings: the vision encoder (the
-        # slow part) runs only when the image changes.
-        embeddings = self._image_embeddings(rgb, inputs["pixel_values"])
-        model_inputs = {k: v for k, v in inputs.items() if k != "pixel_values"}
-        model_inputs["image_embeddings"] = embeddings
+        model_inputs = dict(inputs)
+        model_inputs["image_embeddings"] = prepared["embeddings"]
 
         log.info("Running prompt encoder + mask decoder...")
-        outputs = self.model(**model_inputs)
+        with self._autocast():
+            outputs = self.model(**model_inputs)
+        self._sync_cuda()
+        decoder_elapsed = time.perf_counter() - prompt_started
 
         # post_process_masks -> list per image of (n_objects, n_masks, H, W).
+        post_started = time.perf_counter()
         masks = self.processor.post_process_masks(
             outputs.pred_masks.cpu(), inputs["original_sizes"]
         )[0]
-        iou = outputs.iou_scores.cpu().numpy().reshape(-1)
+        iou = outputs.iou_scores.float().cpu().numpy().reshape(-1)
         best = int(iou.argmax())
         mask = np.asarray(masks[0, best], dtype=bool)
+        post_elapsed = time.perf_counter() - post_started
+        self.last_timings.update(
+            prompt_decode=decoder_elapsed,
+            post_process=post_elapsed,
+            total=time.perf_counter() - t0,
+        )
         coverage = 100.0 * float(mask.mean())
         log.info(
             "Point segmentation done in %.1fs (best IoU=%.3f, mask coverage=%.2f%%)",
@@ -247,6 +300,8 @@ class Sam3VolumePropagator:
         self,
         checkpoint: str = config.DEFAULT_CHECKPOINT,
         device: str | None = None,
+        use_bfloat16: bool = True,
+        compile_model: bool = False,
     ):
         from transformers import (  # deferred: heavy import
             Sam3TrackerVideoModel,
@@ -268,20 +323,37 @@ class Sam3VolumePropagator:
         t0 = time.perf_counter()
         self.model = Sam3TrackerVideoModel.from_pretrained(checkpoint).to(self.device)
         self.model.eval()
+        if compile_model and hasattr(torch, "compile"):
+            log.info("Compiling SAM 3 video tracker (first propagation will warm up)...")
+            self.model = torch.compile(self.model)
         self.processor = Sam3TrackerVideoProcessor.from_pretrained(checkpoint)
+        self.session_dtype = (
+            torch.bfloat16
+            if use_bfloat16
+            and self.device.startswith("cuda")
+            and torch.cuda.is_bf16_supported()
+            else torch.float32
+        )
+        self.last_timings: dict[str, float] = {}
         log.info(
             "Volume propagator ready on %s (loaded in %.1fs)",
             self.device,
             time.perf_counter() - t0,
         )
 
+    def _autocast(self):
+        if self.session_dtype == torch.bfloat16 and self.device.startswith("cuda"):
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
+
     @torch.no_grad()
     def propagate(
         self,
-        frames: list[np.ndarray],
+        frames: Sequence[np.ndarray] | np.ndarray,
         anchor_idx: int,
         points: list[tuple[int, int]],
         labels: list[int],
+        progress: Callable[[int, int, int, np.ndarray], None] | None = None,
     ) -> np.ndarray:
         """Track one object through a stack of slices.
 
@@ -315,11 +387,16 @@ class Sam3VolumePropagator:
         )
         t0 = time.perf_counter()
 
-        pil_frames = [Image.fromarray(f) for f in frames]
+        session_started = time.perf_counter()
         session = self.processor.init_video_session(
-            video=pil_frames,
+            video=frames,
             inference_device=self.device,
+            max_vision_features_cache_size=2,
+            dtype=self.session_dtype,
         )
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize()
+        self.last_timings["session_init"] = time.perf_counter() - session_started
 
         self.processor.add_inputs_to_inference_session(
             session,
@@ -332,34 +409,40 @@ class Sam3VolumePropagator:
 
         # Segment the anchor slice first, then sweep forward and backward.
         masks = np.zeros((n_frames, h, w), dtype=bool)
-        anchor_out = self.model(inference_session=session, frame_idx=anchor_idx)
-        masks[anchor_idx] = self._to_mask(anchor_out.pred_masks, h, w)
-        log.info("Anchor slice %d segmented; propagating forward...", anchor_idx)
+        with self._autocast():
+            anchor_out = self.model(inference_session=session, frame_idx=anchor_idx)
+            masks[anchor_idx] = self._to_mask(anchor_out.pred_masks, h, w)
+            if progress is not None:
+                progress(1, n_frames, anchor_idx, masks[anchor_idx])
+            log.info("Anchor slice %d segmented; propagating forward...", anchor_idx)
 
-        done = 1
-        for reverse in (False, True):
-            direction = "backward" if reverse else "forward"
-            for out in self.model.propagate_in_video_iterator(
-                session, start_frame_idx=anchor_idx, reverse=reverse
-            ):
-                if out.frame_idx == anchor_idx:
-                    continue
-                masks[out.frame_idx] = self._to_mask(out.pred_masks, h, w)
-                done += 1
-                log.info(
-                    "  slice %d/%d done (%s, %.2f%% coverage)",
-                    done,
-                    n_frames,
-                    direction,
-                    100.0 * float(masks[out.frame_idx].mean()),
-                )
-            if not reverse:
-                log.info("Forward sweep complete; propagating backward...")
+            done = 1
+            for reverse in (False, True):
+                direction = "backward" if reverse else "forward"
+                for out in self.model.propagate_in_video_iterator(
+                    session, start_frame_idx=anchor_idx, reverse=reverse
+                ):
+                    if out.frame_idx == anchor_idx:
+                        continue
+                    masks[out.frame_idx] = self._to_mask(out.pred_masks, h, w)
+                    done += 1
+                    if progress is not None:
+                        progress(done, n_frames, out.frame_idx, masks[out.frame_idx])
+                    if done == n_frames or done % max(1, n_frames // 10) == 0:
+                        log.info("  slice %d/%d done (%s)", done, n_frames, direction)
+                if not reverse:
+                    log.info("Forward sweep complete; propagating backward...")
 
+        total_elapsed = time.perf_counter() - t0
+        self.last_timings.update(
+            inference=total_elapsed - self.last_timings["session_init"],
+            total=total_elapsed,
+            fps=n_frames / total_elapsed if total_elapsed else float("inf"),
+        )
         log.info(
             "Volume propagation finished in %.1fs (%d/%d slices, total "
             "coverage %.2f%%)",
-            time.perf_counter() - t0,
+            total_elapsed,
             done,
             n_frames,
             100.0 * float(masks.mean()),
@@ -369,7 +452,7 @@ class Sam3VolumePropagator:
     def _to_mask(self, pred_masks: torch.Tensor, h: int, w: int) -> np.ndarray:
         """Threshold + resize one frame's predicted logits to (H, W) bool."""
         video_masks = self.processor.post_process_masks(
-            [pred_masks.cpu()], original_sizes=[(h, w)], binarize=True
+            [pred_masks], original_sizes=[(h, w)], binarize=True
         )[0]
         # (n_objects, 1, H, W) -> first (only) object.
-        return np.asarray(video_masks[0, 0].numpy(), dtype=bool)
+        return np.asarray(video_masks[0, 0].detach().cpu().numpy(), dtype=bool)

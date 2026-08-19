@@ -1,13 +1,13 @@
 torch
 torchvision
-transformers>=4.58
+transformers>=5.0,<6
 accelerate
 huggingface_hub
 segyio
 pillow
 numpy
 scipy
-streamlit
+streamlit>=1.37,<2
 streamlit-image-coordinates
 safetensors
 pyevtk
