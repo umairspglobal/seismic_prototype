@@ -21,6 +21,10 @@ env/
 # Streamlit
 .streamlit/secrets.toml
 
+# React frontend
+frontend/node_modules/
+frontend/dist/
+
 # SEG-Y / temporary data outputs
 *.vti
 *.vts

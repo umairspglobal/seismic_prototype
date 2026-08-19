@@ -105,7 +105,41 @@ Writes, per input file: `<name>_overlay.png`, `<name>_masks.npz`,
 spacing and sample interval are read from the SEG-Y headers;
 `--trace-spacing` / `--sample-interval` are optional overrides.
 
-### Interactive viewer
+### React interactive client (this branch)
+
+The smooth, SAM 2 demo-style interface: a React/TypeScript/Vite frontend
+talking to a persistent FastAPI inference service. Models, image
+embeddings, and video sessions stay resident between requests, so a
+point click round-trips in tens of milliseconds and propagation streams
+each tracked slice to the browser as it completes (scrub while it runs).
+
+Start the inference server (loads models on first use):
+
+```powershell
+uvicorn server.main:app --host 127.0.0.1 --port 8000
+```
+
+Start the frontend dev server in a second terminal:
+
+```powershell
+cd frontend
+npm install   # first time only (requires Node.js LTS)
+npm run dev
+```
+
+Then open http://localhost:5173. Or run both at once:
+
+```powershell
+.\start_react_app.ps1
+```
+
+Verify the API end-to-end (server must be running):
+
+```powershell
+python benchmarks/api_smoke_test.py --propagate
+```
+
+### Streamlit viewer (legacy)
 
 ```powershell
 streamlit run app.py
