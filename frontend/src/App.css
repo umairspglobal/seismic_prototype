@@ -143,6 +143,30 @@ body {
   margin-top: 10px;
 }
 
+.runtime-list {
+  margin: 10px 0 0;
+  display: grid;
+  grid-template-columns: 7.2rem 1fr;
+  gap: 6px 8px;
+  font-size: 0.78rem;
+}
+
+.runtime-list dt {
+  color: #8a949e;
+  font-weight: 500;
+}
+
+.runtime-list dd {
+  margin: 0;
+  color: #e6e9ec;
+  overflow-wrap: anywhere;
+}
+
+.runtime-mono {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 0.74rem;
+}
+
 .stats {
   margin-top: auto;
   display: flex;

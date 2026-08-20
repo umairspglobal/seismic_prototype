@@ -3,6 +3,8 @@ import {
   Axis,
   FileInfo,
   Point,
+  RuntimeInfo,
+  getRuntime,
   listFiles,
   maskDataUrl,
   prepareSlice,
@@ -38,6 +40,7 @@ export default function App() {
   const [maskOpacity, setMaskOpacity] = useState(0.9);
   const [propagation, setPropagation] = useState<PropagationState | null>(null);
   const [status, setStatus] = useState("Connecting to inference server...");
+  const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
 
   // Per-frame propagated masks for instant scrubbing.
   const propMasksRef = useRef<Map<number, string>>(new Map());
@@ -55,6 +58,9 @@ export default function App() {
       .catch(() =>
         setStatus("Cannot reach the inference server. Start it with: uvicorn server.main:app"),
       );
+    getRuntime()
+      .then(setRuntime)
+      .catch(() => setRuntime(null));
   }, []);
 
   const axisCount = file ? file.axes[axis] : 1;
@@ -322,6 +328,76 @@ export default function App() {
               onChange={(e) => setMaskOpacity(Number(e.target.value))}
             />
           </label>
+        </details>
+
+        <details
+          className="display-settings"
+          onToggle={(event) => {
+            if ((event.currentTarget as HTMLDetailsElement).open) {
+              getRuntime().then(setRuntime).catch(() => setRuntime(null));
+            }
+          }}
+        >
+          <summary>Runtime</summary>
+          {runtime ? (
+            <dl className="runtime-list">
+              <dt>Hardware</dt>
+              <dd>{runtime.hardware.device_name}</dd>
+              <dt>CUDA</dt>
+              <dd>
+                {runtime.hardware.cuda_available
+                  ? `yes (${runtime.hardware.cuda_version ?? "unknown"}, sm ${runtime.hardware.compute_capability ?? "?"})`
+                  : "no — CPU"}
+              </dd>
+              {runtime.hardware.vram.total_gb != null && (
+                <>
+                  <dt>VRAM</dt>
+                  <dd>
+                    {runtime.hardware.vram.allocated_gb ?? "?"} /{" "}
+                    {runtime.hardware.vram.total_gb} GB used
+                  </dd>
+                </>
+              )}
+              <dt>Architecture</dt>
+              <dd>{runtime.architecture}</dd>
+              <dt>Checkpoint</dt>
+              <dd className="runtime-mono">{runtime.checkpoint}</dd>
+              <dt>Point model</dt>
+              <dd>
+                {runtime.point_model}
+                {runtime.point_loaded
+                  ? ` — loaded on ${runtime.point_device ?? "?"}`
+                  : " — not loaded yet"}
+              </dd>
+              <dt>Video model</dt>
+              <dd>
+                {runtime.video_model}
+                {runtime.video_loaded
+                  ? ` — loaded on ${runtime.video_device ?? "?"}${runtime.video_precision ? `, ${runtime.video_precision}` : ""}`
+                  : " — not loaded yet"}
+              </dd>
+              <dt>Embedding cache</dt>
+              <dd>
+                {runtime.cached_slices}/{runtime.embedding_cache_size ?? "?"} slices
+              </dd>
+              <dt>PyTorch</dt>
+              <dd>{runtime.software.torch}</dd>
+              <dt>Transformers</dt>
+              <dd>{runtime.software.transformers ?? "unknown"}</dd>
+              <dt>Python</dt>
+              <dd>{runtime.software.python}</dd>
+              {file && (
+                <>
+                  <dt>Active file</dt>
+                  <dd>
+                    {file.name} ({file.kind}, {file.shape.join(" × ")})
+                  </dd>
+                </>
+              )}
+            </dl>
+          ) : (
+            <p className="hint">Runtime details unavailable until the API is reachable.</p>
+          )}
         </details>
 
         <div className="stats">

@@ -40,6 +40,38 @@ export interface ErrorEvent {
 
 export type PropagationEvent = FrameEvent | DoneEvent | ErrorEvent;
 
+export interface RuntimeInfo {
+  checkpoint: string;
+  architecture: string;
+  point_model: string;
+  video_model: string;
+  point_loaded: boolean;
+  video_loaded: boolean;
+  point_device: string | null;
+  video_device: string | null;
+  video_precision: string | null;
+  embedding_cache_size: number | null;
+  cached_slices: number;
+  hardware: {
+    cuda_available: boolean;
+    device_name: string;
+    compute_capability: string | null;
+    cuda_version: string | null;
+    gpu_count: number;
+    vram: {
+      allocated_gb: number | null;
+      reserved_gb: number | null;
+      total_gb: number | null;
+    };
+  };
+  software: {
+    python: string;
+    platform: string;
+    torch: string;
+    transformers: string | null;
+  };
+}
+
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "http://127.0.0.1:8000";
 
 function apiUrl(path: string): string {
@@ -49,6 +81,12 @@ function apiUrl(path: string): string {
 export async function listFiles(): Promise<FileInfo[]> {
   const res = await fetch(apiUrl("/api/files"));
   if (!res.ok) throw new Error(`Failed to list files: ${res.status}`);
+  return res.json();
+}
+
+export async function getRuntime(): Promise<RuntimeInfo> {
+  const res = await fetch(apiUrl("/api/runtime"));
+  if (!res.ok) throw new Error(`Failed to load runtime info: ${res.status}`);
   return res.json();
 }
 

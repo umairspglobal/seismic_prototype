@@ -15,12 +15,15 @@ from __future__ import annotations
 import base64
 import io
 import json
+import platform
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
 
 import numpy as np
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
@@ -169,6 +172,76 @@ def list_files() -> list[dict]:
             }
         )
     return entries
+
+
+def _bytes_to_gb(n: int | None) -> float | None:
+    if n is None:
+        return None
+    return round(n / (1024**3), 2)
+
+
+@app.get("/api/runtime")
+def runtime_info() -> dict:
+    """Hardware, library, checkpoint, and loaded-model status for the sidebar."""
+    cuda_ok = torch.cuda.is_available()
+    device_name = torch.cuda.get_device_name(0) if cuda_ok else None
+    capability = None
+    vram: dict[str, float | None] = {
+        "allocated_gb": None,
+        "reserved_gb": None,
+        "total_gb": None,
+    }
+    if cuda_ok:
+        props = torch.cuda.get_device_properties(0)
+        capability = f"{props.major}.{props.minor}"
+        vram = {
+            "allocated_gb": _bytes_to_gb(torch.cuda.memory_allocated(0)),
+            "reserved_gb": _bytes_to_gb(torch.cuda.memory_reserved(0)),
+            "total_gb": _bytes_to_gb(props.total_memory),
+        }
+
+    try:
+        import transformers
+
+        transformers_version = transformers.__version__
+    except Exception:
+        transformers_version = None
+
+    with _gpu_lock:
+        point = _point_segmenter
+        video = _propagator
+
+    return {
+        "checkpoint": config.DEFAULT_CHECKPOINT,
+        "architecture": "SAM 3 (Hugging Face transformers)",
+        "point_model": "Sam3TrackerModel",
+        "video_model": "Sam3TrackerVideoModel",
+        "point_loaded": point is not None,
+        "video_loaded": video is not None,
+        "point_device": getattr(point, "device", None),
+        "video_device": getattr(video, "device", None),
+        "video_precision": (
+            str(getattr(video, "session_dtype", "")).replace("torch.", "")
+            if video is not None
+            else None
+        ),
+        "embedding_cache_size": getattr(point, "embedding_cache_size", None),
+        "cached_slices": len(getattr(point, "_prepared", {})),
+        "hardware": {
+            "cuda_available": cuda_ok,
+            "device_name": device_name or "CPU",
+            "compute_capability": capability,
+            "cuda_version": getattr(torch.version, "cuda", None),
+            "gpu_count": torch.cuda.device_count() if cuda_ok else 0,
+            "vram": vram,
+        },
+        "software": {
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "torch": torch.__version__,
+            "transformers": transformers_version,
+        },
+    }
 
 
 @app.get("/api/slice")
