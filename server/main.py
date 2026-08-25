@@ -42,8 +42,21 @@ log = get_logger("server")
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 
-MASK_COLOR = (255, 0, 255)
 MASK_ALPHA = 160
+# Per-object tint palette; must stay in sync with OBJECT_COLORS in
+# frontend/src/api.ts (markers and sidebar swatches use the same colors).
+OBJECT_COLORS: list[tuple[int, int, int]] = [
+    (255, 0, 255),  # magenta
+    (0, 191, 255),  # sky blue
+    (255, 214, 0),  # yellow
+    (25, 224, 131),  # mint
+    (255, 109, 0),  # orange
+    (162, 107, 255),  # violet
+]
+
+
+def _object_color(object_id: int) -> tuple[int, int, int]:
+    return OBJECT_COLORS[object_id % len(OBJECT_COLORS)]
 
 app = FastAPI(title="Seismic SAM interactive API")
 app.add_middleware(
@@ -128,13 +141,25 @@ def _validate_slice(
         raise HTTPException(422, f"Slice index {index} out of range [0, {count - 1}]")
 
 
-def _mask_png_base64(mask: np.ndarray) -> str:
-    """Encode a boolean mask as a pre-tinted RGBA PNG the browser overlays."""
-    rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
-    rgba[mask] = (*MASK_COLOR, MASK_ALPHA)
+def _rgba_png_base64(rgba: np.ndarray) -> str:
     buffer = io.BytesIO()
     Image.fromarray(rgba).save(buffer, format="PNG", compress_level=3)
     return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _mask_png_base64(mask: np.ndarray, object_id: int = 0) -> str:
+    """Encode a boolean mask as a pre-tinted RGBA PNG the browser overlays."""
+    rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    rgba[mask] = (*_object_color(object_id), MASK_ALPHA)
+    return _rgba_png_base64(rgba)
+
+
+def _masks_png_base64(masks: np.ndarray, object_ids: list[int]) -> str:
+    """Encode a (n_objects, H, W) bool stack as one combined tinted PNG."""
+    rgba = np.zeros((*masks.shape[1:], 4), dtype=np.uint8)
+    for mask, object_id in zip(masks, object_ids):
+        rgba[mask] = (*_object_color(object_id), MASK_ALPHA)
+    return _rgba_png_base64(rgba)
 
 
 class SliceRef(BaseModel):
@@ -146,11 +171,17 @@ class SliceRef(BaseModel):
 class SegmentRequest(SliceRef):
     points: list[list[int]] = Field(min_length=1)
     labels: list[int] = Field(min_length=1)
+    object_id: int = 0  # selects the overlay tint color
+
+
+class ObjectPrompt(BaseModel):
+    id: int = 0
+    points: list[list[int]] = Field(min_length=1)
+    labels: list[int] = Field(min_length=1)
 
 
 class PropagateRequest(SliceRef):
-    points: list[list[int]] = Field(min_length=1)
-    labels: list[int] = Field(min_length=1)
+    objects: list[ObjectPrompt] = Field(min_length=1)
 
 
 @app.get("/api/files")
@@ -287,7 +318,7 @@ def segment(req: SegmentRequest) -> dict:
             image_key=(req.file, req.axis, req.index),
         )
     return {
-        "mask": _mask_png_base64(mask),
+        "mask": _mask_png_base64(mask, req.object_id),
         "coverage": float(mask.mean()),
         "timings": {
             **{k: float(v) for k, v in segmenter.last_timings.items()},
@@ -298,8 +329,9 @@ def segment(req: SegmentRequest) -> dict:
 
 @app.post("/api/propagate")
 def propagate(req: PropagateRequest) -> StreamingResponse:
-    if len(req.points) != len(req.labels):
-        raise HTTPException(422, "points and labels must be equal length")
+    for obj in req.objects:
+        if len(obj.points) != len(obj.labels):
+            raise HTTPException(422, "points and labels must be equal length")
     data, geometry, data_u8 = _get_file(req.file)
     if geometry.kind != "3d":
         raise HTTPException(422, "Propagation requires a 3D volume")
@@ -307,18 +339,19 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
     n_frames = _axis_count(data, geometry, req.axis)
     frames = [_slice_rgb(data_u8, geometry, req.axis, i) for i in range(n_frames)]
     propagator = _get_propagator()
+    object_ids = [obj.id for obj in req.objects]
 
     events: queue.Queue[dict | None] = queue.Queue(maxsize=32)
 
-    def on_progress(done: int, total: int, frame_idx: int, mask: np.ndarray) -> None:
+    def on_progress(done: int, total: int, frame_idx: int, masks: np.ndarray) -> None:
         events.put(
             {
                 "type": "frame",
                 "frame": int(frame_idx),
                 "done": int(done),
                 "total": int(total),
-                "coverage": float(mask.mean()),
-                "mask": _mask_png_base64(mask),
+                "coverage": float(masks.any(axis=0).mean()),
+                "mask": _masks_png_base64(masks, object_ids),
             }
         )
 
@@ -328,8 +361,13 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
                 propagator.propagate(
                     frames,
                     anchor_idx=req.index,
-                    points=[(int(c), int(r)) for c, r in req.points],
-                    labels=[int(l) for l in req.labels],
+                    points_per_object=[
+                        [(int(c), int(r)) for c, r in obj.points]
+                        for obj in req.objects
+                    ],
+                    labels_per_object=[
+                        [int(l) for l in obj.labels] for obj in req.objects
+                    ],
                     progress=on_progress,
                 )
             events.put(

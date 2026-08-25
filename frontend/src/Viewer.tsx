@@ -1,10 +1,19 @@
 import { useCallback, useRef } from "react";
+import { objectColor } from "./api";
 import type { Point } from "./api";
+
+export interface ViewerObject {
+  id: number;
+  points: Point[];
+  maskUrl: string | null;
+}
 
 interface ViewerProps {
   imageUrl: string;
-  maskUrl: string | null;
-  points: Point[];
+  /** Combined multi-object overlay from propagation (whole-frame PNG). */
+  propagatedMaskUrl: string | null;
+  objects: ViewerObject[];
+  activeObjectId: number;
   sliceWidth: number;
   sliceHeight: number;
   displayWidth: number;
@@ -36,8 +45,9 @@ function pickFromEvent(
 /** Clickable seismic section with an instant marker + mask overlay stack. */
 export function Viewer({
   imageUrl,
-  maskUrl,
-  points,
+  propagatedMaskUrl,
+  objects,
+  activeObjectId,
   sliceWidth,
   sliceHeight,
   displayWidth,
@@ -78,22 +88,43 @@ export function Viewer({
       onContextMenu={handleContextMenu}
     >
       <img className="viewer-layer" src={imageUrl} alt="Seismic section" draggable={false} />
-      {maskUrl && (
+      {propagatedMaskUrl && (
         <img
           className="viewer-layer viewer-mask"
-          src={maskUrl}
+          src={propagatedMaskUrl}
           alt=""
           style={{ opacity: maskOpacity }}
           draggable={false}
         />
       )}
-      {points.map((p, i) => (
-        <span
-          key={i}
-          className={`marker ${p.label === 1 ? "marker-pos" : "marker-neg"}`}
-          style={{ left: p.col * scaleX, top: p.row * scaleY }}
-        />
-      ))}
+      {objects.map(
+        (obj) =>
+          obj.maskUrl && (
+            <img
+              key={obj.id}
+              className="viewer-layer viewer-mask"
+              src={obj.maskUrl}
+              alt=""
+              style={{ opacity: maskOpacity }}
+              draggable={false}
+            />
+          ),
+      )}
+      {objects.map((obj) =>
+        obj.points.map((p, i) => (
+          <span
+            key={`${obj.id}-${i}`}
+            className={`marker ${p.label === 1 ? "marker-pos" : "marker-neg"} ${
+              obj.id === activeObjectId ? "marker-active" : ""
+            }`}
+            style={{
+              left: p.col * scaleX,
+              top: p.row * scaleY,
+              backgroundColor: `${objectColor(obj.id)}99`,
+            }}
+          />
+        )),
+      )}
     </div>
   );
 }

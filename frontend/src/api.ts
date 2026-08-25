@@ -13,6 +13,25 @@ export interface Point {
   label: 0 | 1;
 }
 
+export interface ObjectPrompt {
+  id: number;
+  points: Point[];
+}
+
+// Must stay in sync with OBJECT_COLORS in server/main.py (mask tints).
+export const OBJECT_COLORS = [
+  "#ff00ff", // magenta
+  "#00bfff", // sky blue
+  "#ffd600", // yellow
+  "#19e083", // mint
+  "#ff6d00", // orange
+  "#a26bff", // violet
+];
+
+export function objectColor(objectId: number): string {
+  return OBJECT_COLORS[objectId % OBJECT_COLORS.length];
+}
+
 export interface SegmentResult {
   mask: string;
   coverage: number;
@@ -112,6 +131,7 @@ export async function segment(
   axis: Axis,
   index: number,
   points: Point[],
+  objectId: number,
   signal?: AbortSignal,
 ): Promise<SegmentResult> {
   const res = await fetch(apiUrl("/api/segment"), {
@@ -124,6 +144,7 @@ export async function segment(
       index,
       points: points.map((p) => [p.col, p.row]),
       labels: points.map((p) => p.label),
+      object_id: objectId,
     }),
   });
   if (!res.ok) throw new Error(`Segmentation failed: ${res.status}`);
@@ -134,7 +155,7 @@ export async function propagate(
   file: string,
   axis: Axis,
   anchor: number,
-  points: Point[],
+  objects: ObjectPrompt[],
   onEvent: (event: PropagationEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -146,8 +167,11 @@ export async function propagate(
       file,
       axis,
       index: anchor,
-      points: points.map((p) => [p.col, p.row]),
-      labels: points.map((p) => p.label),
+      objects: objects.map((o) => ({
+        id: o.id,
+        points: o.points.map((p) => [p.col, p.row]),
+        labels: o.points.map((p) => p.label),
+      })),
     }),
   });
   if (!res.ok || !res.body) throw new Error(`Propagation failed: ${res.status}`);

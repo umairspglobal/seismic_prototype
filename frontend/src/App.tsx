@@ -7,12 +7,13 @@ import {
   getRuntime,
   listFiles,
   maskDataUrl,
+  objectColor,
   prepareSlice,
   propagate,
   segment,
   sliceUrl,
 } from "./api";
-import { Viewer } from "./Viewer";
+import { Viewer, ViewerObject } from "./Viewer";
 import "./App.css";
 
 interface PropagationState {
@@ -23,13 +24,23 @@ interface PropagationState {
   error?: string;
 }
 
+interface SegObject extends ViewerObject {
+  id: number;
+  points: Point[];
+  maskUrl: string | null;
+}
+
+const freshObject = (id: number): SegObject => ({ id, points: [], maskUrl: null });
+
 export default function App() {
   const [files, setFiles] = useState<FileInfo[]>([]);
   const [file, setFile] = useState<FileInfo | null>(null);
   const [axis, setAxis] = useState<Axis>("inline");
   const [index, setIndex] = useState(0);
-  const [points, setPoints] = useState<Point[]>([]);
-  const [maskUrl, setMaskUrl] = useState<string | null>(null);
+  const [objects, setObjects] = useState<SegObject[]>([freshObject(0)]);
+  const [activeObjectId, setActiveObjectId] = useState(0);
+  const nextObjectId = useRef(1);
+  const [propMaskUrl, setPropMaskUrl] = useState<string | null>(null);
   const [coverage, setCoverage] = useState<number | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [segmenting, setSegmenting] = useState(false);
@@ -76,8 +87,10 @@ export default function App() {
   const resetPicks = useCallback(() => {
     abortRef.current?.abort();
     requestSeq.current += 1;
-    setPoints([]);
-    setMaskUrl(null);
+    setObjects([freshObject(0)]);
+    setActiveObjectId(0);
+    nextObjectId.current = 1;
+    setPropMaskUrl(null);
     setCoverage(null);
     setSegmenting(false);
   }, []);
@@ -89,7 +102,7 @@ export default function App() {
     setPrepared(false);
     const propagated = propMasksRef.current.get(index);
     if (propagation && propagation.axis === axis && propagated) {
-      setMaskUrl(maskDataUrl(propagated));
+      setPropMaskUrl(maskDataUrl(propagated));
     }
     const timer = setTimeout(() => {
       prepareSlice(file.name, axis, index)
@@ -100,10 +113,18 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file, axis, index]);
 
+  const setObjectMask = useCallback((objectId: number, url: string | null) => {
+    setObjects((prev) =>
+      prev.map((o) => (o.id === objectId ? { ...o, maskUrl: url } : o)),
+    );
+  }, []);
+
+  // Only the changed object is re-decoded; other objects' masks are
+  // untouched (the image embedding is shared server-side anyway).
   const runSegment = useCallback(
-    (pts: Point[]) => {
+    (objectId: number, pts: Point[]) => {
       if (!file || pts.length === 0) {
-        setMaskUrl(null);
+        setObjectMask(objectId, null);
         setCoverage(null);
         return;
       }
@@ -113,10 +134,10 @@ export default function App() {
       const seq = ++requestSeq.current;
       const started = performance.now();
       setSegmenting(true);
-      segment(file.name, axis, index, pts, controller.signal)
+      segment(file.name, axis, index, pts, objectId, controller.signal)
         .then((result) => {
           if (seq !== requestSeq.current) return; // stale response
-          setMaskUrl(maskDataUrl(result.mask));
+          setObjectMask(objectId, maskDataUrl(result.mask));
           setCoverage(result.coverage);
           setLatencyMs(performance.now() - started);
           setSegmenting(false);
@@ -127,30 +148,72 @@ export default function App() {
           setStatus(`Segmentation failed: ${err.message}`);
         });
     },
-    [file, axis, index],
+    [file, axis, index, setObjectMask],
   );
 
   const handlePick = useCallback(
     (col: number, row: number, label: 0 | 1) => {
       if (propagation?.running) return;
-      const next = [...points, { col, row, label }];
-      setPoints(next); // marker appears immediately
-      runSegment(next);
+      const active = objects.find((o) => o.id === activeObjectId);
+      if (!active) return;
+      const nextPts = [...active.points, { col, row, label }];
+      setObjects((prev) =>
+        prev.map((o) => (o.id === activeObjectId ? { ...o, points: nextPts } : o)),
+      );
+      runSegment(activeObjectId, nextPts);
     },
-    [points, runSegment, propagation],
+    [objects, activeObjectId, runSegment, propagation],
   );
 
   const handleUndo = useCallback(() => {
-    const next = points.slice(0, -1);
-    setPoints(next);
-    runSegment(next);
-  }, [points, runSegment]);
+    const active = objects.find((o) => o.id === activeObjectId);
+    if (!active || active.points.length === 0) return;
+    const nextPts = active.points.slice(0, -1);
+    setObjects((prev) =>
+      prev.map((o) => (o.id === activeObjectId ? { ...o, points: nextPts } : o)),
+    );
+    runSegment(activeObjectId, nextPts);
+  }, [objects, activeObjectId, runSegment]);
+
+  const handleAddObject = useCallback(() => {
+    const id = nextObjectId.current++;
+    setObjects((prev) => [...prev, freshObject(id)]);
+    setActiveObjectId(id);
+  }, []);
+
+  const handleRemoveObject = useCallback(
+    (objectId: number) => {
+      setObjects((prev) => {
+        const next = prev.filter((o) => o.id !== objectId);
+        if (next.length === 0) {
+          const id = nextObjectId.current++;
+          setActiveObjectId(id);
+          return [freshObject(id)];
+        }
+        if (objectId === activeObjectId) setActiveObjectId(next[0].id);
+        return next;
+      });
+    },
+    [activeObjectId],
+  );
+
+  const objectsWithPoints = useMemo(
+    () => objects.filter((o) => o.points.length > 0),
+    [objects],
+  );
+  const totalPoints = useMemo(
+    () => objects.reduce((n, o) => n + o.points.length, 0),
+    [objects],
+  );
 
   const handlePropagate = useCallback(() => {
-    if (!file || points.length === 0) return;
+    if (!file || objectsWithPoints.length === 0) return;
     propMasksRef.current = new Map();
+    // The propagated overlay carries all objects; drop the per-object
+    // single-slice previews so they don't double-tint the anchor frame.
+    setObjects((prev) => prev.map((o) => ({ ...o, maskUrl: null })));
     setPropagation({ axis, running: true, done: 0, total: axisCount });
-    propagate(file.name, axis, index, points, (event) => {
+    propagate(file.name, axis, index, objectsWithPoints, (event) => {
       if (event.type === "frame") {
         propMasksRef.current.set(event.frame, event.mask);
         setPropagation({
@@ -159,7 +222,7 @@ export default function App() {
           done: event.done,
           total: event.total,
         });
-        if (event.frame === index) setMaskUrl(maskDataUrl(event.mask));
+        if (event.frame === index) setPropMaskUrl(maskDataUrl(event.mask));
       } else if (event.type === "done") {
         setPropagation((prev) =>
           prev ? { ...prev, running: false } : null,
@@ -174,7 +237,7 @@ export default function App() {
         prev ? { ...prev, running: false, error: err.message } : null,
       ),
     );
-  }, [file, axis, index, points, axisCount]);
+  }, [file, axis, index, objectsWithPoints, axisCount]);
 
   if (!file) {
     return <div className="app-empty">{status || "Loading..."}</div>;
@@ -258,12 +321,55 @@ export default function App() {
         </div>
 
         <div className="field">
+          <span>Objects</span>
+          <div className="object-list">
+            {objects.map((obj) => (
+              <div
+                key={obj.id}
+                className={
+                  obj.id === activeObjectId ? "object-row active" : "object-row"
+                }
+                onClick={() => setActiveObjectId(obj.id)}
+              >
+                <span
+                  className="object-swatch"
+                  style={{ background: objectColor(obj.id) }}
+                />
+                <span className="object-name">Object {obj.id + 1}</span>
+                <span className="object-count">
+                  {obj.points.length} pt{obj.points.length === 1 ? "" : "s"}
+                </span>
+                <button
+                  className="object-remove"
+                  title="Remove object"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleRemoveObject(obj.id);
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+          <button className="toggle" onClick={handleAddObject}>
+            + Add object
+          </button>
+        </div>
+
+        <div className="field">
           <div className="toggle-row">
-            <button className="toggle" onClick={handleUndo} disabled={!points.length}>
+            <button
+              className="toggle"
+              onClick={handleUndo}
+              disabled={
+                !objects.find((o) => o.id === activeObjectId)?.points.length
+              }
+            >
               Undo point
             </button>
-            <button className="toggle" onClick={resetPicks} disabled={!points.length}>
-              Clear
+            <button className="toggle" onClick={resetPicks} disabled={!totalPoints}>
+              Clear all
             </button>
           </div>
         </div>
@@ -272,11 +378,13 @@ export default function App() {
           <button
             className="primary"
             onClick={handlePropagate}
-            disabled={!points.length || propagation?.running}
+            disabled={!objectsWithPoints.length || propagation?.running}
           >
             {propagation?.running
               ? `Propagating ${propagation.done}/${propagation.total}...`
-              : `Propagate through volume (${axis})`}
+              : `Propagate ${objectsWithPoints.length || ""} object${
+                  objectsWithPoints.length === 1 ? "" : "s"
+                } (${axis})`}
           </button>
         )}
         {propagation && (
@@ -419,8 +527,9 @@ export default function App() {
       <main className="stage">
         <Viewer
           imageUrl={imageUrl}
-          maskUrl={maskUrl}
-          points={points}
+          propagatedMaskUrl={propMaskUrl}
+          objects={objects}
+          activeObjectId={activeObjectId}
           sliceWidth={sliceSize.w}
           sliceHeight={sliceSize.h}
           displayWidth={displayWidth}

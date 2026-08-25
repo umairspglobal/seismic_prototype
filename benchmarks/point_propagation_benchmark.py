@@ -287,7 +287,7 @@ def main() -> int:
 
             def propagate() -> np.ndarray:
                 return propagator.propagate(
-                    frames, propagation_anchor, [point], [1]
+                    frames, propagation_anchor, [[point]], [[1]]
                 )
 
             _, cold_total = timed(device, propagate)

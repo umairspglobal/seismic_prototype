@@ -83,12 +83,15 @@ def main() -> None:
     )
 
     if args.propagate:
+        # Two objects at once: exercises the shared-session multi-object path.
         payload = {
             "file": name,
             "axis": axis,
             "index": index,
-            "points": [[col, row]],
-            "labels": [1],
+            "objects": [
+                {"id": 0, "points": [[col, row]], "labels": [1]},
+                {"id": 1, "points": [[col // 2, row]], "labels": [1]},
+            ],
         }
         t0 = time.perf_counter()
         first_frame_at = None

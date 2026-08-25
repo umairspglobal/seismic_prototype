@@ -103,13 +103,69 @@ body {
   cursor: default;
 }
 
-.toggle.active-pos {
+.toggle.active-pos,
+.click-hint.active-pos {
   border-color: #19c37d;
   color: #19c37d;
 }
 
-.toggle.active-neg {
+.toggle.active-neg,
+.click-hint.active-neg {
   border-color: #ef5350;
+  color: #ef5350;
+}
+
+.object-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.object-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: #0f1317;
+  border: 1px solid #2c343d;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.object-row.active {
+  border-color: #2563eb;
+  background: #14202e;
+}
+
+.object-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.object-name {
+  flex: 1;
+  color: #e6e9ec;
+}
+
+.object-count {
+  color: #7d8790;
+  font-size: 0.75rem;
+}
+
+.object-remove {
+  background: none;
+  border: none;
+  color: #7d8790;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+.object-remove:hover {
   color: #ef5350;
 }
 
@@ -260,4 +316,10 @@ body {
 
 .marker-neg {
   border-color: #ef5350;
+}
+
+.marker-active {
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
 }

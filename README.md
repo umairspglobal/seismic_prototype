@@ -113,6 +113,13 @@ embeddings, and video sessions stay resident between requests, so a
 point click round-trips in tens of milliseconds and propagation streams
 each tracked slice to the browser as it completes (scrub while it runs).
 
+Prompting follows the SAM 2 demo conventions: left click adds an object
+point, right click adds a background point, and multiple objects can be
+tracked at once - add objects in the sidebar, click points for each, and
+propagate. All objects share one tracker session, so the per-slice cost
+of propagation is nearly independent of the object count; each slice
+streams to the browser as a single combined multi-color mask.
+
 Start the inference server (loads models on first use):
 
 ```powershell

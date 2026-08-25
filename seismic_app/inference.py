@@ -351,39 +351,52 @@ class Sam3VolumePropagator:
         self,
         frames: Sequence[np.ndarray] | np.ndarray,
         anchor_idx: int,
-        points: list[tuple[int, int]],
-        labels: list[int],
+        points_per_object: Sequence[Sequence[tuple[int, int]]],
+        labels_per_object: Sequence[Sequence[int]],
         progress: Callable[[int, int, int, np.ndarray], None] | None = None,
     ) -> np.ndarray:
-        """Track one object through a stack of slices.
+        """Track one or more objects through a stack of slices.
+
+        All objects share a single video session, so the expensive
+        per-slice vision encoding runs once regardless of object count -
+        adding objects costs only the (cheap) per-object mask decoding.
 
         Parameters
         ----------
         frames : list of (H, W, 3) uint8 slice images along the chosen
             volume axis, in order.
         anchor_idx : index of the slice the points were picked on.
-        points : (col, row) pixel pairs on the anchor slice.
-        labels : 1 = positive, 0 = negative, matching points.
+        points_per_object : one list of (col, row) pixel pairs per object,
+            all on the anchor slice.
+        labels_per_object : matching lists of 1 = positive / 0 = negative.
+        progress : called as (done, total, frame_idx, frame_masks) where
+            frame_masks is (n_objects, H, W) bool.
 
         Returns
         -------
-        (n_frames, H, W) boolean mask stack, one mask per slice.
+        (n_objects, n_frames, H, W) boolean mask stack.
         """
-        if len(points) != len(labels) or not points:
-            raise ValueError("points and labels must be equal-length and non-empty")
+        if not points_per_object or len(points_per_object) != len(labels_per_object):
+            raise ValueError("need at least one object with matching points/labels")
+        for pts, labs in zip(points_per_object, labels_per_object):
+            if len(pts) != len(labs) or not pts:
+                raise ValueError(
+                    "each object needs equal-length, non-empty points and labels"
+                )
 
+        n_objects = len(points_per_object)
         n_frames = len(frames)
         h, w = frames[0].shape[:2]
         log.info(
             "Volume propagation: %d slices of %dx%d, anchor slice %d, "
-            "%d point(s). This runs the tracker once per slice - expect "
-            "roughly (single-click time) x %d total.",
+            "%d object(s) with %s point(s). One shared tracker session - "
+            "the per-slice cost is nearly independent of object count.",
             n_frames,
             w,
             h,
             anchor_idx,
-            len(points),
-            n_frames,
+            n_objects,
+            [len(p) for p in points_per_object],
         )
         t0 = time.perf_counter()
 
@@ -398,22 +411,27 @@ class Sam3VolumePropagator:
             torch.cuda.synchronize()
         self.last_timings["session_init"] = time.perf_counter() - session_started
 
-        self.processor.add_inputs_to_inference_session(
-            session,
-            frame_idx=anchor_idx,
-            obj_ids=1,
-            input_points=[[[[float(x), float(y)] for x, y in points]]],
-            input_labels=[[[int(l) for l in labels]]],
-            original_size=(h, w),
-        )
+        # Register each object separately (SAM2-demo style: objects may have
+        # different point counts, so no padding is needed).
+        for obj_i, (points, labels) in enumerate(
+            zip(points_per_object, labels_per_object)
+        ):
+            self.processor.add_inputs_to_inference_session(
+                session,
+                frame_idx=anchor_idx,
+                obj_ids=obj_i + 1,
+                input_points=[[[[float(x), float(y)] for x, y in points]]],
+                input_labels=[[[int(l) for l in labels]]],
+                original_size=(h, w),
+            )
 
         # Segment the anchor slice first, then sweep forward and backward.
-        masks = np.zeros((n_frames, h, w), dtype=bool)
+        masks = np.zeros((n_objects, n_frames, h, w), dtype=bool)
         with self._autocast():
             anchor_out = self.model(inference_session=session, frame_idx=anchor_idx)
-            masks[anchor_idx] = self._to_mask(anchor_out.pred_masks, h, w)
+            masks[:, anchor_idx] = self._to_masks(anchor_out.pred_masks, n_objects, h, w)
             if progress is not None:
-                progress(1, n_frames, anchor_idx, masks[anchor_idx])
+                progress(1, n_frames, anchor_idx, masks[:, anchor_idx])
             log.info("Anchor slice %d segmented; propagating forward...", anchor_idx)
 
             done = 1
@@ -424,10 +442,12 @@ class Sam3VolumePropagator:
                 ):
                     if out.frame_idx == anchor_idx:
                         continue
-                    masks[out.frame_idx] = self._to_mask(out.pred_masks, h, w)
+                    masks[:, out.frame_idx] = self._to_masks(
+                        out.pred_masks, n_objects, h, w
+                    )
                     done += 1
                     if progress is not None:
-                        progress(done, n_frames, out.frame_idx, masks[out.frame_idx])
+                        progress(done, n_frames, out.frame_idx, masks[:, out.frame_idx])
                     if done == n_frames or done % max(1, n_frames // 10) == 0:
                         log.info("  slice %d/%d done (%s)", done, n_frames, direction)
                 if not reverse:
@@ -440,19 +460,27 @@ class Sam3VolumePropagator:
             fps=n_frames / total_elapsed if total_elapsed else float("inf"),
         )
         log.info(
-            "Volume propagation finished in %.1fs (%d/%d slices, total "
-            "coverage %.2f%%)",
+            "Volume propagation finished in %.1fs (%d/%d slices, %d object(s), "
+            "total coverage %.2f%%)",
             total_elapsed,
             done,
             n_frames,
-            100.0 * float(masks.mean()),
+            n_objects,
+            100.0 * float(masks.any(axis=0).mean()),
         )
         return masks
 
-    def _to_mask(self, pred_masks: torch.Tensor, h: int, w: int) -> np.ndarray:
-        """Threshold + resize one frame's predicted logits to (H, W) bool."""
+    def _to_masks(
+        self, pred_masks: torch.Tensor, n_objects: int, h: int, w: int
+    ) -> np.ndarray:
+        """Threshold + resize one frame's predicted logits to (n_objects, H, W)."""
         video_masks = self.processor.post_process_masks(
             [pred_masks], original_sizes=[(h, w)], binarize=True
         )[0]
-        # (n_objects, 1, H, W) -> first (only) object.
-        return np.asarray(video_masks[0, 0].detach().cpu().numpy(), dtype=bool)
+        # (n_objects, 1, H, W) -> drop the per-object mask channel.
+        out = np.asarray(video_masks[:, 0].detach().cpu().numpy(), dtype=bool)
+        if out.shape[0] != n_objects:
+            raise RuntimeError(
+                f"tracker returned {out.shape[0]} object masks, expected {n_objects}"
+            )
+        return out
