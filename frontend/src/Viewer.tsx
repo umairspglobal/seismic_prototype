@@ -11,7 +11,26 @@ interface ViewerProps {
   displayHeight: number;
   maskOpacity: number;
   busy: boolean;
-  onPick: (col: number, row: number) => void;
+  onPick: (col: number, row: number, label: 0 | 1) => void;
+}
+
+function pickFromEvent(
+  event: React.MouseEvent<HTMLDivElement>,
+  sliceWidth: number,
+  sliceHeight: number,
+): { col: number; row: number } {
+  const rect = event.currentTarget.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const col = Math.min(
+    sliceWidth - 1,
+    Math.max(0, Math.round((x / rect.width) * sliceWidth)),
+  );
+  const row = Math.min(
+    sliceHeight - 1,
+    Math.max(0, Math.round((y / rect.height) * sliceHeight)),
+  );
+  return { col, row };
 }
 
 /** Clickable seismic section with an instant marker + mask overlay stack. */
@@ -29,20 +48,20 @@ export function Viewer({
 }: ViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // SAM 2-style prompts: left click = object, right click = background.
   const handleClick = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
-      const rect = event.currentTarget.getBoundingClientRect();
-      const x = event.clientX - rect.left;
-      const y = event.clientY - rect.top;
-      const col = Math.min(
-        sliceWidth - 1,
-        Math.max(0, Math.round((x / rect.width) * sliceWidth)),
-      );
-      const row = Math.min(
-        sliceHeight - 1,
-        Math.max(0, Math.round((y / rect.height) * sliceHeight)),
-      );
-      onPick(col, row);
+      const { col, row } = pickFromEvent(event, sliceWidth, sliceHeight);
+      onPick(col, row, 1);
+    },
+    [onPick, sliceWidth, sliceHeight],
+  );
+
+  const handleContextMenu = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      const { col, row } = pickFromEvent(event, sliceWidth, sliceHeight);
+      onPick(col, row, 0);
     },
     [onPick, sliceWidth, sliceHeight],
   );
@@ -56,6 +75,7 @@ export function Viewer({
       className={`viewer ${busy ? "viewer-busy" : ""}`}
       style={{ width: displayWidth, height: displayHeight }}
       onClick={handleClick}
+      onContextMenu={handleContextMenu}
     >
       <img className="viewer-layer" src={imageUrl} alt="Seismic section" draggable={false} />
       {maskUrl && (

@@ -79,14 +79,23 @@ body {
   gap: 8px;
 }
 
-.toggle {
+.toggle,
+.click-hint {
   flex: 1;
   padding: 8px 6px;
   background: #0f1317;
   color: #cdd4da;
   border: 1px solid #2c343d;
   border-radius: 6px;
+  text-align: center;
+}
+
+.toggle {
   cursor: pointer;
+}
+
+.click-hint {
+  cursor: default;
 }
 
 .toggle:disabled {

@@ -28,7 +28,6 @@ export default function App() {
   const [file, setFile] = useState<FileInfo | null>(null);
   const [axis, setAxis] = useState<Axis>("inline");
   const [index, setIndex] = useState(0);
-  const [label, setLabel] = useState<0 | 1>(1);
   const [points, setPoints] = useState<Point[]>([]);
   const [maskUrl, setMaskUrl] = useState<string | null>(null);
   const [coverage, setCoverage] = useState<number | null>(null);
@@ -132,13 +131,13 @@ export default function App() {
   );
 
   const handlePick = useCallback(
-    (col: number, row: number) => {
+    (col: number, row: number, label: 0 | 1) => {
       if (propagation?.running) return;
       const next = [...points, { col, row, label }];
       setPoints(next); // marker appears immediately
       runSegment(next);
     },
-    [points, label, runSegment, propagation],
+    [points, runSegment, propagation],
   );
 
   const handleUndo = useCallback(() => {
@@ -247,20 +246,14 @@ export default function App() {
         )}
 
         <div className="field">
-          <span>Click adds</span>
+          <span>Clicks</span>
           <div className="toggle-row">
-            <button
-              className={label === 1 ? "toggle active-pos" : "toggle"}
-              onClick={() => setLabel(1)}
-            >
-              + object
-            </button>
-            <button
-              className={label === 0 ? "toggle active-neg" : "toggle"}
-              onClick={() => setLabel(0)}
-            >
-              − background
-            </button>
+            <div className="click-hint active-pos" title="Left click">
+              Left + object
+            </div>
+            <div className="click-hint active-neg" title="Right click">
+              Right − background
+            </div>
           </div>
         </div>
 
