@@ -443,63 +443,110 @@ class Sam3VolumePropagator:
         pixel_values: torch.Tensor,
         height: int,
         width: int,
-        anchor_idx: int,
         points_per_object: Sequence[Sequence[tuple[int, int]]],
         labels_per_object: Sequence[Sequence[int]],
+        frame_indices_per_object: Sequence[Sequence[int]],
         object_indices: Sequence[int],
         masks: np.ndarray,
         on_frame: Callable[[int, int], None],
     ) -> None:
-        """Track one GPU-sized batch of objects through the volume."""
-        n_wave = len(object_indices)
-        session = self._new_session(pixel_values, height, width)
-        try:
+        """Track one GPU-sized batch of objects through the volume.
+
+        Points may live on several slices, mirroring SAM2's video
+        refinement. Slices where an object has at least one positive
+        point anchor the object (conditioning frames). Slices with only
+        negative points for an object cannot stand alone - segmenting
+        from negatives alone is meaningless - so they are applied AFTER
+        the first sweep, when the tracker already has memory of the
+        object on that slice; the negative click then subtracts from the
+        remembered mask instead of erasing the object. The corrections
+        are swept outward afterwards.
+        """
+        # frame -> [(wave_position, points_on_frame, labels_on_frame)]
+        anchor_groups: dict[int, list[tuple[int, list, list]]] = {}
+        refine_groups: dict[int, list[tuple[int, list, list]]] = {}
+        for wave_pos, global_idx in enumerate(object_indices):
+            per_frame: dict[int, tuple[list, list]] = {}
+            for (x, y), label, frame_idx in zip(
+                points_per_object[global_idx],
+                labels_per_object[global_idx],
+                frame_indices_per_object[global_idx],
+            ):
+                bucket = per_frame.setdefault(int(frame_idx), ([], []))
+                bucket[0].append((float(x), float(y)))
+                bucket[1].append(int(label))
+            for frame_idx, (pts, labs) in per_frame.items():
+                target = anchor_groups if 1 in labs else refine_groups
+                target.setdefault(frame_idx, []).append((wave_pos, pts, labs))
+
+        n_frames = masks.shape[1]
+        visited: set[int] = set()
+        done = 0
+
+        def record(out) -> None:
+            nonlocal done
+            rows = self._to_masks(out.pred_masks, height, width)
+            # Output rows follow session registration order; out.object_ids
+            # maps each row back to the wave position we assigned (pos + 1).
+            for row, obj_id in zip(rows, out.object_ids):
+                masks[object_indices[int(obj_id) - 1], out.frame_idx] = row
+            if out.frame_idx not in visited:
+                visited.add(out.frame_idx)
+                done += 1
+                if done == n_frames or done % max(1, n_frames // 10) == 0:
+                    log.info("  slice %d/%d done", done, n_frames)
+            # Re-emits refresh the browser overlay after refinements.
+            on_frame(out.frame_idx, done)
+
+        def prompt_frame(frame_idx: int, group: list[tuple[int, list, list]]) -> None:
             self.processor.add_inputs_to_inference_session(
                 session,
-                frame_idx=anchor_idx,
-                obj_ids=list(range(1, n_wave + 1)),
-                input_points=[
-                    [
-                        [[float(x), float(y)] for x, y in points_per_object[i]]
-                        for i in object_indices
-                    ]
-                ],
-                input_labels=[
-                    [
-                        [int(label) for label in labels_per_object[i]]
-                        for i in object_indices
-                    ]
-                ],
+                frame_idx=frame_idx,
+                obj_ids=[wave_pos + 1 for wave_pos, _, _ in group],
+                input_points=[[[[x, y] for x, y in pts] for _, pts, _ in group]],
+                input_labels=[[labs for _, _, labs in group]],
                 original_size=(height, width),
             )
-            with self._autocast():
-                anchor_out = self.model(inference_session=session, frame_idx=anchor_idx)
-                masks[list(object_indices), anchor_idx] = self._to_masks(
-                    anchor_out.pred_masks, n_wave, height, width
-                )
-                on_frame(anchor_idx, 1)
-                log.info("Anchor slice %d segmented; propagating forward...", anchor_idx)
+            record(self.model(inference_session=session, frame_idx=frame_idx))
 
-                done = 1
-                n_frames = masks.shape[1]
+        session = self._new_session(pixel_values, height, width)
+        try:
+            with self._autocast():
+                # Pass 1: condition every anchored slice, then sweep both ways.
+                for frame_idx in sorted(anchor_groups):
+                    prompt_frame(frame_idx, anchor_groups[frame_idx])
+                log.info(
+                    "Conditioned %d anchored slice(s); propagating...",
+                    len(anchor_groups),
+                )
+                start_frame = min(anchor_groups)
                 for reverse in (False, True):
-                    direction = "backward" if reverse else "forward"
                     for out in self.model.propagate_in_video_iterator(
-                        session, start_frame_idx=anchor_idx, reverse=reverse
+                        session, start_frame_idx=start_frame, reverse=reverse
                     ):
-                        if out.frame_idx == anchor_idx:
-                            continue
-                        masks[list(object_indices), out.frame_idx] = self._to_masks(
-                            out.pred_masks, n_wave, height, width
-                        )
-                        done += 1
-                        on_frame(out.frame_idx, done)
-                        if done == n_frames or done % max(1, n_frames // 10) == 0:
-                            log.info(
-                                "  slice %d/%d done (%s)", done, n_frames, direction
-                            )
+                        record(out)
                     if not reverse:
                         log.info("Forward sweep complete; propagating backward...")
+
+                # Pass 2: negative-only refinements. Every slice is tracked
+                # now, so these run as memory-based refinements (subtractive),
+                # not as fresh "the object is absent here" conditioning.
+                if refine_groups:
+                    log.info(
+                        "Applying negative-only refinements on slice(s) %s and "
+                        "re-sweeping...",
+                        sorted(refine_groups),
+                    )
+                    for frame_idx in sorted(refine_groups):
+                        prompt_frame(frame_idx, refine_groups[frame_idx])
+                    for reverse, start in (
+                        (False, min(refine_groups)),
+                        (True, max(refine_groups)),
+                    ):
+                        for out in self.model.propagate_in_video_iterator(
+                            session, start_frame_idx=start, reverse=reverse
+                        ):
+                            record(out)
         finally:
             del session
             self._free_cuda()
@@ -511,6 +558,7 @@ class Sam3VolumePropagator:
         anchor_idx: int,
         points_per_object: Sequence[Sequence[tuple[int, int]]],
         labels_per_object: Sequence[Sequence[int]],
+        frame_indices_per_object: Sequence[Sequence[int]] | None = None,
         progress: Callable[[int, int, int, np.ndarray], None] | None = None,
     ) -> np.ndarray:
         """Track one or more objects through a stack of slices.
@@ -525,10 +573,13 @@ class Sam3VolumePropagator:
         ----------
         frames : list of (H, W, 3) uint8 slice images along the chosen
             volume axis, in order.
-        anchor_idx : index of the slice the points were picked on.
-        points_per_object : one list of (col, row) pixel pairs per object,
-            all on the anchor slice.
+        anchor_idx : default slice for points without an explicit slice.
+        points_per_object : one list of (col, row) pixel pairs per object.
         labels_per_object : matching lists of 1 = positive / 0 = negative.
+        frame_indices_per_object : per-point slice index, aligned with
+            points_per_object. Defaults to anchor_idx for every point.
+            Points on several slices act as SAM2-style refinement clicks:
+            each prompted slice becomes a conditioning frame.
         progress : called as (done, total, frame_idx, frame_masks) where
             frame_masks is (n_objects, H, W) bool for every object so far.
 
@@ -538,24 +589,42 @@ class Sam3VolumePropagator:
         """
         if not points_per_object or len(points_per_object) != len(labels_per_object):
             raise ValueError("need at least one object with matching points/labels")
-        for pts, labs in zip(points_per_object, labels_per_object):
-            if len(pts) != len(labs) or not pts:
+        if frame_indices_per_object is None:
+            frame_indices_per_object = [
+                [anchor_idx] * len(pts) for pts in points_per_object
+            ]
+        if len(frame_indices_per_object) != len(points_per_object):
+            raise ValueError("frame_indices_per_object must match points_per_object")
+        n_frames = len(frames)
+        for pts, labs, frs in zip(
+            points_per_object, labels_per_object, frame_indices_per_object
+        ):
+            if len(pts) != len(labs) or len(pts) != len(frs) or not pts:
                 raise ValueError(
-                    "each object needs equal-length, non-empty points and labels"
+                    "each object needs equal-length, non-empty points/labels/slices"
+                )
+            if any(not 0 <= int(f) < n_frames for f in frs):
+                raise ValueError("point slice index out of range")
+            if 1 not in labs:
+                raise ValueError(
+                    "each object needs at least one positive (+) point; "
+                    "negative-only prompts cannot define an object"
                 )
 
         n_objects = len(points_per_object)
-        n_frames = len(frames)
         h, w = frames[0].shape[:2]
         batch_limit = min(n_objects, self._estimate_max_objects())
+        prompted_slices = sorted(
+            {int(f) for frs in frame_indices_per_object for f in frs}
+        )
         log.info(
-            "Volume propagation: %d slices of %dx%d, anchor slice %d, "
+            "Volume propagation: %d slices of %dx%d, prompts on slice(s) %s, "
             "%d object(s) with %s point(s). GPU budget %d object(s)/wave "
             "(%d wave(s) queued).",
             n_frames,
             w,
             h,
-            anchor_idx,
+            prompted_slices,
             n_objects,
             [len(p) for p in points_per_object],
             batch_limit,
@@ -569,6 +638,7 @@ class Sam3VolumePropagator:
         )
         pixel_values = processed.pixel_values_videos[0]
         self.last_timings["session_init"] = time.perf_counter() - session_started
+        del frames  # the uint8 slices are no longer needed; free them early
 
         masks = np.zeros((n_objects, n_frames, h, w), dtype=bool)
         pending = list(range(n_objects))
@@ -597,9 +667,9 @@ class Sam3VolumePropagator:
                     pixel_values,
                     h,
                     w,
-                    anchor_idx,
                     points_per_object,
                     labels_per_object,
+                    frame_indices_per_object,
                     wave,
                     masks,
                     on_frame,
@@ -643,17 +713,14 @@ class Sam3VolumePropagator:
         )
         return masks
 
-    def _to_masks(
-        self, pred_masks: torch.Tensor, n_objects: int, h: int, w: int
-    ) -> np.ndarray:
-        """Threshold + resize one frame's predicted logits to (n_objects, H, W)."""
+    def _to_masks(self, pred_masks: torch.Tensor, h: int, w: int) -> np.ndarray:
+        """Threshold + resize one frame's predicted logits to (n_rows, H, W).
+
+        Row order matches the session's object registration order; callers
+        map rows back to objects via the output's object_ids.
+        """
         video_masks = self.processor.post_process_masks(
             [pred_masks], original_sizes=[(h, w)], binarize=True
         )[0]
-        # (n_objects, 1, H, W) -> drop the per-object mask channel.
-        out = np.asarray(video_masks[:, 0].detach().cpu().numpy(), dtype=bool)
-        if out.shape[0] != n_objects:
-            raise RuntimeError(
-                f"tracker returned {out.shape[0]} object masks, expected {n_objects}"
-            )
-        return out
+        # (n_rows, 1, H, W) -> drop the per-object mask channel.
+        return np.asarray(video_masks[:, 0].detach().cpu().numpy(), dtype=bool)

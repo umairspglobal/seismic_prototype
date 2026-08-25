@@ -56,8 +56,12 @@ export default function App() {
 
   // Per-frame propagated masks for instant scrubbing.
   const propMasksRef = useRef<Map<number, string>>(new Map());
-  const requestSeq = useRef(0);
-  const abortRef = useRef<AbortController | null>(null);
+  // Per-object request bookkeeping so refreshing one object's preview
+  // doesn't cancel another object's in-flight request.
+  const requestSeq = useRef<Map<number, number>>(new Map());
+  const abortMap = useRef<Map<number, AbortController>>(new Map());
+  // Latest objects for async callbacks (slice-change re-segmentation).
+  const objectsRef = useRef<SegObject[]>([]);
 
   useEffect(() => {
     listFiles()
@@ -109,34 +113,30 @@ export default function App() {
     return { w: nXl, h: nIl };
   }, [file, axis]);
 
+  objectsRef.current = objects;
+
+  const abortAll = useCallback(() => {
+    abortMap.current.forEach((c) => c.abort());
+    abortMap.current.clear();
+    requestSeq.current = new Map();
+  }, []);
+
   const resetPicks = useCallback(() => {
-    abortRef.current?.abort();
-    requestSeq.current += 1;
+    abortAll();
     setObjects([freshObject(0)]);
     setActiveObjectId(0);
     nextObjectId.current = 1;
     setPropMaskUrl(null);
     setCoverage(null);
     setSegmenting(false);
-  }, []);
+  }, [abortAll]);
 
-  // Reset picks and pre-encode the new slice so the first click is warm.
+  // A new file or axis invalidates all picks; a slice change does NOT -
+  // objects persist so you can refine them on any slice (SAM2-style).
   useEffect(() => {
-    if (!file || !pointReady) return;
     resetPicks();
-    setPrepared(false);
-    const propagated = propMasksRef.current.get(index);
-    if (propagation && propagation.axis === axis && propagated) {
-      setPropMaskUrl(maskDataUrl(propagated));
-    }
-    const timer = setTimeout(() => {
-      prepareSlice(file.name, axis, index)
-        .then(() => setPrepared(true))
-        .catch(() => setPrepared(false));
-    }, 250);
-    return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file, axis, index, pointReady]);
+  }, [file, axis]);
 
   const setObjectMask = useCallback((objectId: number, url: string | null) => {
     setObjects((prev) =>
@@ -144,24 +144,28 @@ export default function App() {
     );
   }, []);
 
-  // Only the changed object is re-decoded; other objects' masks are
-  // untouched (the image embedding is shared server-side anyway).
+  // Preview one object's mask from its points on the CURRENT slice only.
+  // Other objects' requests are untouched (embedding is shared server-side).
   const runSegment = useCallback(
     (objectId: number, pts: Point[]) => {
-      if (!file || pts.length === 0) {
+      // Negative-only clicks can't produce a standalone preview (there is
+      // nothing positive to segment from). They are stored as refinement
+      // prompts and take effect on re-propagation, where the tracker's
+      // memory of the object gives them something to subtract from.
+      if (!file || pts.length === 0 || !pts.some((p) => p.label === 1)) {
         setObjectMask(objectId, null);
-        setCoverage(null);
         return;
       }
-      abortRef.current?.abort();
+      abortMap.current.get(objectId)?.abort();
       const controller = new AbortController();
-      abortRef.current = controller;
-      const seq = ++requestSeq.current;
+      abortMap.current.set(objectId, controller);
+      const seq = (requestSeq.current.get(objectId) ?? 0) + 1;
+      requestSeq.current.set(objectId, seq);
       const started = performance.now();
       setSegmenting(true);
       segment(file.name, axis, index, pts, objectId, controller.signal)
         .then((result) => {
-          if (seq !== requestSeq.current) return; // stale response
+          if (seq !== requestSeq.current.get(objectId)) return; // stale
           setObjectMask(objectId, maskDataUrl(result.mask));
           setCoverage(result.coverage);
           setLatencyMs(performance.now() - started);
@@ -176,29 +180,73 @@ export default function App() {
     [file, axis, index, setObjectMask],
   );
 
+  // On slice change: keep every object and its points, drop the stale
+  // single-slice previews, pre-encode the slice, then re-preview objects
+  // that have points here.
+  useEffect(() => {
+    if (!file || !pointReady) return;
+    abortAll();
+    setSegmenting(false);
+    setObjects((prev) => prev.map((o) => ({ ...o, maskUrl: null })));
+    setPropMaskUrl(null);
+    const propagated = propMasksRef.current.get(index);
+    if (propagation && propagation.axis === axis && propagated) {
+      setPropMaskUrl(maskDataUrl(propagated));
+    }
+    setPrepared(false);
+    const timer = setTimeout(() => {
+      prepareSlice(file.name, axis, index)
+        .then(() => {
+          setPrepared(true);
+          for (const obj of objectsRef.current) {
+            const pts = obj.points.filter((p) => p.slice === index);
+            if (pts.length) runSegment(obj.id, pts);
+          }
+        })
+        .catch(() => setPrepared(false));
+    }, 250);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file, axis, index, pointReady]);
+
   const handlePick = useCallback(
     (col: number, row: number, label: 0 | 1) => {
       if (propagation?.running || !prepared || !pointReady) return;
       const active = objects.find((o) => o.id === activeObjectId);
       if (!active) return;
-      const nextPts = [...active.points, { col, row, label }];
+      const nextPts = [...active.points, { col, row, label, slice: index }];
       setObjects((prev) =>
         prev.map((o) => (o.id === activeObjectId ? { ...o, points: nextPts } : o)),
       );
-      runSegment(activeObjectId, nextPts);
+      runSegment(
+        activeObjectId,
+        nextPts.filter((p) => p.slice === index),
+      );
     },
-    [objects, activeObjectId, runSegment, propagation, prepared, pointReady],
+    [objects, activeObjectId, index, runSegment, propagation, prepared, pointReady],
   );
 
+  // Undo removes the active object's most recent point on THIS slice.
   const handleUndo = useCallback(() => {
     const active = objects.find((o) => o.id === activeObjectId);
-    if (!active || active.points.length === 0) return;
-    const nextPts = active.points.slice(0, -1);
+    if (!active) return;
+    let removeAt = -1;
+    for (let i = active.points.length - 1; i >= 0; i--) {
+      if (active.points[i].slice === index) {
+        removeAt = i;
+        break;
+      }
+    }
+    if (removeAt < 0) return;
+    const nextPts = active.points.filter((_, i) => i !== removeAt);
     setObjects((prev) =>
       prev.map((o) => (o.id === activeObjectId ? { ...o, points: nextPts } : o)),
     );
-    runSegment(activeObjectId, nextPts);
-  }, [objects, activeObjectId, runSegment]);
+    runSegment(
+      activeObjectId,
+      nextPts.filter((p) => p.slice === index),
+    );
+  }, [objects, activeObjectId, index, runSegment]);
 
   const handleAddObject = useCallback(() => {
     const id = nextObjectId.current++;
@@ -208,6 +256,8 @@ export default function App() {
 
   const handleRemoveObject = useCallback(
     (objectId: number) => {
+      abortMap.current.get(objectId)?.abort();
+      abortMap.current.delete(objectId);
       setObjects((prev) => {
         const next = prev.filter((o) => o.id !== objectId);
         if (next.length === 0) {
@@ -222,13 +272,36 @@ export default function App() {
     [activeObjectId],
   );
 
+  // Only objects with at least one + point can be tracked; negative-only
+  // objects have nothing to segment.
   const objectsWithPoints = useMemo(
-    () => objects.filter((o) => o.points.length > 0),
+    () => objects.filter((o) => o.points.some((p) => p.label === 1)),
     [objects],
   );
   const totalPoints = useMemo(
     () => objects.reduce((n, o) => n + o.points.length, 0),
     [objects],
+  );
+  const activePointsHere = useMemo(() => {
+    const active = objects.find((o) => o.id === activeObjectId);
+    return active ? active.points.filter((p) => p.slice === index).length : 0;
+  }, [objects, activeObjectId, index]);
+  // True when the active object's clicks on this slice are all negative:
+  // no live preview is possible, the clicks apply on re-propagation.
+  const negativeOnlyHere = useMemo(() => {
+    const active = objects.find((o) => o.id === activeObjectId);
+    if (!active) return false;
+    const here = active.points.filter((p) => p.slice === index);
+    return here.length > 0 && !here.some((p) => p.label === 1);
+  }, [objects, activeObjectId, index]);
+  // The viewer only shows markers and previews belonging to this slice.
+  const viewerObjects = useMemo(
+    () =>
+      objects.map((o) => ({
+        ...o,
+        points: o.points.filter((p) => p.slice === index),
+      })),
+    [objects, index],
   );
 
   const handlePropagate = useCallback(() => {
@@ -380,8 +453,12 @@ export default function App() {
                   style={{ background: objectColor(obj.id) }}
                 />
                 <span className="object-name">Object {obj.id + 1}</span>
-                <span className="object-count">
-                  {obj.points.length} pt{obj.points.length === 1 ? "" : "s"}
+                <span
+                  className="object-count"
+                  title="points on this slice / total points"
+                >
+                  {obj.points.filter((p) => p.slice === index).length}/
+                  {obj.points.length} pts
                 </span>
                 <button
                   className="object-remove"
@@ -399,6 +476,18 @@ export default function App() {
           <button className="toggle" onClick={handleAddObject}>
             + Add object
           </button>
+          {file.kind === "3d" && (
+            <p className="hint">
+              Points persist across slices — scrub to another slice to add
+              refinement clicks, then re-propagate.
+            </p>
+          )}
+          {negativeOnlyHere && (
+            <p className="hint hint-notice">
+              Only − points on this slice: they refine the tracked mask on
+              re-propagation. No live preview without a + point here.
+            </p>
+          )}
         </div>
 
         <div className="field">
@@ -406,9 +495,8 @@ export default function App() {
             <button
               className="toggle"
               onClick={handleUndo}
-              disabled={
-                !objects.find((o) => o.id === activeObjectId)?.points.length
-              }
+              disabled={!activePointsHere}
+              title="Removes the active object's last point on this slice"
             >
               Undo point
             </button>
@@ -428,9 +516,9 @@ export default function App() {
               ? `Propagating ${propagation.done}/${propagation.total}...`
               : !videoReady
                 ? "Loading volume tracker..."
-                : `Propagate ${objectsWithPoints.length || ""} object${
-                    objectsWithPoints.length === 1 ? "" : "s"
-                  } (${axis})`}
+                : `${propagation ? "Re-propagate" : "Propagate"} ${
+                    objectsWithPoints.length || ""
+                  } object${objectsWithPoints.length === 1 ? "" : "s"} (${axis})`}
           </button>
         )}
         {propagation && (
@@ -589,7 +677,7 @@ export default function App() {
         <Viewer
           imageUrl={imageUrl}
           propagatedMaskUrl={propMaskUrl}
-          objects={objects}
+          objects={viewerObjects}
           activeObjectId={activeObjectId}
           sliceWidth={sliceSize.w}
           sliceHeight={sliceSize.h}

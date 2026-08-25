@@ -127,6 +127,12 @@ body {
   font-style: normal;
 }
 
+.hint-notice {
+  color: #f0b429;
+  font-size: 0.78rem;
+  margin: 4px 0 0;
+}
+
 .toggle-row {
   display: flex;
   gap: 8px;

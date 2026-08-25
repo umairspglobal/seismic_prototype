@@ -230,6 +230,9 @@ class ObjectPrompt(BaseModel):
     id: int = 0
     points: list[list[int]] = Field(min_length=1)
     labels: list[int] = Field(min_length=1)
+    # Per-point slice index (SAM2-style refinement clicks on any slice).
+    # Defaults to the request's anchor slice for every point.
+    slices: list[int] | None = None
 
 
 class PropagateRequest(SliceRef):
@@ -383,14 +386,25 @@ def segment(req: SegmentRequest) -> dict:
 
 @app.post("/api/propagate")
 def propagate(req: PropagateRequest) -> StreamingResponse:
-    for obj in req.objects:
-        if len(obj.points) != len(obj.labels):
-            raise HTTPException(422, "points and labels must be equal length")
     data, geometry, data_u8 = _get_file(req.file)
     if geometry.kind != "3d":
         raise HTTPException(422, "Propagation requires a 3D volume")
     _validate_slice(data, geometry, req.axis, req.index)
     n_frames = _axis_count(data, geometry, req.axis)
+    for obj in req.objects:
+        if len(obj.points) != len(obj.labels):
+            raise HTTPException(422, "points and labels must be equal length")
+        if 1 not in obj.labels:
+            raise HTTPException(
+                422,
+                f"object {obj.id + 1} has only negative points; "
+                "add at least one + point to define the object",
+            )
+        if obj.slices is not None:
+            if len(obj.slices) != len(obj.points):
+                raise HTTPException(422, "slices must match points length")
+            if any(not 0 <= s < n_frames for s in obj.slices):
+                raise HTTPException(422, "point slice index out of range")
     frames = [_slice_rgb(data_u8, geometry, req.axis, i) for i in range(n_frames)]
     propagator = _require_propagator()
     object_ids = [obj.id for obj in req.objects]
@@ -421,6 +435,12 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
                     ],
                     labels_per_object=[
                         [int(l) for l in obj.labels] for obj in req.objects
+                    ],
+                    frame_indices_per_object=[
+                        [int(s) for s in obj.slices]
+                        if obj.slices is not None
+                        else [req.index] * len(obj.points)
+                        for obj in req.objects
                     ],
                     progress=on_progress,
                 )

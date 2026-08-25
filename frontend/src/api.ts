@@ -11,6 +11,8 @@ export interface Point {
   col: number;
   row: number;
   label: 0 | 1;
+  /** Slice index the point was picked on (0 for 2D lines). */
+  slice: number;
 }
 
 export interface ObjectPrompt {
@@ -178,6 +180,7 @@ export async function propagate(
         id: o.id,
         points: o.points.map((p) => [p.col, p.row]),
         labels: o.points.map((p) => p.label),
+        slices: o.points.map((p) => p.slice),
       })),
     }),
   });
