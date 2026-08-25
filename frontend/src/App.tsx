@@ -51,6 +51,8 @@ export default function App() {
   const [propagation, setPropagation] = useState<PropagationState | null>(null);
   const [status, setStatus] = useState("Connecting to inference server...");
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
+  const pointReady = Boolean(runtime?.point_loaded);
+  const videoReady = Boolean(runtime?.video_loaded);
 
   // Per-frame propagated masks for instant scrubbing.
   const propMasksRef = useRef<Map<number, string>>(new Map());
@@ -68,9 +70,32 @@ export default function App() {
       .catch(() =>
         setStatus("Cannot reach the inference server. Start it with: uvicorn server.main:app"),
       );
-    getRuntime()
-      .then(setRuntime)
-      .catch(() => setRuntime(null));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = (delayMs: number) => {
+      timer = window.setTimeout(async () => {
+        try {
+          const info = await getRuntime();
+          if (cancelled) return;
+          setRuntime(info);
+          const finished =
+            info.load_stage === "ready" || info.load_stage === "error";
+          poll(finished ? 8000 : 600);
+        } catch {
+          if (cancelled) return;
+          setRuntime(null);
+          poll(1000);
+        }
+      }, delayMs);
+    };
+    poll(0);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, []);
 
   const axisCount = file ? file.axes[axis] : 1;
@@ -97,7 +122,7 @@ export default function App() {
 
   // Reset picks and pre-encode the new slice so the first click is warm.
   useEffect(() => {
-    if (!file) return;
+    if (!file || !pointReady) return;
     resetPicks();
     setPrepared(false);
     const propagated = propMasksRef.current.get(index);
@@ -111,7 +136,7 @@ export default function App() {
     }, 250);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file, axis, index]);
+  }, [file, axis, index, pointReady]);
 
   const setObjectMask = useCallback((objectId: number, url: string | null) => {
     setObjects((prev) =>
@@ -153,7 +178,7 @@ export default function App() {
 
   const handlePick = useCallback(
     (col: number, row: number, label: 0 | 1) => {
-      if (propagation?.running) return;
+      if (propagation?.running || !prepared || !pointReady) return;
       const active = objects.find((o) => o.id === activeObjectId);
       if (!active) return;
       const nextPts = [...active.points, { col, row, label }];
@@ -162,7 +187,7 @@ export default function App() {
       );
       runSegment(activeObjectId, nextPts);
     },
-    [objects, activeObjectId, runSegment, propagation],
+    [objects, activeObjectId, runSegment, propagation, prepared, pointReady],
   );
 
   const handleUndo = useCallback(() => {
@@ -247,9 +272,28 @@ export default function App() {
   const progressPct = propagation
     ? Math.round((100 * propagation.done) / propagation.total)
     : 0;
+  const modelsLoading = !pointReady;
+  const loadMessage = runtime?.load_error && !pointReady
+    ? runtime.load_error
+    : (runtime?.load_stage as string | undefined) ?? "Connecting to inference server...";
 
   return (
     <div className="app">
+      {(modelsLoading || (runtime?.load_error && !pointReady)) && (
+        <div className="loading-overlay" role="status">
+          <div className="loading-card">
+            {!(runtime?.load_error && !pointReady) && <div className="loading-spinner" />}
+            <h2>{runtime?.load_error && !pointReady ? "Model failed to load" : "Loading SAM 3"}</h2>
+            <p>{loadMessage}</p>
+            {!(runtime?.load_error && !pointReady) && (
+              <p className="loading-hint">
+                The tracker is loaded once at startup so the first click stays fast.
+                This can take a minute on the first run.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
       <aside className="sidebar">
         <h1>Seismic SAM</h1>
         <p className="subtitle">Interactive point segmentation</p>
@@ -378,13 +422,15 @@ export default function App() {
           <button
             className="primary"
             onClick={handlePropagate}
-            disabled={!objectsWithPoints.length || propagation?.running}
+            disabled={!objectsWithPoints.length || propagation?.running || !videoReady}
           >
             {propagation?.running
               ? `Propagating ${propagation.done}/${propagation.total}...`
-              : `Propagate ${objectsWithPoints.length || ""} object${
-                  objectsWithPoints.length === 1 ? "" : "s"
-                } (${axis})`}
+              : !videoReady
+                ? "Loading volume tracker..."
+                : `Propagate ${objectsWithPoints.length || ""} object${
+                    objectsWithPoints.length === 1 ? "" : "s"
+                  } (${axis})`}
           </button>
         )}
         {propagation && (
@@ -503,9 +549,21 @@ export default function App() {
 
         <div className="stats">
           <div>
+            <span className="stat-label">Point tracker</span>
+            <span className={pointReady ? "stat-ok" : "stat-wait"}>
+              {pointReady ? "ready" : (runtime?.load_stage ?? "loading...")}
+            </span>
+          </div>
+          <div>
+            <span className="stat-label">Volume tracker</span>
+            <span className={videoReady ? "stat-ok" : "stat-wait"}>
+              {videoReady ? "ready" : pointReady ? "loading..." : "waiting"}
+            </span>
+          </div>
+          <div>
             <span className="stat-label">Slice encoder</span>
             <span className={prepared ? "stat-ok" : "stat-wait"}>
-              {prepared ? "ready" : "encoding..."}
+              {prepared ? "ready" : pointReady ? "encoding..." : "waiting"}
             </span>
           </div>
           {latencyMs !== null && (
@@ -522,6 +580,9 @@ export default function App() {
           )}
         </div>
         {status && <p className="error">{status}</p>}
+        {runtime?.load_error && pointReady && (
+          <p className="error">{runtime.load_error}</p>
+        )}
       </aside>
 
       <main className="stage">
@@ -535,7 +596,7 @@ export default function App() {
           displayWidth={displayWidth}
           displayHeight={displayHeight}
           maskOpacity={maskOpacity}
-          busy={segmenting}
+          busy={segmenting || !prepared || !pointReady}
           onPick={handlePick}
         />
       </main>

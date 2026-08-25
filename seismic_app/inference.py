@@ -16,7 +16,10 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Sequence
 from contextlib import nullcontext
+import gc
 import importlib.util
+import math
+import threading
 import time
 
 import numpy as np
@@ -28,6 +31,45 @@ from . import config
 from .logutil import get_logger
 
 log = get_logger("inference")
+
+# Transformers' lazy module loader is not thread-safe. FastAPI runs sync
+# endpoints in a thread pool, so two concurrent imports of Sam3Tracker*
+# can raise ImportError even when the classes exist. Serialize them.
+_tf_import_lock = threading.Lock()
+_tf_point_classes: tuple[type, type] | None = None
+_tf_video_classes: tuple[type, type] | None = None
+_tf_version: str | None = None
+
+
+def transformers_version() -> str | None:
+    """Import transformers under the shared lock and return its version."""
+    global _tf_version
+    with _tf_import_lock:
+        if _tf_version is None:
+            import transformers
+
+            _tf_version = transformers.__version__
+        return _tf_version
+
+
+def _point_tracker_classes() -> tuple[type, type]:
+    global _tf_point_classes
+    with _tf_import_lock:
+        if _tf_point_classes is None:
+            from transformers import Sam3TrackerModel, Sam3TrackerProcessor
+
+            _tf_point_classes = (Sam3TrackerModel, Sam3TrackerProcessor)
+        return _tf_point_classes
+
+
+def _video_tracker_classes() -> tuple[type, type]:
+    global _tf_video_classes
+    with _tf_import_lock:
+        if _tf_video_classes is None:
+            from transformers import Sam3TrackerVideoModel, Sam3TrackerVideoProcessor
+
+            _tf_video_classes = (Sam3TrackerVideoModel, Sam3TrackerVideoProcessor)
+        return _tf_video_classes
 
 
 class Sam3SeismicSegmenter:
@@ -121,7 +163,7 @@ class Sam3PointSegmenter:
         device: str | None = None,
         embedding_cache_size: int = 2,
     ):
-        from transformers import Sam3TrackerModel, Sam3TrackerProcessor  # deferred
+        Sam3TrackerModel, Sam3TrackerProcessor = _point_tracker_classes()
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.startswith("cuda") and not torch.cuda.is_available():
@@ -303,10 +345,7 @@ class Sam3VolumePropagator:
         use_bfloat16: bool = True,
         compile_model: bool = False,
     ):
-        from transformers import (  # deferred: heavy import
-            Sam3TrackerVideoModel,
-            Sam3TrackerVideoProcessor,
-        )
+        Sam3TrackerVideoModel, Sam3TrackerVideoProcessor = _video_tracker_classes()
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.startswith("cuda") and not torch.cuda.is_available():
@@ -346,6 +385,125 @@ class Sam3VolumePropagator:
             return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         return nullcontext()
 
+    def _free_cuda(self) -> None:
+        gc.collect()
+        if self.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    @staticmethod
+    def _is_cuda_oom(exc: BaseException) -> bool:
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+        text = str(exc).lower()
+        return "out of memory" in text or "cuda oom" in text
+
+    def _estimate_max_objects(self) -> int:
+        """How many objects can share one tracker session on this GPU.
+
+        Decoder work is per-object, but the memory encoder batches every
+        object on the current slice. That batch is the VRAM ceiling.
+        Video frames and mask-memory banks are stored on CPU so they do
+        not count against this budget.
+        """
+        if not self.device.startswith("cuda"):
+            return 10**9
+        free, _total = torch.cuda.mem_get_info()
+        # Keep ~20% free for the vision encoder + scratch; never claim more
+        # than is actually available.
+        headroom = max(int(0.20 * free), 256 * 1024 * 1024)
+        usable = int(free) - headroom
+        if usable <= 0:
+            return 1
+        per_object = 48 * 1024 * 1024  # batched high-res masks + mem-enc activations
+        return max(1, usable // per_object)
+
+    def _new_session(self, pixel_values: torch.Tensor, height: int, width: int):
+        """Build a tracker session with CPU-side video + memory banks."""
+        with _tf_import_lock:
+            from transformers.models.sam3_tracker_video.modeling_sam3_tracker_video import (
+                Sam3TrackerVideoInferenceSession,
+            )
+
+        state_device = "cpu" if self.device.startswith("cuda") else self.device
+        return Sam3TrackerVideoInferenceSession(
+            video=pixel_values,
+            video_height=height,
+            video_width=width,
+            inference_device=self.device,
+            inference_state_device=state_device,
+            video_storage_device=state_device,
+            dtype=self.session_dtype,
+            # Features live on CPU; a handful of cached slices avoids
+            # re-encoding the same frame on the reverse sweep.
+            max_vision_features_cache_size=8,
+        )
+
+    def _propagate_wave(
+        self,
+        pixel_values: torch.Tensor,
+        height: int,
+        width: int,
+        anchor_idx: int,
+        points_per_object: Sequence[Sequence[tuple[int, int]]],
+        labels_per_object: Sequence[Sequence[int]],
+        object_indices: Sequence[int],
+        masks: np.ndarray,
+        on_frame: Callable[[int, int], None],
+    ) -> None:
+        """Track one GPU-sized batch of objects through the volume."""
+        n_wave = len(object_indices)
+        session = self._new_session(pixel_values, height, width)
+        try:
+            self.processor.add_inputs_to_inference_session(
+                session,
+                frame_idx=anchor_idx,
+                obj_ids=list(range(1, n_wave + 1)),
+                input_points=[
+                    [
+                        [[float(x), float(y)] for x, y in points_per_object[i]]
+                        for i in object_indices
+                    ]
+                ],
+                input_labels=[
+                    [
+                        [int(label) for label in labels_per_object[i]]
+                        for i in object_indices
+                    ]
+                ],
+                original_size=(height, width),
+            )
+            with self._autocast():
+                anchor_out = self.model(inference_session=session, frame_idx=anchor_idx)
+                masks[list(object_indices), anchor_idx] = self._to_masks(
+                    anchor_out.pred_masks, n_wave, height, width
+                )
+                on_frame(anchor_idx, 1)
+                log.info("Anchor slice %d segmented; propagating forward...", anchor_idx)
+
+                done = 1
+                n_frames = masks.shape[1]
+                for reverse in (False, True):
+                    direction = "backward" if reverse else "forward"
+                    for out in self.model.propagate_in_video_iterator(
+                        session, start_frame_idx=anchor_idx, reverse=reverse
+                    ):
+                        if out.frame_idx == anchor_idx:
+                            continue
+                        masks[list(object_indices), out.frame_idx] = self._to_masks(
+                            out.pred_masks, n_wave, height, width
+                        )
+                        done += 1
+                        on_frame(out.frame_idx, done)
+                        if done == n_frames or done % max(1, n_frames // 10) == 0:
+                            log.info(
+                                "  slice %d/%d done (%s)", done, n_frames, direction
+                            )
+                    if not reverse:
+                        log.info("Forward sweep complete; propagating backward...")
+        finally:
+            del session
+            self._free_cuda()
+
     @torch.no_grad()
     def propagate(
         self,
@@ -357,9 +515,11 @@ class Sam3VolumePropagator:
     ) -> np.ndarray:
         """Track one or more objects through a stack of slices.
 
-        All objects share a single video session, so the expensive
-        per-slice vision encoding runs once regardless of object count -
-        adding objects costs only the (cheap) per-object mask decoding.
+        Objects share a tracker session up to the GPU's VRAM budget.
+        Video frames and per-object memory banks live on CPU; only the
+        active decode runs on the GPU. Any objects that do not fit are
+        queued and tracked in later waves (the vision encoder is reused
+        per wave, not per object).
 
         Parameters
         ----------
@@ -370,7 +530,7 @@ class Sam3VolumePropagator:
             all on the anchor slice.
         labels_per_object : matching lists of 1 = positive / 0 = negative.
         progress : called as (done, total, frame_idx, frame_masks) where
-            frame_masks is (n_objects, H, W) bool.
+            frame_masks is (n_objects, H, W) bool for every object so far.
 
         Returns
         -------
@@ -387,85 +547,98 @@ class Sam3VolumePropagator:
         n_objects = len(points_per_object)
         n_frames = len(frames)
         h, w = frames[0].shape[:2]
+        batch_limit = min(n_objects, self._estimate_max_objects())
         log.info(
             "Volume propagation: %d slices of %dx%d, anchor slice %d, "
-            "%d object(s) with %s point(s). One shared tracker session - "
-            "the per-slice cost is nearly independent of object count.",
+            "%d object(s) with %s point(s). GPU budget %d object(s)/wave "
+            "(%d wave(s) queued).",
             n_frames,
             w,
             h,
             anchor_idx,
             n_objects,
             [len(p) for p in points_per_object],
+            batch_limit,
+            math.ceil(n_objects / batch_limit),
         )
         t0 = time.perf_counter()
 
         session_started = time.perf_counter()
-        session = self.processor.init_video_session(
-            video=frames,
-            inference_device=self.device,
-            max_vision_features_cache_size=2,
-            dtype=self.session_dtype,
+        processed = self.processor.video_processor(
+            videos=frames, device="cpu", return_tensors="pt"
         )
-        if self.device.startswith("cuda"):
-            torch.cuda.synchronize()
+        pixel_values = processed.pixel_values_videos[0]
         self.last_timings["session_init"] = time.perf_counter() - session_started
 
-        # Register each object separately (SAM2-demo style: objects may have
-        # different point counts, so no padding is needed).
-        for obj_i, (points, labels) in enumerate(
-            zip(points_per_object, labels_per_object)
-        ):
-            self.processor.add_inputs_to_inference_session(
-                session,
-                frame_idx=anchor_idx,
-                obj_ids=obj_i + 1,
-                input_points=[[[[float(x), float(y)] for x, y in points]]],
-                input_labels=[[[int(l) for l in labels]]],
-                original_size=(h, w),
-            )
-
-        # Segment the anchor slice first, then sweep forward and backward.
         masks = np.zeros((n_objects, n_frames, h, w), dtype=bool)
-        with self._autocast():
-            anchor_out = self.model(inference_session=session, frame_idx=anchor_idx)
-            masks[:, anchor_idx] = self._to_masks(anchor_out.pred_masks, n_objects, h, w)
-            if progress is not None:
-                progress(1, n_frames, anchor_idx, masks[:, anchor_idx])
-            log.info("Anchor slice %d segmented; propagating forward...", anchor_idx)
+        pending = list(range(n_objects))
+        waves_done = 0
+        wave_sizes: list[int] = []
+        estimated_waves = max(1, math.ceil(n_objects / batch_limit))
 
-            done = 1
-            for reverse in (False, True):
-                direction = "backward" if reverse else "forward"
-                for out in self.model.propagate_in_video_iterator(
-                    session, start_frame_idx=anchor_idx, reverse=reverse
-                ):
-                    if out.frame_idx == anchor_idx:
-                        continue
-                    masks[:, out.frame_idx] = self._to_masks(
-                        out.pred_masks, n_objects, h, w
-                    )
-                    done += 1
-                    if progress is not None:
-                        progress(done, n_frames, out.frame_idx, masks[:, out.frame_idx])
-                    if done == n_frames or done % max(1, n_frames // 10) == 0:
-                        log.info("  slice %d/%d done (%s)", done, n_frames, direction)
-                if not reverse:
-                    log.info("Forward sweep complete; propagating backward...")
+        def on_frame(frame_idx: int, done_in_wave: int) -> None:
+            if progress is None:
+                return
+            total = estimated_waves * n_frames
+            done = waves_done * n_frames + done_in_wave
+            progress(done, total, frame_idx, masks[:, frame_idx])
+
+        while pending:
+            wave = pending[:batch_limit]
+            queued = pending[len(wave) :]
+            log.info(
+                "Tracker wave %d: %d object(s) on GPU, %d queued",
+                waves_done + 1,
+                len(wave),
+                len(queued),
+            )
+            try:
+                self._propagate_wave(
+                    pixel_values,
+                    h,
+                    w,
+                    anchor_idx,
+                    points_per_object,
+                    labels_per_object,
+                    wave,
+                    masks,
+                    on_frame,
+                )
+            except Exception as exc:
+                if not self._is_cuda_oom(exc) or len(wave) == 1:
+                    raise
+                log.warning(
+                    "GPU full with %d objects in one session (%s); "
+                    "halving the wave and queueing the rest",
+                    len(wave),
+                    exc,
+                )
+                self._free_cuda()
+                batch_limit = max(1, len(wave) // 2)
+                estimated_waves = waves_done + math.ceil(len(pending) / batch_limit)
+                continue
+            pending = queued
+            wave_sizes.append(len(wave))
+            waves_done += 1
+            estimated_waves = waves_done + (
+                math.ceil(len(pending) / batch_limit) if pending else 0
+            )
 
         total_elapsed = time.perf_counter() - t0
         self.last_timings.update(
             inference=total_elapsed - self.last_timings["session_init"],
             total=total_elapsed,
             fps=n_frames / total_elapsed if total_elapsed else float("inf"),
+            object_waves=float(waves_done),
+            objects_per_wave=float(max(wave_sizes) if wave_sizes else 0),
         )
         log.info(
-            "Volume propagation finished in %.1fs (%d/%d slices, %d object(s), "
-            "total coverage %.2f%%)",
+            "Volume propagation finished in %.1fs (%d slices, %d object(s) "
+            "in %d wave(s), total coverage %.2f%%)",
             total_elapsed,
-            done,
             n_frames,
             n_objects,
+            waves_done,
             100.0 * float(masks.any(axis=0).mean()),
         )
         return masks

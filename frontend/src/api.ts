@@ -66,6 +66,9 @@ export interface RuntimeInfo {
   video_model: string;
   point_loaded: boolean;
   video_loaded: boolean;
+  load_stage: string | null;
+  load_error: string | null;
+  ready: boolean;
   point_device: string | null;
   video_device: string | null;
   video_precision: string | null;
@@ -119,11 +122,15 @@ export async function prepareSlice(
   axis: Axis,
   index: number,
 ): Promise<void> {
-  await fetch(apiUrl("/api/prepare"), {
+  const res = await fetch(apiUrl("/api/prepare"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ file, axis, index }),
   });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(detail || `Prepare failed: ${res.status}`);
+  }
 }
 
 export async function segment(

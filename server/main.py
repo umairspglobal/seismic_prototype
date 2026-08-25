@@ -20,6 +20,7 @@ import queue
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,11 @@ from pydantic import BaseModel, Field
 
 from seismic_app import config
 from seismic_app.geometry import SectionGeometry
-from seismic_app.inference import Sam3PointSegmenter, Sam3VolumePropagator
+from seismic_app.inference import (
+    Sam3PointSegmenter,
+    Sam3VolumePropagator,
+    transformers_version,
+)
 from seismic_app.logutil import get_logger
 from seismic_app.preprocessing import inline_to_rgb_25d, normalize_to_uint8, to_rgb
 from seismic_app.sgy_loader import load_any
@@ -58,14 +63,6 @@ OBJECT_COLORS: list[tuple[int, int, int]] = [
 def _object_color(object_id: int) -> tuple[int, int, int]:
     return OBJECT_COLORS[object_id % len(OBJECT_COLORS)]
 
-app = FastAPI(title="Seismic SAM interactive API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # One lock serializes GPU work; a second protects the file cache.
 _gpu_lock = threading.Lock()
@@ -73,6 +70,41 @@ _cache_lock = threading.Lock()
 _file_cache: dict[str, tuple[np.ndarray, SectionGeometry, np.ndarray]] = {}
 _point_segmenter: Sam3PointSegmenter | None = None
 _propagator: Sam3VolumePropagator | None = None
+_load_state: dict[str, str | bool | None] = {
+    "stage": "starting",
+    "error": None,
+}
+
+
+def _warmup_models() -> None:
+    """Load both trackers at process start so the first click is not a cold load."""
+    try:
+        _load_state["stage"] = "Loading SAM 3 point tracker onto the GPU..."
+        _get_point_segmenter()
+        _load_state["stage"] = "Loading SAM 3 volume tracker onto the GPU..."
+        _get_propagator()
+        _load_state["stage"] = "ready"
+        log.info("Model warmup complete; point and volume trackers are resident.")
+    except Exception as exc:
+        log.exception("Model warmup failed")
+        _load_state["error"] = str(exc)
+        _load_state["stage"] = "ready" if _point_segmenter is not None else "error"
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    threading.Thread(target=_warmup_models, daemon=True, name="model-warmup").start()
+    yield
+
+
+app = FastAPI(title="Seismic SAM interactive API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _list_sgy() -> list[Path]:
@@ -109,6 +141,26 @@ def _get_propagator() -> Sam3VolumePropagator:
         if _propagator is None:
             _propagator = Sam3VolumePropagator(config.DEFAULT_CHECKPOINT)
         return _propagator
+
+
+def _require_point_segmenter() -> Sam3PointSegmenter:
+    if _load_state["error"] and _point_segmenter is None:
+        raise HTTPException(503, f"Model failed to load: {_load_state['error']}")
+    if _point_segmenter is None:
+        raise HTTPException(
+            503, str(_load_state["stage"] or "SAM 3 point tracker is still loading")
+        )
+    return _point_segmenter
+
+
+def _require_propagator() -> Sam3VolumePropagator:
+    if _load_state["error"] and _propagator is None:
+        raise HTTPException(503, f"Model failed to load: {_load_state['error']}")
+    if _propagator is None:
+        raise HTTPException(
+            503, str(_load_state["stage"] or "SAM 3 volume tracker is still loading")
+        )
+    return _propagator
 
 
 def _axis_count(data: np.ndarray, geometry: SectionGeometry, axis: str) -> int:
@@ -232,15 +284,14 @@ def runtime_info() -> dict:
         }
 
     try:
-        import transformers
-
-        transformers_version = transformers.__version__
+        tf_version = transformers_version()
     except Exception:
-        transformers_version = None
+        tf_version = None
 
-    with _gpu_lock:
-        point = _point_segmenter
-        video = _propagator
+    # Don't take _gpu_lock here: warmup holds it for the whole weight load,
+    # and the UI needs to poll this endpoint for the loading overlay.
+    point = _point_segmenter
+    video = _propagator
 
     return {
         "checkpoint": config.DEFAULT_CHECKPOINT,
@@ -249,6 +300,9 @@ def runtime_info() -> dict:
         "video_model": "Sam3TrackerVideoModel",
         "point_loaded": point is not None,
         "video_loaded": video is not None,
+        "load_stage": _load_state["stage"],
+        "load_error": _load_state["error"],
+        "ready": point is not None,
         "point_device": getattr(point, "device", None),
         "video_device": getattr(video, "device", None),
         "video_precision": (
@@ -270,7 +324,7 @@ def runtime_info() -> dict:
             "python": sys.version.split()[0],
             "platform": platform.platform(),
             "torch": torch.__version__,
-            "transformers": transformers_version,
+            "transformers": tf_version,
         },
     }
 
@@ -295,7 +349,7 @@ def prepare_slice(req: SliceRef) -> dict:
     data, geometry, data_u8 = _get_file(req.file)
     _validate_slice(data, geometry, req.axis, req.index)
     rgb = _slice_rgb(data_u8, geometry, req.axis, req.index)
-    segmenter = _get_point_segmenter()
+    segmenter = _require_point_segmenter()
     with _gpu_lock:
         segmenter.prepare_image(rgb, image_key=(req.file, req.axis, req.index))
     return {"prepare_seconds": segmenter.last_timings.get("prepare_image", 0.0)}
@@ -308,7 +362,7 @@ def segment(req: SegmentRequest) -> dict:
     data, geometry, data_u8 = _get_file(req.file)
     _validate_slice(data, geometry, req.axis, req.index)
     rgb = _slice_rgb(data_u8, geometry, req.axis, req.index)
-    segmenter = _get_point_segmenter()
+    segmenter = _require_point_segmenter()
     started = time.perf_counter()
     with _gpu_lock:
         mask = segmenter.segment(
@@ -338,7 +392,7 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
     _validate_slice(data, geometry, req.axis, req.index)
     n_frames = _axis_count(data, geometry, req.axis)
     frames = [_slice_rgb(data_u8, geometry, req.axis, i) for i in range(n_frames)]
-    propagator = _get_propagator()
+    propagator = _require_propagator()
     object_ids = [obj.id for obj in req.objects]
 
     events: queue.Queue[dict | None] = queue.Queue(maxsize=32)

@@ -61,19 +61,21 @@ export function Viewer({
   // SAM 2-style prompts: left click = object, right click = background.
   const handleClick = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
+      if (busy) return;
       const { col, row } = pickFromEvent(event, sliceWidth, sliceHeight);
       onPick(col, row, 1);
     },
-    [onPick, sliceWidth, sliceHeight],
+    [onPick, sliceWidth, sliceHeight, busy],
   );
 
   const handleContextMenu = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
       event.preventDefault();
+      if (busy) return;
       const { col, row } = pickFromEvent(event, sliceWidth, sliceHeight);
       onPick(col, row, 0);
     },
-    [onPick, sliceWidth, sliceHeight],
+    [onPick, sliceWidth, sliceHeight, busy],
   );
 
   const scaleX = displayWidth / sliceWidth;

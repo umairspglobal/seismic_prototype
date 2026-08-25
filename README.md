@@ -120,7 +120,12 @@ propagate. All objects share one tracker session, so the per-slice cost
 of propagation is nearly independent of the object count; each slice
 streams to the browser as a single combined multi-color mask.
 
-Start the inference server (loads models on first use):
+The tracker models are loaded in the background as soon as the inference
+server starts. The React client shows a loading overlay until the point
+tracker is on the GPU, then encodes the active slice so the first click
+is already warm.
+
+Start the inference server (models begin loading immediately):
 
 ```powershell
 uvicorn server.main:app --host 127.0.0.1 --port 8000

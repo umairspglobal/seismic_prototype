@@ -16,6 +16,59 @@ body {
 .app {
   display: flex;
   min-height: 100vh;
+  position: relative;
+}
+
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  background: rgba(10, 13, 16, 0.78);
+  backdrop-filter: blur(6px);
+}
+
+.loading-card {
+  width: min(420px, calc(100vw - 48px));
+  padding: 28px 24px;
+  border-radius: 12px;
+  background: #171c22;
+  border: 1px solid #2c343d;
+  text-align: center;
+}
+
+.loading-card h2 {
+  margin: 16px 0 8px;
+  font-size: 1.2rem;
+}
+
+.loading-card p {
+  margin: 0;
+  color: #b8c0c8;
+  font-size: 0.9rem;
+}
+
+.loading-hint {
+  margin-top: 12px !important;
+  color: #7d8790 !important;
+  font-size: 0.8rem !important;
+}
+
+.loading-spinner {
+  width: 36px;
+  height: 36px;
+  margin: 0 auto;
+  border: 3px solid #2c343d;
+  border-top-color: #2563eb;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .app-empty {
