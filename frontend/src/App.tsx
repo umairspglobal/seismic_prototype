@@ -3,6 +3,7 @@ import {
   Axis,
   ExportResult,
   FileInfo,
+  ModelFamily,
   Point,
   PropagationEvent,
   RuntimeInfo,
@@ -17,6 +18,7 @@ import {
   refine,
   resweep,
   segment,
+  setModel,
   sliceUrl,
 } from "./api";
 import { Viewer, ViewerObject } from "./Viewer";
@@ -72,8 +74,9 @@ export default function App() {
   // React state (not only the runtime poll) so a stale /api/runtime
   // response during a long sweep cannot hide export or disable refine.
   const [trackedObjectIds, setTrackedObjectIds] = useState<number[]>([]);
-  const pointReady = Boolean(runtime?.point_loaded);
-  const videoReady = Boolean(runtime?.video_loaded);
+  const [modelFamily, setModelFamily] = useState<ModelFamily>("sam3");
+  const pointReady = Boolean(runtime?.point_loaded) && runtime?.family === modelFamily;
+  const videoReady = Boolean(runtime?.video_loaded) && runtime?.family === modelFamily;
 
   // Per-frame propagated masks for instant scrubbing.
   const propMasksRef = useRef<Map<number, string>>(new Map());
@@ -86,6 +89,7 @@ export default function App() {
   // Objects the live tracker holds, for use inside effects.
   const trackedIdsRef = useRef<Set<number>>(new Set());
   const trackedReadyRef = useRef(false);
+  const userPickedFamily = useRef<ModelFamily | null>(null);
 
   useEffect(() => {
     listFiles()
@@ -135,7 +139,12 @@ export default function App() {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, []);
+  }, [modelFamily]);
+
+  useEffect(() => {
+    if (!runtime?.family || userPickedFamily.current != null) return;
+    setModelFamily(runtime.family);
+  }, [runtime?.family]);
 
   const axisCount = file ? file.axes[axis] : 1;
   const sliceSize = useMemo(() => {
@@ -187,6 +196,36 @@ export default function App() {
     setExportInfo(null);
     setExportError(null);
   }, [abortAll]);
+
+  const handleModelChange = useCallback(
+    (family: ModelFamily) => {
+      if (family === modelFamily || propagation?.running) return;
+      userPickedFamily.current = family;
+      setModelFamily(family);
+      abortAll();
+      setPropMaskUrl(null);
+      setCoverage(null);
+      setSegmenting(false);
+      setPrepared(false);
+      propMasksRef.current = new Map();
+      setPropagation(null);
+      setPendingEdits(0);
+      setPromptsDropped(true);
+      setTrackedObjectIds([]);
+      setExportInfo(null);
+      setExportError(null);
+      setObjects((prev) => prev.map((o) => ({ ...o, maskUrl: null })));
+      setModel(family)
+        .then(() => getRuntime().then(setRuntime).catch(() => undefined))
+        .catch((err: Error) => {
+          setStatus(`Could not switch tracker: ${err.message}`);
+          const fallback = runtime?.family ?? "sam3";
+          userPickedFamily.current = fallback;
+          setModelFamily(fallback);
+        });
+    },
+    [modelFamily, propagation?.running, abortAll, runtime?.family],
+  );
 
   // A new file or axis invalidates all picks; a slice change does NOT -
   // objects persist so you can refine them on any slice (SAM2-style).
@@ -530,6 +569,7 @@ export default function App() {
     ? Math.round((100 * propagation.done) / propagation.total)
     : 0;
   const modelsLoading = !pointReady;
+  const familyLabel = runtime?.family_label ?? (modelFamily === "sam2" ? "SAM 2" : "SAM 3");
   const loadMessage = runtime?.load_error && !pointReady
     ? runtime.load_error
     : (runtime?.load_stage as string | undefined) ?? "Connecting to inference server...";
@@ -540,12 +580,12 @@ export default function App() {
         <div className="loading-overlay" role="status">
           <div className="loading-card">
             {!(runtime?.load_error && !pointReady) && <div className="loading-spinner" />}
-            <h2>{runtime?.load_error && !pointReady ? "Model failed to load" : "Loading SAM 3"}</h2>
+            <h2>{runtime?.load_error && !pointReady ? "Model failed to load" : `Loading ${familyLabel}`}</h2>
             <p>{loadMessage}</p>
             {!(runtime?.load_error && !pointReady) && (
               <p className="loading-hint">
-                The tracker is loaded once at startup so the first click stays fast.
-                This can take a minute on the first run.
+                Only one tracker stays on the GPU. The first load of a
+                model can take a minute (and may download weights).
               </p>
             )}
           </div>
@@ -554,6 +594,32 @@ export default function App() {
       <aside className="sidebar">
         <h1>Seismic SAM</h1>
         <p className="subtitle">Interactive point segmentation</p>
+
+        <div className="field">
+          <span>Tracker model</span>
+          <div className="toggle-row">
+            <button
+              className={modelFamily === "sam3" ? "toggle active-model" : "toggle"}
+              onClick={() => handleModelChange("sam3")}
+              disabled={propagation?.running}
+              title="SAM 3 tracker (default)"
+            >
+              SAM 3
+            </button>
+            <button
+              className={modelFamily === "sam2" ? "toggle active-model" : "toggle"}
+              onClick={() => handleModelChange("sam2")}
+              disabled={propagation?.running}
+              title="SAM 2.1 hiera-large, for comparison"
+            >
+              SAM 2
+            </button>
+          </div>
+          <p className="hint">
+            SAM 3 is the default. Switch to SAM 2 to compare masks on the
+            same clicks; only one model stays on the GPU.
+          </p>
+        </div>
 
         <label className="field">
           <span>Seismic file</span>
@@ -834,6 +900,8 @@ export default function App() {
               )}
               <dt>Architecture</dt>
               <dd>{runtime.architecture}</dd>
+              <dt>Tracker</dt>
+              <dd>{runtime.family_label}</dd>
               <dt>Checkpoint</dt>
               <dd className="runtime-mono">{runtime.checkpoint}</dd>
               <dt>Point model</dt>

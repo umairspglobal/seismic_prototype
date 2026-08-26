@@ -33,11 +33,12 @@ from .logutil import get_logger
 log = get_logger("inference")
 
 # Transformers' lazy module loader is not thread-safe. FastAPI runs sync
-# endpoints in a thread pool, so two concurrent imports of Sam3Tracker*
+# endpoints in a thread pool, so two concurrent imports of Sam* classes
 # can raise ImportError even when the classes exist. Serialize them.
 _tf_import_lock = threading.Lock()
-_tf_point_classes: tuple[type, type] | None = None
-_tf_video_classes: tuple[type, type] | None = None
+_tf_point_classes: dict[str, tuple[type, type]] = {}
+_tf_video_classes: dict[str, tuple[type, type]] = {}
+_tf_session_classes: dict[str, type] = {}
 _tf_version: str | None = None
 
 
@@ -52,24 +53,53 @@ def transformers_version() -> str | None:
         return _tf_version
 
 
-def _point_tracker_classes() -> tuple[type, type]:
-    global _tf_point_classes
+def _point_tracker_classes(family: str | None = None) -> tuple[type, type]:
+    key = config.resolve_family(family)
     with _tf_import_lock:
-        if _tf_point_classes is None:
-            from transformers import Sam3TrackerModel, Sam3TrackerProcessor
+        if key not in _tf_point_classes:
+            if key == "sam2":
+                from transformers import Sam2Model, Sam2Processor
 
-            _tf_point_classes = (Sam3TrackerModel, Sam3TrackerProcessor)
-        return _tf_point_classes
+                _tf_point_classes[key] = (Sam2Model, Sam2Processor)
+            else:
+                from transformers import Sam3TrackerModel, Sam3TrackerProcessor
+
+                _tf_point_classes[key] = (Sam3TrackerModel, Sam3TrackerProcessor)
+        return _tf_point_classes[key]
 
 
-def _video_tracker_classes() -> tuple[type, type]:
-    global _tf_video_classes
+def _video_tracker_classes(family: str | None = None) -> tuple[type, type]:
+    key = config.resolve_family(family)
     with _tf_import_lock:
-        if _tf_video_classes is None:
-            from transformers import Sam3TrackerVideoModel, Sam3TrackerVideoProcessor
+        if key not in _tf_video_classes:
+            if key == "sam2":
+                from transformers import Sam2VideoModel, Sam2VideoProcessor
 
-            _tf_video_classes = (Sam3TrackerVideoModel, Sam3TrackerVideoProcessor)
-        return _tf_video_classes
+                _tf_video_classes[key] = (Sam2VideoModel, Sam2VideoProcessor)
+            else:
+                from transformers import Sam3TrackerVideoModel, Sam3TrackerVideoProcessor
+
+                _tf_video_classes[key] = (Sam3TrackerVideoModel, Sam3TrackerVideoProcessor)
+        return _tf_video_classes[key]
+
+
+def _video_session_class(family: str | None = None) -> type:
+    key = config.resolve_family(family)
+    with _tf_import_lock:
+        if key not in _tf_session_classes:
+            if key == "sam2":
+                from transformers.models.sam2_video.modeling_sam2_video import (
+                    Sam2VideoInferenceSession,
+                )
+
+                _tf_session_classes[key] = Sam2VideoInferenceSession
+            else:
+                from transformers.models.sam3_tracker_video.modeling_sam3_tracker_video import (
+                    Sam3TrackerVideoInferenceSession,
+                )
+
+                _tf_session_classes[key] = Sam3TrackerVideoInferenceSession
+        return _tf_session_classes[key]
 
 
 class Sam3SeismicSegmenter:
@@ -146,24 +176,28 @@ class Sam3SeismicSegmenter:
 
 
 class Sam3PointSegmenter:
-    """Interactive point-prompted segmentation (SAM3 Tracker / PVS head).
+    """Interactive point-prompted segmentation (SAM 3 tracker or SAM 2).
 
-    This is the SAM2-style promptable-visual-segmentation interface of
-    SAM 3: the user clicks positive/negative points on the section and
-    the model segments the one object they indicated. The *whole*
-    section image is passed in one go (seismic lines are small compared
-    to SAM's 1024 input; the processor resizes internally), so click
-    coordinates are plain full-resolution array indices - no tile
-    bookkeeping required.
+    SAM 3 uses the tracker / PVS head; SAM 2 uses Sam2Model. Both share
+    the same click interface: the user marks positive/negative points on
+    the section and the model segments the one object they indicated.
+    The *whole* section image is passed in one go (seismic lines are
+    small compared to SAM's 1024 input; the processor resizes
+    internally), so click coordinates are plain full-resolution array
+    indices - no tile bookkeeping required.
     """
 
     def __init__(
         self,
-        checkpoint: str = config.DEFAULT_CHECKPOINT,
+        checkpoint: str | None = None,
         device: str | None = None,
         embedding_cache_size: int = 2,
+        family: str | None = None,
     ):
-        Sam3TrackerModel, Sam3TrackerProcessor = _point_tracker_classes()
+        self.family = config.resolve_family(family)
+        spec = config.family_spec(self.family)
+        checkpoint = checkpoint or str(spec["checkpoint"])
+        ModelCls, ProcessorCls = _point_tracker_classes(self.family)
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.startswith("cuda") and not torch.cuda.is_available():
@@ -173,20 +207,23 @@ class Sam3PointSegmenter:
                 "or select CPU."
             )
         log.info(
-            "Loading Sam3TrackerModel from '%s' onto device=%s (first run may "
+            "Loading %s from '%s' onto device=%s (first run may "
             "download weights - can take several minutes on CPU)...",
+            spec["point_model"],
             checkpoint,
             self.device,
         )
         t0 = time.perf_counter()
-        self.model = Sam3TrackerModel.from_pretrained(checkpoint).to(self.device)
+        self.model = ModelCls.from_pretrained(checkpoint).to(self.device)
         self.model.eval()
         log.info(
-            "Sam3TrackerModel weights loaded in %.1fs; loading processor...",
+            "%s weights loaded in %.1fs; loading processor...",
+            spec["point_model"],
             time.perf_counter() - t0,
         )
-        self.processor = Sam3TrackerProcessor.from_pretrained(checkpoint)
-        log.info("Point-prompt tracker ready on %s", self.device)
+        self.processor = ProcessorCls.from_pretrained(checkpoint)
+        self.checkpoint = checkpoint
+        log.info("Point-prompt tracker (%s) ready on %s", spec["label"], self.device)
 
         # Keep only a few sections resident: embeddings are large GPU tensors.
         self.embedding_cache_size = max(1, int(embedding_cache_size))
@@ -377,7 +414,7 @@ class LiveTracker:
 
 
 class Sam3VolumePropagator:
-    """Propagate a point-picked object through a 3D volume, SAM2-video style.
+    """Propagate a point-picked object through a 3D volume, video-tracker style.
 
     This is the seismic equivalent of SAM 2's video segmentation: the
     slices of a 3D volume along one axis (inlines, crosslines, or time
@@ -386,6 +423,8 @@ class Sam3VolumePropagator:
     every other slice in both directions. No conversion of the .sgy to an
     actual video file is needed - the frames are fed in as arrays.
 
+    ``family`` selects SAM 3's tracker video model (default) or SAM 2.1.
+
     Note this only makes sense for 3D volumes. A 2D line is a single
     frame: its image already contains the full time axis, so there is
     nothing to propagate through.
@@ -393,12 +432,17 @@ class Sam3VolumePropagator:
 
     def __init__(
         self,
-        checkpoint: str = config.DEFAULT_CHECKPOINT,
+        checkpoint: str | None = None,
         device: str | None = None,
         use_bfloat16: bool = True,
         compile_model: bool = False,
+        family: str | None = None,
     ):
-        Sam3TrackerVideoModel, Sam3TrackerVideoProcessor = _video_tracker_classes()
+        self.family = config.resolve_family(family)
+        spec = config.family_spec(self.family)
+        checkpoint = checkpoint or str(spec["checkpoint"])
+        ModelCls, ProcessorCls = _video_tracker_classes(self.family)
+        self._session_cls = _video_session_class(self.family)
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.startswith("cuda") and not torch.cuda.is_available():
@@ -408,17 +452,22 @@ class Sam3VolumePropagator:
                 "or select CPU."
             )
         log.info(
-            "Loading Sam3TrackerVideoModel from '%s' onto device=%s...",
+            "Loading %s from '%s' onto device=%s...",
+            spec["video_model"],
             checkpoint,
             self.device,
         )
         t0 = time.perf_counter()
-        self.model = Sam3TrackerVideoModel.from_pretrained(checkpoint).to(self.device)
+        self.model = ModelCls.from_pretrained(checkpoint).to(self.device)
         self.model.eval()
         if compile_model and hasattr(torch, "compile"):
-            log.info("Compiling SAM 3 video tracker (first propagation will warm up)...")
+            log.info(
+                "Compiling %s video tracker (first propagation will warm up)...",
+                spec["label"],
+            )
             self.model = torch.compile(self.model)
-        self.processor = Sam3TrackerVideoProcessor.from_pretrained(checkpoint)
+        self.processor = ProcessorCls.from_pretrained(checkpoint)
+        self.checkpoint = checkpoint
         self.session_dtype = (
             torch.bfloat16
             if use_bfloat16
@@ -430,7 +479,8 @@ class Sam3VolumePropagator:
         # Sessions from the last propagation, kept for interactive edits.
         self.live: LiveTracker | None = None
         log.info(
-            "Volume propagator ready on %s (loaded in %.1fs)",
+            "Volume propagator (%s) ready on %s (loaded in %.1fs)",
+            spec["label"],
             self.device,
             time.perf_counter() - t0,
         )
@@ -474,13 +524,8 @@ class Sam3VolumePropagator:
 
     def _new_session(self, pixel_values: torch.Tensor, height: int, width: int):
         """Build a tracker session with CPU-side video + memory banks."""
-        with _tf_import_lock:
-            from transformers.models.sam3_tracker_video.modeling_sam3_tracker_video import (
-                Sam3TrackerVideoInferenceSession,
-            )
-
         state_device = "cpu" if self.device.startswith("cuda") else self.device
-        return Sam3TrackerVideoInferenceSession(
+        return self._session_cls(
             video=pixel_values,
             video_height=height,
             video_width=width,

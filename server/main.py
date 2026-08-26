@@ -1,4 +1,4 @@
-"""Persistent SAM 3 inference API for the React interactive client.
+"""Persistent SAM inference API for the React interactive client.
 
 Run with:
     uvicorn server.main:app --host 127.0.0.1 --port 8000
@@ -8,11 +8,15 @@ client/server split), so a point click only runs the prompt encoder and
 mask decoder. Propagation streams one NDJSON event per tracked slice so
 the browser can display and scrub frames while the sweep is still
 running.
+
+SAM 3 is loaded by default. POST /api/model with ``{"family": "sam2"}``
+or ``{"family": "sam3"}`` to switch; only one family stays on the GPU.
 """
 
 from __future__ import annotations
 
 import base64
+import gc
 import io
 import json
 import platform
@@ -33,6 +37,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from seismic_app import config
+from seismic_app.config import ModelFamily
 from seismic_app.geometry import SectionGeometry
 from seismic_app.inference import (
     LiveTracker,
@@ -71,9 +76,12 @@ def _object_color(object_id: int) -> tuple[int, int, int]:
 # One lock serializes GPU work; a second protects the file cache.
 _gpu_lock = threading.Lock()
 _cache_lock = threading.Lock()
+_family_lock = threading.Lock()
 _file_cache: dict[str, tuple[np.ndarray, SectionGeometry, np.ndarray]] = {}
 _point_segmenter: Sam3PointSegmenter | None = None
 _propagator: Sam3VolumePropagator | None = None
+_active_family: ModelFamily = config.DEFAULT_MODEL_FAMILY
+_load_id = 0
 _load_state: dict[str, str | bool | None] = {
     "stage": "starting",
     "error": None,
@@ -117,19 +125,105 @@ def _require_propagation(file: str, axis: str) -> Propagation:
     return _propagation
 
 
-def _warmup_models() -> None:
-    """Load both trackers at process start so the first click is not a cold load."""
+def _family_label(family: str | None = None) -> str:
+    return str(config.family_spec(family or _active_family)["label"])
+
+
+def _unload_models_locked() -> None:
+    """Drop resident trackers so a different family can occupy the GPU."""
+    global _point_segmenter, _propagator, _propagation
+    _propagation = None
+    if _propagator is not None:
+        _propagator.live = None
+        _propagator.model = None
+        _propagator.processor = None
+        _propagator = None
+    if _point_segmenter is not None:
+        _point_segmenter._prepared.clear()
+        _point_segmenter.model = None
+        _point_segmenter.processor = None
+        _point_segmenter = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _load_models(family: ModelFamily, load_id: int) -> None:
+    """Load one tracker family; ignore the result if a newer switch superseded it."""
+    global _point_segmenter, _propagator
+    label = _family_label(family)
     try:
-        _load_state["stage"] = "Loading SAM 3 point tracker onto the GPU..."
-        _get_point_segmenter()
-        _load_state["stage"] = "Loading SAM 3 volume tracker onto the GPU..."
-        _get_propagator()
-        _load_state["stage"] = "ready"
-        log.info("Model warmup complete; point and volume trackers are resident.")
+        with _gpu_lock:
+            if load_id != _load_id:
+                return
+            _unload_models_locked()
+            _load_state["error"] = None
+            _load_state["stage"] = f"Loading {label} point tracker onto the GPU..."
+            _point_segmenter = Sam3PointSegmenter(
+                family=family, embedding_cache_size=4
+            )
+            if load_id != _load_id:
+                _unload_models_locked()
+                return
+            _load_state["stage"] = f"Loading {label} volume tracker onto the GPU..."
+            _propagator = Sam3VolumePropagator(family=family)
+            if load_id != _load_id:
+                _unload_models_locked()
+                return
+            _load_state["stage"] = "ready"
+            log.info(
+                "Model warmup complete; %s point and volume trackers are resident.",
+                label,
+            )
     except Exception as exc:
-        log.exception("Model warmup failed")
+        log.exception("Model warmup failed for %s", label)
         _load_state["error"] = str(exc)
         _load_state["stage"] = "ready" if _point_segmenter is not None else "error"
+
+
+def _warmup_models() -> None:
+    """Load the default tracker family at process start so the first click is warm."""
+    global _load_id
+    with _family_lock:
+        # Don't stomp a family the UI already requested during startup.
+        if _load_id != 0:
+            return
+        _load_id = 1
+        load_id = _load_id
+        family = _active_family
+    _load_models(family, load_id)
+
+
+def _request_family(family: ModelFamily) -> dict:
+    """Switch the resident tracker family, loading in the background if needed."""
+    global _active_family, _load_id
+    spec = config.family_spec(family)
+    with _family_lock:
+        already = (
+            family == _active_family
+            and _point_segmenter is not None
+            and _load_state["stage"] == "ready"
+        )
+        if already:
+            return {"family": family, "ready": True, "label": spec["label"]}
+        same_in_flight = family == _active_family and _load_state["stage"] not in (
+            "ready",
+            "error",
+        )
+        if same_in_flight:
+            return {"family": family, "ready": False, "label": spec["label"]}
+        _active_family = family
+        _load_id += 1
+        load_id = _load_id
+        _load_state["error"] = None
+        _load_state["stage"] = f"Switching to {spec['label']}..."
+    threading.Thread(
+        target=_load_models,
+        args=(family, load_id),
+        daemon=True,
+        name=f"model-load-{family}",
+    ).start()
+    return {"family": family, "ready": False, "label": spec["label"]}
 
 
 @asynccontextmanager
@@ -166,30 +260,16 @@ def _get_file(name: str) -> tuple[np.ndarray, SectionGeometry, np.ndarray]:
         return _file_cache[name]
 
 
-def _get_point_segmenter() -> Sam3PointSegmenter:
-    global _point_segmenter
-    with _gpu_lock:
-        if _point_segmenter is None:
-            _point_segmenter = Sam3PointSegmenter(
-                config.DEFAULT_CHECKPOINT, embedding_cache_size=4
-            )
-        return _point_segmenter
-
-
-def _get_propagator() -> Sam3VolumePropagator:
-    global _propagator
-    with _gpu_lock:
-        if _propagator is None:
-            _propagator = Sam3VolumePropagator(config.DEFAULT_CHECKPOINT)
-        return _propagator
-
-
 def _require_point_segmenter() -> Sam3PointSegmenter:
     if _load_state["error"] and _point_segmenter is None:
         raise HTTPException(503, f"Model failed to load: {_load_state['error']}")
     if _point_segmenter is None:
         raise HTTPException(
-            503, str(_load_state["stage"] or "SAM 3 point tracker is still loading")
+            503,
+            str(
+                _load_state["stage"]
+                or f"{_family_label()} point tracker is still loading"
+            ),
         )
     return _point_segmenter
 
@@ -199,7 +279,11 @@ def _require_propagator() -> Sam3VolumePropagator:
         raise HTTPException(503, f"Model failed to load: {_load_state['error']}")
     if _propagator is None:
         raise HTTPException(
-            503, str(_load_state["stage"] or "SAM 3 volume tracker is still loading")
+            503,
+            str(
+                _load_state["stage"]
+                or f"{_family_label()} volume tracker is still loading"
+            ),
         )
     return _propagator
 
@@ -297,6 +381,25 @@ class ExportRequest(VolumeRef):
     include_amplitude: bool = True
 
 
+class SetModelRequest(BaseModel):
+    family: str
+
+
+@app.post("/api/model")
+def set_model(req: SetModelRequest) -> dict:
+    """Switch the resident tracker between SAM 2 and SAM 3.
+
+    Only one family is kept on the GPU. The previous models, cached
+    embeddings, and any live tracked volume are dropped. Loading runs in
+    the background; poll ``/api/runtime`` until ``ready`` is true.
+    """
+    try:
+        family = config.resolve_family(req.family)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _request_family(family)
+
+
 @app.get("/api/files")
 def list_files() -> list[dict]:
     entries = []
@@ -354,16 +457,39 @@ def runtime_info() -> dict:
     point = _point_segmenter
     video = _propagator
 
+    spec = config.family_spec(_active_family)
+    loaded_family = getattr(point, "family", None)
+    models_match = loaded_family == _active_family
+    # Clicks can start as soon as the point tracker of the requested family
+    # is resident; the volume tracker may still be loading.
+    point_ready = (
+        point is not None and models_match and _load_state["stage"] != "error"
+    )
+    video_ready = (
+        video is not None and models_match and _load_state["stage"] == "ready"
+    )
+
     return {
-        "checkpoint": config.DEFAULT_CHECKPOINT,
-        "architecture": "SAM 3 (Hugging Face transformers)",
-        "point_model": "Sam3TrackerModel",
-        "video_model": "Sam3TrackerVideoModel",
-        "point_loaded": point is not None,
-        "video_loaded": video is not None,
+        "family": _active_family,
+        "family_label": spec["label"],
+        "available_models": [
+            {
+                "id": item["id"],
+                "label": item["label"],
+                "checkpoint": item["checkpoint"],
+                "gated": item["gated"],
+            }
+            for item in config.SAM_FAMILIES.values()
+        ],
+        "checkpoint": getattr(point, "checkpoint", None) or spec["checkpoint"],
+        "architecture": spec["architecture"],
+        "point_model": spec["point_model"],
+        "video_model": spec["video_model"],
+        "point_loaded": point_ready,
+        "video_loaded": video_ready,
         "load_stage": _load_state["stage"],
         "load_error": _load_state["error"],
-        "ready": point is not None,
+        "ready": point_ready,
         "point_device": getattr(point, "device", None),
         "video_device": getattr(video, "device", None),
         "video_precision": (

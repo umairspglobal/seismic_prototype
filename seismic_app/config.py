@@ -9,14 +9,62 @@ it to the visual concept it was trained/prompted on.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
-# --- SAM 3 model -------------------------------------------------------
+# --- Tracker models (SAM 3 default, SAM 2 optional) --------------------
 
-# Gated on the Hub. The user must accept the license at
+# Interactive point/volume tracking can run either SAM 3's tracker head
+# or SAM 2.1. Text-prompt automatic detection remains SAM 3 only.
+# SAM 3 is gated on the Hub: accept the license at
 # https://huggingface.co/facebook/sam3 and authenticate locally
-# (`hf auth login`, or set the HF_TOKEN env var) before this checkpoint
-# can be downloaded.
-DEFAULT_CHECKPOINT = "facebook/sam3"
+# (`hf auth login`, or set the HF_TOKEN env var) before that checkpoint
+# can be downloaded. SAM 2.1 is Apache 2.0 and is not gated.
+
+ModelFamily = Literal["sam2", "sam3"]
+
+DEFAULT_MODEL_FAMILY: ModelFamily = "sam3"
+
+SAM_FAMILIES: dict[str, dict[str, str | bool]] = {
+    "sam3": {
+        "id": "sam3",
+        "label": "SAM 3",
+        "checkpoint": "facebook/sam3",
+        "architecture": "SAM 3 (Hugging Face transformers)",
+        "point_model": "Sam3TrackerModel",
+        "video_model": "Sam3TrackerVideoModel",
+        "gated": True,
+    },
+    "sam2": {
+        "id": "sam2",
+        "label": "SAM 2",
+        "checkpoint": "facebook/sam2.1-hiera-large",
+        "architecture": "SAM 2.1 (Hugging Face transformers)",
+        "point_model": "Sam2Model",
+        "video_model": "Sam2VideoModel",
+        "gated": False,
+    },
+}
+
+DEFAULT_CHECKPOINT = str(SAM_FAMILIES[DEFAULT_MODEL_FAMILY]["checkpoint"])
+
+
+def resolve_family(family: str | None = None) -> ModelFamily:
+    """Normalize a UI/API family name to ``sam2`` or ``sam3``."""
+    raw = (family or DEFAULT_MODEL_FAMILY).strip().lower()
+    key = raw.replace(" ", "").replace("-", "").replace("_", "")
+    if key in ("sam2", "sam21", "sam2.1"):
+        return "sam2"
+    if key in ("sam3",):
+        return "sam3"
+    raise ValueError(f"Unknown model family {family!r}; expected 'sam2' or 'sam3'")
+
+
+def family_spec(family: str | None = None) -> dict[str, str | bool]:
+    return SAM_FAMILIES[resolve_family(family)]
+
+
+def checkpoint_for(family: str | None = None) -> str:
+    return str(family_spec(family)["checkpoint"])
 
 # --- Fixed noun_phrase vocabulary --------------------------------------
 # Order matters only for the color map below; SAM 3 is prompted with each

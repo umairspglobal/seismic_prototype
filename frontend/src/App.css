@@ -88,6 +88,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  position: relative;
+  z-index: 21;
 }
 
 .sidebar h1 {
@@ -197,6 +199,12 @@ body {
 .click-hint.active-neg {
   border-color: #ef5350;
   color: #ef5350;
+}
+
+.toggle.active-model {
+  border-color: #2563eb;
+  color: #dbe7ff;
+  background: #14202e;
 }
 
 .object-list {

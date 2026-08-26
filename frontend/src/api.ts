@@ -7,6 +7,15 @@ export interface FileInfo {
 
 export type Axis = "inline" | "crossline" | "time";
 
+export type ModelFamily = "sam2" | "sam3";
+
+export interface ModelInfo {
+  id: ModelFamily;
+  label: string;
+  checkpoint: string;
+  gated: boolean;
+}
+
 export interface Point {
   col: number;
   row: number;
@@ -81,6 +90,9 @@ export interface ExportResult {
 }
 
 export interface RuntimeInfo {
+  family: ModelFamily;
+  family_label: string;
+  available_models: ModelInfo[];
   checkpoint: string;
   architecture: string;
   point_model: string;
@@ -182,6 +194,16 @@ export async function getRuntime(): Promise<RuntimeInfo> {
   const res = await fetch(apiUrl("/api/runtime"));
   if (!res.ok) throw new Error(`Failed to load runtime info: ${res.status}`);
   return res.json();
+}
+
+export async function setModel(
+  family: ModelFamily,
+): Promise<{ family: ModelFamily; ready: boolean; label: string }> {
+  return postJson(
+    "/api/model",
+    { family },
+    "Failed to switch tracker model",
+  );
 }
 
 export function sliceUrl(file: string, axis: Axis, index: number): string {

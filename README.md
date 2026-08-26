@@ -62,6 +62,7 @@ IDs from 6 upward. Use ParaView's Threshold filter per label ID.
 | SGY loader (2D/3D auto-detect, orientation) | [seismic_app/sgy_loader.py](seismic_app/sgy_loader.py) |
 | Preprocessor (clip/normalize/RGB/2.5D/tiling) | [seismic_app/preprocessing.py](seismic_app/preprocessing.py) |
 | SAM 3 inference (text prompts + point prompts) | [seismic_app/inference.py](seismic_app/inference.py) |
+| SAM 2 / SAM 3 family selection | [seismic_app/config.py](seismic_app/config.py) |
 | Mask stitcher | [seismic_app/stitching.py](seismic_app/stitching.py) |
 | Viewer / overlay helpers | [seismic_app/visualization.py](seismic_app/visualization.py) |
 | VTK export (.vts/.vti with real geometry) | [seismic_app/vtk_export.py](seismic_app/vtk_export.py) |
@@ -78,7 +79,8 @@ pip install -r requirements.txt
 Note: SAM 3 requires a transformers release that includes it
 (`transformers>=4.58`); the requirements file enforces this.
 
-SAM 3 is a **gated** model on Hugging Face. Before running inference:
+SAM 3 is a **gated** model on Hugging Face. Before running inference with
+the default tracker:
 
 1. Log in to Hugging Face and accept the license at
    https://huggingface.co/facebook/sam3
@@ -90,6 +92,9 @@ SAM 3 is a **gated** model on Hugging Face. Before running inference:
 
    (or set the `HF_TOKEN` environment variable). This must be done by you
    directly in a terminal - never share your token in chat.
+
+SAM 2.1 (`facebook/sam2.1-hiera-large`) is not gated and can be selected
+from the React client's **Tracker model** toggle without that step.
 
 ## Usage
 
@@ -129,9 +134,16 @@ anything beyond that is queued into follow-up waves automatically. Each
 slice streams to the browser as a single combined multi-color mask.
 
 The tracker models are loaded in the background as soon as the inference
-server starts. The React client shows a loading overlay until the point
-tracker is on the GPU, then encodes the active slice so the first click
-is already warm.
+server starts (SAM 3 by default). The React client shows a loading overlay
+until the point tracker is on the GPU, then encodes the active slice so the
+first click is already warm. Use the **SAM 3 / SAM 2** toggle in the sidebar
+to unload the resident family and load the other — only one stays on the
+GPU. Clicks are kept so you can compare masks on the same prompts; a
+tracked volume has to be re-propagated after a switch.
+
+SAM 2 uses the improved **SAM 2.1** `hiera-large` checkpoint
+(`facebook/sam2.1-hiera-large`), which is Apache 2.0 and is not gated.
+SAM 3 remains the default (`facebook/sam3`).
 
 Start the inference server (models begin loading immediately):
 

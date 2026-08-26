@@ -69,8 +69,9 @@ def test_point_embeddings_are_keyed_and_lru_bounded():
 
 
 class _VideoProcessor:
-    def init_video_session(self, video, **kwargs):
-        return SimpleNamespace(video=video)
+    def video_processor(self, videos, **kwargs):
+        n = len(videos)
+        return SimpleNamespace(pixel_values_videos=[torch.zeros((n, 3, 8, 8))])
 
     def add_inputs_to_inference_session(self, session, **kwargs):
         return session
@@ -83,6 +84,7 @@ class _VideoModel:
     def __call__(self, inference_session, frame_idx):
         return SimpleNamespace(
             frame_idx=frame_idx,
+            object_ids=[1],
             pred_masks=torch.ones((1, 1, 2, 2)),
         )
 
@@ -93,8 +95,14 @@ class _VideoModel:
         for frame_idx in indices:
             yield SimpleNamespace(
                 frame_idx=frame_idx,
+                object_ids=[1],
                 pred_masks=torch.ones((1, 1, 2, 2)),
             )
+
+
+class _Session:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
 
 
 def test_propagation_reports_each_completed_frame():
@@ -104,22 +112,22 @@ def test_propagation_reports_each_completed_frame():
     propagator.processor = _VideoProcessor()
     propagator.session_dtype = torch.float32
     propagator.last_timings = {}
+    propagator.live = None
+    propagator.family = "sam3"
+    propagator._session_cls = _Session
     updates = []
 
     masks = propagator.propagate(
         [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(3)],
         anchor_idx=1,
-        points=[(0, 0)],
-        labels=[1],
+        points_per_object=[[(0, 0)]],
+        labels_per_object=[[1]],
         progress=lambda done, total, frame_idx, mask: updates.append(
             (done, total, frame_idx, int(mask.sum()))
         ),
     )
 
-    assert masks.shape == (3, 2, 2)
-    assert [update[:3] for update in updates] == [
-        (1, 3, 1),
-        (2, 3, 2),
-        (3, 3, 0),
-    ]
+    assert masks.shape == (1, 3, 2, 2)
+    assert {update[2] for update in updates} == {0, 1, 2}
+    assert updates[-1][0] == 3
     assert propagator.last_timings["fps"] > 0
