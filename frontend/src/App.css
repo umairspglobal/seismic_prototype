@@ -133,6 +133,31 @@ body {
   margin: 4px 0 0;
 }
 
+.hint code {
+  font-size: 0.75rem;
+  color: #d5dbe1;
+  background: #11161b;
+  border-radius: 3px;
+  padding: 1px 4px;
+  /* Absolute output paths are long; wrap instead of overflowing. */
+  overflow-wrap: anywhere;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 0.82rem;
+  color: #b8c0c8;
+  cursor: pointer;
+}
+
+.checkbox-row input {
+  accent-color: #2563eb;
+  cursor: pointer;
+}
+
 .toggle-row {
   display: flex;
   gap: 8px;

@@ -52,6 +52,8 @@ export interface FrameEvent {
 export interface DoneEvent {
   type: "done";
   timings: Record<string, number>;
+  /** Tracker sessions were kept, so slices can be edited in place. */
+  editable?: boolean;
 }
 
 export interface ErrorEvent {
@@ -60,6 +62,23 @@ export interface ErrorEvent {
 }
 
 export type PropagationEvent = FrameEvent | DoneEvent | ErrorEvent;
+
+/** A propagated volume the server still holds, editable and exportable. */
+export interface TrackedVolume {
+  file: string;
+  axis: Axis;
+  objects: number[];
+  edited_slices: number[];
+}
+
+export interface ExportResult {
+  path: string;
+  directory: string;
+  size_mb: number;
+  /** Object name -> integer value in the exported "label" array. */
+  labels: Record<string, number>;
+  seconds: number;
+}
 
 export interface RuntimeInfo {
   checkpoint: string;
@@ -76,6 +95,7 @@ export interface RuntimeInfo {
   video_precision: string | null;
   embedding_cache_size: number | null;
   cached_slices: number;
+  tracked_volume: TrackedVolume | null;
   hardware: {
     cuda_available: boolean;
     device_name: string;
@@ -100,6 +120,56 @@ const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "http:
 
 function apiUrl(path: string): string {
   return `${API_BASE}${path}`;
+}
+
+/** FastAPI reports failures as {"detail": ...}; surface that, not the code. */
+async function errorMessage(res: Response, fallback: string): Promise<string> {
+  try {
+    const body = await res.json();
+    const detail = body?.detail;
+    if (typeof detail === "string") return detail;
+    if (detail) return JSON.stringify(detail);
+  } catch {
+    /* not JSON */
+  }
+  return `${fallback} (${res.status})`;
+}
+
+async function postJson<T>(
+  path: string,
+  body: unknown,
+  fallback: string,
+  signal?: AbortSignal,
+): Promise<T> {
+  const res = await fetch(apiUrl(path), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, fallback));
+  return res.json();
+}
+
+/** Read an NDJSON stream of tracking events, dispatching one per line. */
+async function readEventStream(
+  res: Response,
+  onEvent: (event: PropagationEvent) => void,
+): Promise<void> {
+  if (!res.body) throw new Error("The server returned an empty stream");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (line.trim()) onEvent(JSON.parse(line) as PropagationEvent);
+    }
+  }
 }
 
 export async function listFiles(): Promise<FileInfo[]> {
@@ -143,21 +213,51 @@ export async function segment(
   objectId: number,
   signal?: AbortSignal,
 ): Promise<SegmentResult> {
-  const res = await fetch(apiUrl("/api/segment"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    signal,
-    body: JSON.stringify({
+  return postJson<SegmentResult>(
+    "/api/segment",
+    {
       file,
       axis,
       index,
       points: points.map((p) => [p.col, p.row]),
       labels: points.map((p) => p.label),
       object_id: objectId,
-    }),
-  });
-  if (!res.ok) throw new Error(`Segmentation failed: ${res.status}`);
-  return res.json();
+    },
+    "Segmentation failed",
+    signal,
+  );
+}
+
+/**
+ * Edit one object on one slice of an already-tracked volume.
+ *
+ * Unlike `segment`, this runs against the live tracker session, so the
+ * clicks are combined with the tracker's memory of the object on this
+ * slice: negative points carve into the propagated mask instead of
+ * being meaningless on their own. Returns the slice's combined
+ * multi-object overlay.
+ */
+export async function refine(
+  file: string,
+  axis: Axis,
+  index: number,
+  points: Point[],
+  objectId: number,
+  signal?: AbortSignal,
+): Promise<SegmentResult> {
+  return postJson<SegmentResult>(
+    "/api/refine",
+    {
+      file,
+      axis,
+      index,
+      points: points.map((p) => [p.col, p.row]),
+      labels: points.map((p) => p.label),
+      object_id: objectId,
+    },
+    "Refinement failed",
+    signal,
+  );
 }
 
 export async function propagate(
@@ -184,21 +284,63 @@ export async function propagate(
       })),
     }),
   });
-  if (!res.ok || !res.body) throw new Error(`Propagation failed: ${res.status}`);
+  if (!res.ok) throw new Error(await errorMessage(res, "Propagation failed"));
+  await readEventStream(res, onEvent);
+}
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      if (line.trim()) onEvent(JSON.parse(line) as PropagationEvent);
-    }
-  }
+/**
+ * Re-track the volume outward from the slices edited since the last sweep.
+ *
+ * Reuses the live tracker sessions, so it is much faster than a full
+ * propagation and keeps every refinement click already applied.
+ */
+export async function resweep(
+  file: string,
+  axis: Axis,
+  onEvent: (event: PropagationEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(apiUrl("/api/resweep"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal,
+    body: JSON.stringify({ file, axis }),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, "Re-propagation failed"));
+  await readEventStream(res, onEvent);
+}
+
+/** Write the tracked volume to a ParaView .vti in the outputs/ folder. */
+export async function exportVolume(
+  file: string,
+  axis: Axis,
+  includeAmplitude: boolean,
+): Promise<ExportResult> {
+  return postJson<ExportResult>(
+    "/api/export",
+    { file, axis, include_amplitude: includeAmplitude },
+    "Export failed",
+  );
+}
+
+/** Download a previously written .vti so it can be opened in ParaView. */
+export async function downloadExportedVolume(
+  file: string,
+  axis: Axis,
+  filename: string,
+): Promise<void> {
+  const params = new URLSearchParams({ file, axis });
+  const res = await fetch(apiUrl(`/api/export/file?${params}`));
+  if (!res.ok) throw new Error(await errorMessage(res, "Download failed"));
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 export function maskDataUrl(base64Png: string): string {

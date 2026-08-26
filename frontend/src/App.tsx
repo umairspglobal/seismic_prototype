@@ -1,15 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Axis,
+  ExportResult,
   FileInfo,
   Point,
+  PropagationEvent,
   RuntimeInfo,
+  downloadExportedVolume,
+  exportVolume,
   getRuntime,
   listFiles,
   maskDataUrl,
   objectColor,
   prepareSlice,
   propagate,
+  refine,
+  resweep,
   segment,
   sliceUrl,
 } from "./api";
@@ -21,6 +27,8 @@ interface PropagationState {
   running: boolean;
   done: number;
   total: number;
+  /** True while re-tracking from edits rather than rebuilding. */
+  resweeping?: boolean;
   error?: string;
 }
 
@@ -51,6 +59,19 @@ export default function App() {
   const [propagation, setPropagation] = useState<PropagationState | null>(null);
   const [status, setStatus] = useState("Connecting to inference server...");
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
+  // Slice edits applied to the live tracker but not yet swept outward.
+  const [pendingEdits, setPendingEdits] = useState(0);
+  // Set when a prompt was removed from the live tracker, which it cannot
+  // undo in place - only a full re-propagation drops it.
+  const [promptsDropped, setPromptsDropped] = useState(false);
+  const [includeAmplitude, setIncludeAmplitude] = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const [exportInfo, setExportInfo] = useState<ExportResult | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  // Object ids the last completed propagation actually tracked. Kept in
+  // React state (not only the runtime poll) so a stale /api/runtime
+  // response during a long sweep cannot hide export or disable refine.
+  const [trackedObjectIds, setTrackedObjectIds] = useState<number[]>([]);
   const pointReady = Boolean(runtime?.point_loaded);
   const videoReady = Boolean(runtime?.video_loaded);
 
@@ -62,6 +83,9 @@ export default function App() {
   const abortMap = useRef<Map<number, AbortController>>(new Map());
   // Latest objects for async callbacks (slice-change re-segmentation).
   const objectsRef = useRef<SegObject[]>([]);
+  // Objects the live tracker holds, for use inside effects.
+  const trackedIdsRef = useRef<Set<number>>(new Set());
+  const trackedReadyRef = useRef(false);
 
   useEffect(() => {
     listFiles()
@@ -84,7 +108,18 @@ export default function App() {
         try {
           const info = await getRuntime();
           if (cancelled) return;
-          setRuntime(info);
+          setRuntime((prev) => {
+            // A poll that started while a sweep had cleared the server's
+            // volume must not wipe the one that just finished.
+            if (
+              !info.tracked_volume &&
+              prev?.tracked_volume &&
+              trackedReadyRef.current
+            ) {
+              return { ...info, tracked_volume: prev.tracked_volume };
+            }
+            return info;
+          });
           const finished =
             info.load_stage === "ready" || info.load_stage === "error";
           poll(finished ? 8000 : 600);
@@ -115,6 +150,19 @@ export default function App() {
 
   objectsRef.current = objects;
 
+  // Only objects this UI session actually propagated are "live". Do not
+  // fall back to runtime.tracked_volume: that leftover from an earlier
+  // run would send the first clicks to /api/refine and skip the
+  // single-slice preview, leaving points with no mask.
+  const liveTracked = useMemo(() => {
+    const tracked = runtime?.tracked_volume;
+    if (!tracked || !file) return null;
+    return tracked.file === file.name && tracked.axis === axis ? tracked : null;
+  }, [runtime, file, axis]);
+  const trackedIds = trackedObjectIds;
+  trackedIdsRef.current = new Set(trackedIds);
+  trackedReadyRef.current = trackedIds.length > 0;
+
   const abortAll = useCallback(() => {
     abortMap.current.forEach((c) => c.abort());
     abortMap.current.clear();
@@ -129,6 +177,15 @@ export default function App() {
     setPropMaskUrl(null);
     setCoverage(null);
     setSegmenting(false);
+    // Drop the propagated overlay too, otherwise scrubbing keeps showing
+    // masks for objects that no longer exist.
+    propMasksRef.current = new Map();
+    setPropagation(null);
+    setPendingEdits(0);
+    setPromptsDropped(true);
+    setTrackedObjectIds([]);
+    setExportInfo(null);
+    setExportError(null);
   }, [abortAll]);
 
   // A new file or axis invalidates all picks; a slice change does NOT -
@@ -144,28 +201,33 @@ export default function App() {
     );
   }, []);
 
+  /** Start a per-object request, cancelling that object's previous one. */
+  const beginRequest = useCallback((objectId: number) => {
+    abortMap.current.get(objectId)?.abort();
+    const controller = new AbortController();
+    abortMap.current.set(objectId, controller);
+    const seq = (requestSeq.current.get(objectId) ?? 0) + 1;
+    requestSeq.current.set(objectId, seq);
+    const isCurrent = () => seq === requestSeq.current.get(objectId);
+    return { controller, isCurrent, started: performance.now() };
+  }, []);
+
   // Preview one object's mask from its points on the CURRENT slice only.
   // Other objects' requests are untouched (embedding is shared server-side).
   const runSegment = useCallback(
     (objectId: number, pts: Point[]) => {
-      // Negative-only clicks can't produce a standalone preview (there is
-      // nothing positive to segment from). They are stored as refinement
-      // prompts and take effect on re-propagation, where the tracker's
-      // memory of the object gives them something to subtract from.
+      // Without a tracked volume there is no memory of the object here, so
+      // negative-only clicks have nothing to subtract from and cannot
+      // produce a mask on their own.
       if (!file || pts.length === 0 || !pts.some((p) => p.label === 1)) {
         setObjectMask(objectId, null);
         return;
       }
-      abortMap.current.get(objectId)?.abort();
-      const controller = new AbortController();
-      abortMap.current.set(objectId, controller);
-      const seq = (requestSeq.current.get(objectId) ?? 0) + 1;
-      requestSeq.current.set(objectId, seq);
-      const started = performance.now();
+      const { controller, isCurrent, started } = beginRequest(objectId);
       setSegmenting(true);
       segment(file.name, axis, index, pts, objectId, controller.signal)
         .then((result) => {
-          if (seq !== requestSeq.current.get(objectId)) return; // stale
+          if (!isCurrent()) return; // stale
           setObjectMask(objectId, maskDataUrl(result.mask));
           setCoverage(result.coverage);
           setLatencyMs(performance.now() - started);
@@ -177,7 +239,53 @@ export default function App() {
           setStatus(`Segmentation failed: ${err.message}`);
         });
     },
-    [file, axis, index, setObjectMask],
+    [file, axis, index, setObjectMask, beginRequest],
+  );
+
+  // Edit a tracked object on this slice: the tracker combines the clicks
+  // with its memory of the object here, so a − click carves the
+  // propagated mask and a + click grows it, both visible immediately.
+  const runRefine = useCallback(
+    (objectId: number, pts: Point[]) => {
+      if (!file || pts.length === 0) return;
+      const { controller, isCurrent, started } = beginRequest(objectId);
+      const slice = index;
+      setSegmenting(true);
+      refine(file.name, axis, slice, pts, objectId, controller.signal)
+        .then((result) => {
+          if (!isCurrent()) return; // stale
+          propMasksRef.current.set(slice, result.mask);
+          setPropMaskUrl(maskDataUrl(result.mask));
+          setCoverage(result.coverage);
+          setLatencyMs(performance.now() - started);
+          setSegmenting(false);
+          setPendingEdits((n) => n + 1);
+        })
+        .catch(() => {
+          if (controller.signal.aborted) return;
+          setSegmenting(false);
+          runSegment(objectId, pts);
+        });
+    },
+    [file, axis, index, beginRequest, runSegment],
+  );
+
+  // Route a slice's clicks to whichever path can actually render them.
+  const applyClicks = useCallback(
+    (objectId: number, ptsHere: Point[]) => {
+      if (!trackedIds.includes(objectId)) {
+        runSegment(objectId, ptsHere);
+        return;
+      }
+      if (ptsHere.length) {
+        runRefine(objectId, ptsHere);
+      } else {
+        // The live session cannot un-prompt a slice; only a full rebuild
+        // forgets these clicks.
+        setPromptsDropped(true);
+      }
+    },
+    [trackedIds, runSegment, runRefine],
   );
 
   // On slice change: keep every object and its points, drop the stale
@@ -199,6 +307,14 @@ export default function App() {
         .then(() => {
           setPrepared(true);
           for (const obj of objectsRef.current) {
+            // Tracked objects already show through the propagated overlay;
+            // only skip the single-slice decoder when that overlay exists.
+            if (
+              trackedIdsRef.current.has(obj.id) &&
+              propMasksRef.current.has(index)
+            ) {
+              continue;
+            }
             const pts = obj.points.filter((p) => p.slice === index);
             if (pts.length) runSegment(obj.id, pts);
           }
@@ -211,19 +327,25 @@ export default function App() {
 
   const handlePick = useCallback(
     (col: number, row: number, label: 0 | 1) => {
-      if (propagation?.running || !prepared || !pointReady) return;
-      const active = objects.find((o) => o.id === activeObjectId);
+      if (propagation?.running || !pointReady) return;
+      // Refinement talks to the live tracker and does not need the
+      // single-slice encoder. Only untracked objects wait for prepare.
+      const tracked = trackedIdsRef.current.has(activeObjectId);
+      if (!prepared && !tracked) return;
+      const active = objectsRef.current.find((o) => o.id === activeObjectId);
       if (!active) return;
       const nextPts = [...active.points, { col, row, label, slice: index }];
-      setObjects((prev) =>
-        prev.map((o) => (o.id === activeObjectId ? { ...o, points: nextPts } : o)),
+      const next = objectsRef.current.map((o) =>
+        o.id === activeObjectId ? { ...o, points: nextPts } : o,
       );
-      runSegment(
+      objectsRef.current = next;
+      setObjects(next);
+      applyClicks(
         activeObjectId,
         nextPts.filter((p) => p.slice === index),
       );
     },
-    [objects, activeObjectId, index, runSegment, propagation, prepared, pointReady],
+    [activeObjectId, index, applyClicks, propagation, prepared, pointReady],
   );
 
   // Undo removes the active object's most recent point on THIS slice.
@@ -242,11 +364,11 @@ export default function App() {
     setObjects((prev) =>
       prev.map((o) => (o.id === activeObjectId ? { ...o, points: nextPts } : o)),
     );
-    runSegment(
+    applyClicks(
       activeObjectId,
       nextPts.filter((p) => p.slice === index),
     );
-  }, [objects, activeObjectId, index, runSegment]);
+  }, [objects, activeObjectId, index, applyClicks]);
 
   const handleAddObject = useCallback(() => {
     const id = nextObjectId.current++;
@@ -258,6 +380,9 @@ export default function App() {
     (objectId: number) => {
       abortMap.current.get(objectId)?.abort();
       abortMap.current.delete(objectId);
+      // The live tracker still holds this object; only a full rebuild
+      // stops tracking it.
+      if (trackedIdsRef.current.has(objectId)) setPromptsDropped(true);
       setObjects((prev) => {
         const next = prev.filter((o) => o.id !== objectId);
         if (next.length === 0) {
@@ -286,14 +411,22 @@ export default function App() {
     const active = objects.find((o) => o.id === activeObjectId);
     return active ? active.points.filter((p) => p.slice === index).length : 0;
   }, [objects, activeObjectId, index]);
-  // True when the active object's clicks on this slice are all negative:
-  // no live preview is possible, the clicks apply on re-propagation.
+  // Objects the live tracker does not know about yet (new since the last
+  // propagation), which forces a full rebuild rather than a re-sweep.
+  const untrackedObjects = useMemo(
+    () => objectsWithPoints.filter((o) => !trackedIds.includes(o.id)),
+    [objectsWithPoints, trackedIds],
+  );
+  const needsFullPropagate =
+    trackedIds.length === 0 || untrackedObjects.length > 0 || promptsDropped;
+  // Without a live tracker, negative-only clicks on a slice cannot be
+  // rendered at all; with one they refine the tracked mask directly.
   const negativeOnlyHere = useMemo(() => {
     const active = objects.find((o) => o.id === activeObjectId);
-    if (!active) return false;
+    if (!active || trackedIds.includes(activeObjectId)) return false;
     const here = active.points.filter((p) => p.slice === index);
     return here.length > 0 && !here.some((p) => p.label === 1);
-  }, [objects, activeObjectId, index]);
+  }, [objects, activeObjectId, index, trackedIds]);
   // The viewer only shows markers and previews belonging to this slice.
   const viewerObjects = useMemo(
     () =>
@@ -306,12 +439,26 @@ export default function App() {
 
   const handlePropagate = useCallback(() => {
     if (!file || objectsWithPoints.length === 0) return;
-    propMasksRef.current = new Map();
-    // The propagated overlay carries all objects; drop the per-object
-    // single-slice previews so they don't double-tint the anchor frame.
-    setObjects((prev) => prev.map((o) => ({ ...o, maskUrl: null })));
-    setPropagation({ axis, running: true, done: 0, total: axisCount });
-    propagate(file.name, axis, index, objectsWithPoints, (event) => {
+    // A re-sweep only re-tracks from the edited slices, reusing the live
+    // sessions; anything else has to rebuild them from all the prompts.
+    const reuseSessions = !needsFullPropagate && pendingEdits > 0;
+    if (!reuseSessions) {
+      propMasksRef.current = new Map();
+      setTrackedObjectIds([]);
+      // The propagated overlay carries all objects; drop the per-object
+      // single-slice previews so they don't double-tint the anchor frame.
+      setObjects((prev) => prev.map((o) => ({ ...o, maskUrl: null })));
+    }
+    setPropagation({
+      axis,
+      running: true,
+      done: 0,
+      total: axisCount,
+      resweeping: reuseSessions,
+    });
+    setExportInfo(null);
+
+    const onEvent = (event: PropagationEvent) => {
       if (event.type === "frame") {
         propMasksRef.current.set(event.frame, event.mask);
         setPropagation({
@@ -319,23 +466,60 @@ export default function App() {
           running: true,
           done: event.done,
           total: event.total,
+          resweeping: reuseSessions,
         });
         if (event.frame === index) setPropMaskUrl(maskDataUrl(event.mask));
       } else if (event.type === "done") {
-        setPropagation((prev) =>
-          prev ? { ...prev, running: false } : null,
-        );
+        setPropagation((prev) => (prev ? { ...prev, running: false } : null));
+        setPendingEdits(0);
+        setPromptsDropped(false);
+        setTrackedObjectIds(objectsWithPoints.map((o) => o.id));
+        // Pick up the new tracked-volume state without waiting for the poll.
+        getRuntime().then(setRuntime).catch(() => undefined);
       } else {
         setPropagation((prev) =>
           prev ? { ...prev, running: false, error: event.message } : null,
         );
       }
-    }).catch((err) =>
+    };
+
+    const request = reuseSessions
+      ? resweep(file.name, axis, onEvent)
+      : propagate(file.name, axis, index, objectsWithPoints, onEvent);
+    request.catch((err) =>
       setPropagation((prev) =>
         prev ? { ...prev, running: false, error: err.message } : null,
       ),
     );
-  }, [file, axis, index, objectsWithPoints, axisCount]);
+  }, [
+    file,
+    axis,
+    index,
+    objectsWithPoints,
+    axisCount,
+    needsFullPropagate,
+    pendingEdits,
+  ]);
+
+  const canExport = trackedIds.length > 0 || Boolean(liveTracked);
+
+  const handleExport = useCallback(() => {
+    if (!file || !canExport) return;
+    setExporting(true);
+    setExportError(null);
+    setExportInfo(null);
+    exportVolume(file.name, axis, includeAmplitude)
+      .then(async (info) => {
+        setExportInfo(info);
+        const filename = info.path.replace(/^.*[\\/]/, "") || `${file.name}.vti`;
+        await downloadExportedVolume(file.name, axis, filename);
+        setExporting(false);
+      })
+      .catch((err) => {
+        setExportError(err.message);
+        setExporting(false);
+      });
+  }, [file, axis, canExport, includeAmplitude]);
 
   if (!file) {
     return <div className="app-empty">{status || "Loading..."}</div>;
@@ -479,13 +663,22 @@ export default function App() {
           {file.kind === "3d" && (
             <p className="hint">
               Points persist across slices — scrub to another slice to add
-              refinement clicks, then re-propagate.
+              refinement clicks. After a propagate, +/− clicks edit the
+              mask on that slice immediately; re-propagate to spread the
+              edits through the volume.
+            </p>
+          )}
+          {trackedIds.length > 0 && (
+            <p className="hint">
+              Tracked volume is live: left/right clicks on any slice edit
+              the propagated mask right there.
             </p>
           )}
           {negativeOnlyHere && (
             <p className="hint hint-notice">
-              Only − points on this slice: they refine the tracked mask on
-              re-propagation. No live preview without a + point here.
+              Only − points on this slice and nothing tracked here yet, so
+              there is no mask to carve into. Add a + point, or propagate
+              first and then refine.
             </p>
           )}
         </div>
@@ -513,12 +706,18 @@ export default function App() {
             disabled={!objectsWithPoints.length || propagation?.running || !videoReady}
           >
             {propagation?.running
-              ? `Propagating ${propagation.done}/${propagation.total}...`
+              ? `${propagation.resweeping ? "Re-tracking" : "Propagating"} ${
+                  propagation.done
+                }/${propagation.total}...`
               : !videoReady
                 ? "Loading volume tracker..."
-                : `${propagation ? "Re-propagate" : "Propagate"} ${
-                    objectsWithPoints.length || ""
-                  } object${objectsWithPoints.length === 1 ? "" : "s"} (${axis})`}
+                : !needsFullPropagate && pendingEdits > 0
+                  ? `Re-propagate ${pendingEdits} slice edit${
+                      pendingEdits === 1 ? "" : "s"
+                    } (${axis})`
+                  : `${trackedIds.length ? "Re-propagate" : "Propagate"} ${
+                      objectsWithPoints.length || ""
+                    } object${objectsWithPoints.length === 1 ? "" : "s"} (${axis})`}
           </button>
         )}
         {propagation && (
@@ -527,6 +726,46 @@ export default function App() {
           </div>
         )}
         {propagation?.error && <p className="error">{propagation.error}</p>}
+
+        {file.kind === "3d" && canExport && !propagation?.running && (
+          <div className="field">
+            <span>ParaView export</span>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={includeAmplitude}
+                onChange={(e) => setIncludeAmplitude(e.target.checked)}
+              />
+              Include seismic amplitude
+            </label>
+            <button
+              className="primary"
+              onClick={handleExport}
+              disabled={exporting}
+            >
+              {exporting ? "Writing .vti..." : "Download tracked volume (.vti)"}
+            </button>
+            {pendingEdits > 0 && (
+              <p className="hint hint-notice">
+                {pendingEdits} slice edit{pendingEdits === 1 ? "" : "s"} not
+                swept yet — re-propagate first to carry {pendingEdits === 1 ? "it" : "them"}{" "}
+                through the volume.
+              </p>
+            )}
+            {exportInfo && (
+              <p className="hint">
+                Saved <code>{exportInfo.path}</code> ({exportInfo.size_mb} MB)
+                and started a download. Open the .vti in ParaView and
+                threshold the <code>label</code> array:{" "}
+                {Object.entries(exportInfo.labels)
+                  .map(([name, value]) => `${name} = ${value}`)
+                  .join(", ")}
+                .
+              </p>
+            )}
+            {exportError && <p className="error">{exportError}</p>}
+          </div>
+        )}
 
         <details className="display-settings">
           <summary>Display</summary>
@@ -654,6 +893,12 @@ export default function App() {
               {prepared ? "ready" : pointReady ? "encoding..." : "waiting"}
             </span>
           </div>
+          {segmenting && (
+            <div>
+              <span className="stat-label">Mask</span>
+              <span className="stat-wait">updating...</span>
+            </div>
+          )}
           {latencyMs !== null && (
             <div>
               <span className="stat-label">Last click → mask</span>
@@ -684,7 +929,11 @@ export default function App() {
           displayWidth={displayWidth}
           displayHeight={displayHeight}
           maskOpacity={maskOpacity}
-          busy={segmenting || !prepared || !pointReady}
+          busy={
+            propagation?.running ||
+            !pointReady ||
+            (!prepared && trackedIds.length === 0)
+          }
           onPick={handlePick}
         />
       </main>

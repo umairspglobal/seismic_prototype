@@ -147,6 +147,7 @@ def export_volume_vti(
     amplitude: np.ndarray,
     geometry: SectionGeometry,
     out_path: str | Path,
+    include_amplitude: bool = True,
 ) -> Path:
     """Write a 3D volume as ImageData with real bin/sample spacings.
 
@@ -155,6 +156,10 @@ def export_volume_vti(
     cube. Axes: x=inline direction, y=crossline direction, z=time
     (negative down). The survey's world rotation is not encoded - apply
     a transform in ParaView if you need true world placement.
+
+    Set include_amplitude=False to write labels only; the file is then
+    roughly half the size, at the cost of not being able to check the
+    mask against the seismic without loading the .sgy separately.
     """
     from pyevtk.hl import imageToVTK  # deferred: optional dependency
 
@@ -165,6 +170,14 @@ def export_volume_vti(
     labels_cube = np.transpose(labels, (0, 2, 1))  # -> (n_il, n_xl, n_samples)
     z_depths = _sample_depths(geometry)
 
+    point_data = {
+        "label": np.ascontiguousarray(labels_cube[:, :, ::-1].astype(np.int32))
+    }
+    if include_amplitude:
+        point_data["amplitude"] = np.ascontiguousarray(
+            amplitude[:, :, ::-1].astype(np.float32)
+        )
+
     written = imageToVTK(
         str(out_path.with_suffix("")),
         origin=(0.0, 0.0, float(z_depths[-1])),
@@ -173,12 +186,7 @@ def export_volume_vti(
             geometry.xline_spacing_m or 25.0,
             geometry.dt_ms,
         ),
-        pointData={
-            "label": np.ascontiguousarray(labels_cube[:, :, ::-1].astype(np.int32)),
-            "amplitude": np.ascontiguousarray(
-                amplitude[:, :, ::-1].astype(np.float32)
-            ),
-        },
+        pointData=point_data,
     )
     return Path(written)
 

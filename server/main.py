@@ -20,6 +20,7 @@ import queue
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -27,13 +28,14 @@ import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 
 from seismic_app import config
 from seismic_app.geometry import SectionGeometry
 from seismic_app.inference import (
+    LiveTracker,
     Sam3PointSegmenter,
     Sam3VolumePropagator,
     transformers_version,
@@ -41,11 +43,13 @@ from seismic_app.inference import (
 from seismic_app.logutil import get_logger
 from seismic_app.preprocessing import inline_to_rgb_25d, normalize_to_uint8, to_rgb
 from seismic_app.sgy_loader import load_any
+from seismic_app.vtk_export import FIRST_INTERACTIVE_LABEL_ID, export_volume_vti
 
 log = get_logger("server")
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
+OUTPUT_DIR = ROOT / "outputs"
 
 MASK_ALPHA = 160
 # Per-object tint palette; must stay in sync with OBJECT_COLORS in
@@ -74,6 +78,43 @@ _load_state: dict[str, str | bool | None] = {
     "stage": "starting",
     "error": None,
 }
+
+
+class Propagation:
+    """The last completed propagation: its live tracker plus what it covers.
+
+    Held so that clicks on any slice can be answered as refinements of
+    the tracked volume, and so the volume can be exported to ParaView
+    without re-running anything.
+    """
+
+    def __init__(self, file: str, axis: str, object_ids: list[int], live: LiveTracker):
+        self.file = file
+        self.axis = axis
+        self.object_ids = object_ids
+        self.live = live
+
+    def covers(self, file: str, axis: str) -> bool:
+        return self.file == file and self.axis == axis
+
+    def position_of(self, object_id: int) -> int | None:
+        """Row of a frontend object id in the tracked mask stack."""
+        try:
+            return self.object_ids.index(object_id)
+        except ValueError:
+            return None
+
+
+_propagation: Propagation | None = None
+
+
+def _require_propagation(file: str, axis: str) -> Propagation:
+    if _propagation is None or not _propagation.covers(file, axis):
+        raise HTTPException(
+            409,
+            "No tracked volume for this file and axis yet - propagate first.",
+        )
+    return _propagation
 
 
 def _warmup_models() -> None:
@@ -239,6 +280,23 @@ class PropagateRequest(SliceRef):
     objects: list[ObjectPrompt] = Field(min_length=1)
 
 
+class RefineRequest(SliceRef):
+    """Clicks for one object on one slice of an already-tracked volume."""
+
+    object_id: int = 0
+    points: list[list[int]] = Field(min_length=1)
+    labels: list[int] = Field(min_length=1)
+
+
+class VolumeRef(BaseModel):
+    file: str
+    axis: str = "inline"
+
+
+class ExportRequest(VolumeRef):
+    include_amplitude: bool = True
+
+
 @app.get("/api/files")
 def list_files() -> list[dict]:
     entries = []
@@ -315,6 +373,17 @@ def runtime_info() -> dict:
         ),
         "embedding_cache_size": getattr(point, "embedding_cache_size", None),
         "cached_slices": len(getattr(point, "_prepared", {})),
+        # Lets the UI restore the edit/export affordances after a reload.
+        "tracked_volume": (
+            {
+                "file": _propagation.file,
+                "axis": _propagation.axis,
+                "objects": list(_propagation.object_ids),
+                "edited_slices": sorted(_propagation.live.dirty_frames),
+            }
+            if _propagation is not None
+            else None
+        ),
         "hardware": {
             "cuda_available": cuda_ok,
             "device_name": device_name or "CPU",
@@ -384,6 +453,50 @@ def segment(req: SegmentRequest) -> dict:
     }
 
 
+def _stream_tracking(
+    object_ids: list[int],
+    work: Callable[[Callable[[int, int, int, np.ndarray], None]], dict],
+) -> StreamingResponse:
+    """Run a tracking job on a worker thread, one NDJSON event per slice.
+
+    ``work`` is called with a progress callback and returns the payload
+    to merge into the terminating "done" event.
+    """
+    events: queue.Queue[dict | None] = queue.Queue(maxsize=32)
+
+    def on_progress(done: int, total: int, frame_idx: int, masks: np.ndarray) -> None:
+        events.put(
+            {
+                "type": "frame",
+                "frame": int(frame_idx),
+                "done": int(done),
+                "total": int(total),
+                "coverage": float(masks.any(axis=0).mean()),
+                "mask": _masks_png_base64(masks, object_ids),
+            }
+        )
+
+    def run() -> None:
+        try:
+            events.put({"type": "done", **work(on_progress)})
+        except Exception as exc:  # surface tracker errors to the browser
+            log.exception("Tracking failed")
+            events.put({"type": "error", "message": str(exc)})
+        finally:
+            events.put(None)
+
+    threading.Thread(target=run, daemon=True).start()
+
+    def stream():
+        while True:
+            event = events.get()
+            if event is None:
+                break
+            yield json.dumps(event) + "\n"
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
 @app.post("/api/propagate")
 def propagate(req: PropagateRequest) -> StreamingResponse:
     data, geometry, data_u8 = _get_file(req.file)
@@ -409,62 +522,183 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
     propagator = _require_propagator()
     object_ids = [obj.id for obj in req.objects]
 
-    events: queue.Queue[dict | None] = queue.Queue(maxsize=32)
-
-    def on_progress(done: int, total: int, frame_idx: int, masks: np.ndarray) -> None:
-        events.put(
-            {
-                "type": "frame",
-                "frame": int(frame_idx),
-                "done": int(done),
-                "total": int(total),
-                "coverage": float(masks.any(axis=0).mean()),
-                "mask": _masks_png_base64(masks, object_ids),
-            }
-        )
-
-    def run() -> None:
-        try:
-            with _gpu_lock:
-                propagator.propagate(
-                    frames,
-                    anchor_idx=req.index,
-                    points_per_object=[
-                        [(int(c), int(r)) for c, r in obj.points]
-                        for obj in req.objects
-                    ],
-                    labels_per_object=[
-                        [int(l) for l in obj.labels] for obj in req.objects
-                    ],
-                    frame_indices_per_object=[
-                        [int(s) for s in obj.slices]
-                        if obj.slices is not None
-                        else [req.index] * len(obj.points)
-                        for obj in req.objects
-                    ],
-                    progress=on_progress,
-                )
-            events.put(
-                {
-                    "type": "done",
-                    "timings": {
-                        k: float(v) for k, v in propagator.last_timings.items()
-                    },
-                }
+    def work(on_progress) -> dict:
+        global _propagation
+        # Drop the previous volume before tracking so its sessions and mask
+        # stack are freed rather than held alongside the new ones.
+        _propagation = None
+        with _gpu_lock:
+            propagator.propagate(
+                frames,
+                anchor_idx=req.index,
+                points_per_object=[
+                    [(int(c), int(r)) for c, r in obj.points] for obj in req.objects
+                ],
+                labels_per_object=[
+                    [int(l) for l in obj.labels] for obj in req.objects
+                ],
+                frame_indices_per_object=[
+                    [int(s) for s in obj.slices]
+                    if obj.slices is not None
+                    else [req.index] * len(obj.points)
+                    for obj in req.objects
+                ],
+                progress=on_progress,
+                keep_live=True,
             )
-        except Exception as exc:  # surface tracker errors to the browser
-            log.exception("Propagation failed")
-            events.put({"type": "error", "message": str(exc)})
-        finally:
-            events.put(None)
+            live = propagator.live
+        if live is not None:
+            _propagation = Propagation(req.file, req.axis, object_ids, live)
+        return {
+            "timings": {k: float(v) for k, v in propagator.last_timings.items()},
+            "editable": live is not None,
+        }
 
-    threading.Thread(target=run, daemon=True).start()
+    return _stream_tracking(object_ids, work)
 
-    def stream():
-        while True:
-            event = events.get()
-            if event is None:
-                break
-            yield json.dumps(event) + "\n"
 
-    return StreamingResponse(stream(), media_type="application/x-ndjson")
+@app.post("/api/refine")
+def refine(req: RefineRequest) -> dict:
+    """Re-decode one slice for one object using the live tracker's memory.
+
+    This is the interactive edit path: because the slice has already been
+    tracked, a negative click carves into the propagated mask and a
+    positive click extends it, both visible on this slice immediately.
+    """
+    if len(req.points) != len(req.labels):
+        raise HTTPException(422, "points and labels must be equal length")
+    data, geometry, _ = _get_file(req.file)
+    _validate_slice(data, geometry, req.axis, req.index)
+    state = _require_propagation(req.file, req.axis)
+    position = state.position_of(req.object_id)
+    if position is None:
+        raise HTTPException(
+            409,
+            f"Object {req.object_id + 1} is not part of the tracked volume - "
+            "propagate again to include it.",
+        )
+    propagator = _require_propagator()
+    started = time.perf_counter()
+    with _gpu_lock:
+        frame_masks = propagator.refine_frame(
+            state.live,
+            position,
+            req.index,
+            [(int(c), int(r)) for c, r in req.points],
+            [int(l) for l in req.labels],
+        )
+    return {
+        "mask": _masks_png_base64(frame_masks, state.object_ids),
+        "coverage": float(frame_masks.any(axis=0).mean()),
+        "timings": {"server_total": time.perf_counter() - started},
+    }
+
+
+@app.post("/api/resweep")
+def resweep(req: VolumeRef) -> StreamingResponse:
+    """Re-track the volume outward from the slices edited since the last sweep."""
+    data, geometry, _ = _get_file(req.file)
+    if geometry.kind != "3d":
+        raise HTTPException(422, "Propagation requires a 3D volume")
+    state = _require_propagation(req.file, req.axis)
+    if not state.live.dirty_frames:
+        raise HTTPException(409, "Nothing was edited since the last propagation.")
+    propagator = _require_propagator()
+
+    def work(on_progress) -> dict:
+        with _gpu_lock:
+            propagator.resweep(state.live, progress=on_progress)
+        return {
+            "timings": {k: float(v) for k, v in propagator.last_timings.items()},
+            "editable": True,
+        }
+
+    return _stream_tracking(state.object_ids, work)
+
+
+def _slice_masks_to_cube(
+    masks: np.ndarray, axis: str, cube_shape: tuple[int, int, int]
+) -> np.ndarray:
+    """(n_frames, H, W) per-slice masks -> an (n_il, n_xl, n_samples) volume.
+
+    Undoes the per-axis orientation that _slice_rgb applies, so the
+    exported labels land on the same samples the user clicked on.
+    """
+    n_il, n_xl, n_samples = cube_shape
+    cube = np.zeros(cube_shape, dtype=bool)
+    if axis == "inline":  # frame i = inline i, imaged (n_samples, n_xl)
+        for i in range(min(masks.shape[0], n_il)):
+            cube[i] = masks[i].T
+    elif axis == "crossline":  # frame j = crossline j, imaged (n_samples, n_il)
+        for j in range(min(masks.shape[0], n_xl)):
+            cube[:, j, :] = masks[j].T
+    else:  # frame k = time sample k, imaged (n_il, n_xl)
+        for k in range(min(masks.shape[0], n_samples)):
+            cube[:, :, k] = masks[k]
+    return cube
+
+
+@app.post("/api/export")
+def export_volume(req: ExportRequest) -> dict:
+    """Write the tracked volume to a ParaView .vti next to the CLI outputs."""
+    data, geometry, _ = _get_file(req.file)
+    if geometry.kind != "3d":
+        raise HTTPException(422, "Volume export requires a 3D volume")
+    state = _require_propagation(req.file, req.axis)
+    masks = state.live.masks
+
+    started = time.perf_counter()
+    # One named mask per object; vtk_export folds them into a single int
+    # label array, assigning ids in insertion order. Later objects win
+    # where two masks overlap.
+    label_masks = {
+        f"object {object_id + 1}": np.transpose(
+            _slice_masks_to_cube(masks[row], req.axis, data.shape), (0, 2, 1)
+        )
+        for row, object_id in enumerate(state.object_ids)
+    }
+    out_base = _export_path(req.file, req.axis).with_suffix("")
+    written = export_volume_vti(
+        label_masks,
+        data,
+        geometry,
+        out_base,
+        include_amplitude=req.include_amplitude,
+    )
+    elapsed = time.perf_counter() - started
+    legend = {
+        f"object {object_id + 1}": FIRST_INTERACTIVE_LABEL_ID + row
+        for row, object_id in enumerate(state.object_ids)
+    }
+    log.info("Exported %s in %.1fs", written, elapsed)
+    return {
+        "path": str(written),
+        "directory": str(written.parent),
+        "size_mb": round(written.stat().st_size / (1024**2), 1),
+        "labels": legend,
+        "seconds": elapsed,
+    }
+
+
+def _export_path(file: str, axis: str) -> Path:
+    return OUTPUT_DIR / f"{Path(file).stem}_{axis}_objects.vti"
+
+
+@app.get("/api/export/file")
+def download_export(file: str, axis: str = "inline") -> FileResponse:
+    """Stream the last written .vti so the browser can save it for ParaView."""
+    allowed = {p.name for p in _list_sgy()}
+    if file not in allowed:
+        raise HTTPException(404, f"Unknown seismic file: {file}")
+    if axis not in ("inline", "crossline", "time"):
+        raise HTTPException(422, f"Unknown axis: {axis}")
+    written = _export_path(file, axis)
+    if not written.is_file():
+        raise HTTPException(
+            404, "No export file yet - export the tracked volume first."
+        )
+    return FileResponse(
+        written,
+        media_type="application/octet-stream",
+        filename=written.name,
+    )

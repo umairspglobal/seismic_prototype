@@ -118,14 +118,13 @@ point, right click adds a background point, and multiple objects can be
 tracked at once - add objects in the sidebar, click points for each, and
 propagate. Objects and their points persist while you scrub: move to any
 slice, add or undo refinement clicks for an object there, and
-re-propagate - every slice with a + point becomes a conditioning frame
-for the tracker, exactly like refining a SAM 2 video with clicks on
-multiple frames. Slices where an object has only - points are applied
-after the first sweep as memory-based refinements (they subtract from
-the tracked mask instead of redefining the object), and the correction
-is swept outward. Negative-only clicks have no live single-slice
-preview; they take effect on re-propagation. Objects share one tracker
-session up to the GPU's free VRAM;
+re-propagate. After the first propagate, +/− clicks on any slice edit
+that slice's tracked mask immediately (a − click carves the blob you
+clicked, a + click grows it), then **Re-propagate** spreads those edits
+through the volume. **Download tracked volume (.vti)** writes a ParaView
+ImageData file you can open directly — threshold the `label` array
+(object 1 = 6, object 2 = 7, …). Objects share one tracker session up
+to the GPU's free VRAM;
 anything beyond that is queued into follow-up waves automatically. Each
 slice streams to the browser as a single combined multi-color mask.
 

@@ -323,6 +323,59 @@ class Sam3PointSegmenter:
         return mask
 
 
+class LiveTracker:
+    """Tracker sessions kept alive after a propagation, for interactive edits.
+
+    Sessions keep their video and per-object memory banks on CPU, so
+    holding them resident costs host RAM rather than VRAM. Keeping them
+    is what makes SAM2-style editing possible: a click on a slice that
+    has already been tracked is applied *with* the tracker's memory of
+    the object there, so it refines the propagated mask immediately
+    instead of segmenting that slice from scratch.
+
+    ``masks`` is the propagated volume, kept in sync with every edit, so
+    it is also what gets exported to ParaView.
+    """
+
+    def __init__(self, n_objects: int, n_frames: int, height: int, width: int):
+        self.masks = np.zeros((n_objects, n_frames, height, width), dtype=bool)
+        self.height = height
+        self.width = width
+        # One session per GPU-sized wave of objects.
+        self.sessions: list = []
+        # global object index -> (session position, object id within that session)
+        self.slots: dict[int, tuple[int, int]] = {}
+        # Slices edited since the last sweep; the next sweep starts from these.
+        self.dirty_frames: set[int] = set()
+
+    @property
+    def n_objects(self) -> int:
+        return int(self.masks.shape[0])
+
+    @property
+    def n_frames(self) -> int:
+        return int(self.masks.shape[1])
+
+    def attach(self, session, slots: dict[int, int]) -> None:
+        """Register a finished wave's session and its object id mapping."""
+        session_idx = len(self.sessions)
+        self.sessions.append(session)
+        for global_idx, obj_id in slots.items():
+            self.slots[global_idx] = (session_idx, obj_id)
+
+    def objects_in(self, session_idx: int) -> dict[int, int]:
+        """object id within the session -> global object index."""
+        return {
+            obj_id: global_idx
+            for global_idx, (sess, obj_id) in self.slots.items()
+            if sess == session_idx
+        }
+
+    def close(self) -> None:
+        self.sessions.clear()
+        self.slots.clear()
+
+
 class Sam3VolumePropagator:
     """Propagate a point-picked object through a 3D volume, SAM2-video style.
 
@@ -374,6 +427,8 @@ class Sam3VolumePropagator:
             else torch.float32
         )
         self.last_timings: dict[str, float] = {}
+        # Sessions from the last propagation, kept for interactive edits.
+        self.live: LiveTracker | None = None
         log.info(
             "Volume propagator ready on %s (loaded in %.1fs)",
             self.device,
@@ -449,6 +504,7 @@ class Sam3VolumePropagator:
         object_indices: Sequence[int],
         masks: np.ndarray,
         on_frame: Callable[[int, int], None],
+        live: LiveTracker | None = None,
     ) -> None:
         """Track one GPU-sized batch of objects through the volume.
 
@@ -510,6 +566,7 @@ class Sam3VolumePropagator:
             record(self.model(inference_session=session, frame_idx=frame_idx))
 
         session = self._new_session(pixel_values, height, width)
+        keep_session = False
         try:
             with self._autocast():
                 # Pass 1: condition every anchored slice, then sweep both ways.
@@ -547,8 +604,17 @@ class Sam3VolumePropagator:
                             session, start_frame_idx=start, reverse=reverse
                         ):
                             record(out)
+            keep_session = live is not None
         finally:
-            del session
+            if keep_session:
+                # Hand the session (CPU-resident) to the caller so later
+                # clicks refine with memory instead of rebuilding.
+                live.attach(
+                    session,
+                    {g: pos + 1 for pos, g in enumerate(object_indices)},
+                )
+            else:
+                del session
             self._free_cuda()
 
     @torch.no_grad()
@@ -560,6 +626,7 @@ class Sam3VolumePropagator:
         labels_per_object: Sequence[Sequence[int]],
         frame_indices_per_object: Sequence[Sequence[int]] | None = None,
         progress: Callable[[int, int, int, np.ndarray], None] | None = None,
+        keep_live: bool = False,
     ) -> np.ndarray:
         """Track one or more objects through a stack of slices.
 
@@ -582,6 +649,9 @@ class Sam3VolumePropagator:
             each prompted slice becomes a conditioning frame.
         progress : called as (done, total, frame_idx, frame_masks) where
             frame_masks is (n_objects, H, W) bool for every object so far.
+        keep_live : keep the tracker sessions resident afterwards (on
+            ``self.live``) so ``refine_frame``/``resweep`` can edit the
+            result interactively. Costs host RAM until replaced.
 
         Returns
         -------
@@ -640,7 +710,13 @@ class Sam3VolumePropagator:
         self.last_timings["session_init"] = time.perf_counter() - session_started
         del frames  # the uint8 slices are no longer needed; free them early
 
-        masks = np.zeros((n_objects, n_frames, h, w), dtype=bool)
+        # Drop any previous live sessions before allocating new ones so the
+        # old video + memory banks are freed rather than doubled up.
+        self.live = None
+        live = LiveTracker(n_objects, n_frames, h, w) if keep_live else None
+        masks = live.masks if live is not None else np.zeros(
+            (n_objects, n_frames, h, w), dtype=bool
+        )
         pending = list(range(n_objects))
         waves_done = 0
         wave_sizes: list[int] = []
@@ -673,6 +749,7 @@ class Sam3VolumePropagator:
                     wave,
                     masks,
                     on_frame,
+                    live,
                 )
             except Exception as exc:
                 if not self._is_cuda_oom(exc) or len(wave) == 1:
@@ -711,7 +788,139 @@ class Sam3VolumePropagator:
             waves_done,
             100.0 * float(masks.any(axis=0).mean()),
         )
+        self.live = live
         return masks
+
+    @torch.no_grad()
+    def refine_frame(
+        self,
+        live: LiveTracker,
+        object_index: int,
+        frame_idx: int,
+        points: Sequence[tuple[int, int]],
+        labels: Sequence[int],
+    ) -> np.ndarray:
+        """Re-decode one slice for one object from its clicks on that slice.
+
+        The slice has already been tracked, so the tracker conditions on
+        its memory of the object *and* the new clicks - this is SAM2's
+        refinement path. A negative click therefore carves away part of
+        the propagated mask rather than redefining the object, and a
+        positive click extends it, both visible immediately.
+
+        Clicks replace whatever was previously prompted on this slice for
+        this object, so callers should send the object's full point list
+        for the slice. Returns the (n_objects, H, W) stack for the slice.
+        """
+        if not points or len(points) != len(labels):
+            raise ValueError("refinement needs equal-length, non-empty points/labels")
+        slot = live.slots.get(object_index)
+        if slot is None:
+            raise ValueError(
+                f"object {object_index} is not part of the live tracker session; "
+                "re-propagate to add it"
+            )
+        session_idx, obj_id = slot
+        session = live.sessions[session_idx]
+        started = time.perf_counter()
+
+        with self._autocast():
+            self.processor.add_inputs_to_inference_session(
+                session,
+                frame_idx=int(frame_idx),
+                obj_ids=[obj_id],
+                input_points=[[[[float(x), float(y)] for x, y in points]]],
+                input_labels=[[[int(l) for l in labels]]],
+                original_size=(live.height, live.width),
+            )
+            out = self.model(inference_session=session, frame_idx=int(frame_idx))
+
+        rows = self._to_masks(out.pred_masks, live.height, live.width)
+        by_session_id = live.objects_in(session_idx)
+        for row, out_id in zip(rows, out.object_ids):
+            global_idx = by_session_id.get(int(out_id))
+            if global_idx is not None:
+                live.masks[global_idx, frame_idx] = row
+        live.dirty_frames.add(int(frame_idx))
+        self.last_timings["refine_frame"] = time.perf_counter() - started
+        log.info(
+            "Refined object %d on slice %d with %d point(s) in %.2fs "
+            "(coverage %.2f%%)",
+            object_index + 1,
+            frame_idx,
+            len(points),
+            self.last_timings["refine_frame"],
+            100.0 * float(live.masks[object_index, frame_idx].mean()),
+        )
+        return live.masks[:, int(frame_idx)]
+
+    @torch.no_grad()
+    def resweep(
+        self,
+        live: LiveTracker,
+        progress: Callable[[int, int, int, np.ndarray], None] | None = None,
+    ) -> np.ndarray:
+        """Re-track the volume outward from the slices edited since the last sweep.
+
+        Reuses the live sessions, so the refinement clicks already applied
+        stay in place and only the tracking is redone. This is what SAM 2's
+        demo does when you refine a frame and hit 'Track objects' again.
+        """
+        if not live.sessions:
+            raise ValueError("no live tracker sessions; run a full propagation first")
+        edited = sorted(live.dirty_frames)
+        if not edited:
+            raise ValueError("nothing was edited since the last propagation")
+
+        n_frames = live.n_frames
+        total = len(live.sessions) * n_frames
+        t0 = time.perf_counter()
+        log.info(
+            "Re-sweeping %d slice(s) from edit(s) on slice(s) %s across "
+            "%d session(s)...",
+            n_frames,
+            edited,
+            len(live.sessions),
+        )
+        done = 0
+        for session_idx, session in enumerate(live.sessions):
+            by_session_id = live.objects_in(session_idx)
+            visited: set[int] = set()
+            with self._autocast():
+                # Forward from the first edit, backward from the last: together
+                # they cover every slice while starting where the change is.
+                for reverse, start in ((False, edited[0]), (True, edited[-1])):
+                    for out in self.model.propagate_in_video_iterator(
+                        session, start_frame_idx=start, reverse=reverse
+                    ):
+                        rows = self._to_masks(out.pred_masks, live.height, live.width)
+                        for row, out_id in zip(rows, out.object_ids):
+                            global_idx = by_session_id.get(int(out_id))
+                            if global_idx is not None:
+                                live.masks[global_idx, out.frame_idx] = row
+                        if out.frame_idx not in visited:
+                            visited.add(out.frame_idx)
+                            done += 1
+                        if progress is not None:
+                            progress(
+                                min(done, total),
+                                total,
+                                int(out.frame_idx),
+                                live.masks[:, out.frame_idx],
+                            )
+            self._free_cuda()
+
+        live.dirty_frames.clear()
+        elapsed = time.perf_counter() - t0
+        self.last_timings.update(
+            total=elapsed, fps=n_frames / elapsed if elapsed else float("inf")
+        )
+        log.info(
+            "Re-sweep finished in %.1fs (total coverage %.2f%%)",
+            elapsed,
+            100.0 * float(live.masks.any(axis=0).mean()),
+        )
+        return live.masks
 
     def _to_masks(self, pred_masks: torch.Tensor, h: int, w: int) -> np.ndarray:
         """Threshold + resize one frame's predicted logits to (n_rows, H, W).
