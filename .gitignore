@@ -4,6 +4,13 @@ outputs/
 # Seismic data (large binary files - keep local only)
 data/
 
+# Fine-tuning working files
+finetune_data/
+finetuned_checkpoints/
+finetune_logs/seismic_facies_phase1/checkpoints/checkpoint.pt
+sam3-finetune-env/
+sam3/
+
 # Python
 __pycache__/
 *.pyc

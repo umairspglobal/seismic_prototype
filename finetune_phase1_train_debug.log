@@ -1,0 +1,1335 @@
+C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3-finetune-env\Lib\site-packages\timm\models\layers\__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+###################### Train App Config ####################
+paths:
+  dataset_root: C:/Users/umair_tariq/Downloads/Downloads/seismic_prototype/finetune_data
+  experiment_log_dir: C:/Users/umair_tariq/Downloads/Downloads/seismic_prototype/finetune_logs/seismic_facies_phase1
+  bpe_path: C:/Users/umair_tariq/Downloads/Downloads/seismic_prototype/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  init_checkpoint: C:/Users/umair_tariq/.cache/huggingface/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt
+seismic_train:
+  category_name: seismic facies
+  train_transforms:
+  - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
+    transforms:
+    - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
+      query_filter:
+        _target_: sam3.train.transforms.filter_query_transforms.FilterCrowds
+    - _target_: sam3.train.transforms.segmentation.DecodeRle
+    - _target_: sam3.train.transforms.basic_for_api.RandomHorizontalFlip
+      consistent_transform: true
+      p: 0.5
+    - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
+      sizes:
+        _target_: sam3.train.transforms.basic.get_random_resize_scales
+        size: ${scratch.resolution}
+        min_size: 480
+        rounded: false
+      max_size:
+        _target_: sam3.train.transforms.basic.get_random_resize_max_size
+        size: ${scratch.resolution}
+      square: true
+      consistent_transform: ${scratch.consistent_transform}
+    - _target_: sam3.train.transforms.basic_for_api.PadToSizeAPI
+      size: ${scratch.resolution}
+      consistent_transform: ${scratch.consistent_transform}
+    - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+    - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
+      query_filter:
+        _target_: sam3.train.transforms.filter_query_transforms.FilterEmptyTargets
+    - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
+      mean: ${scratch.train_norm_mean}
+      std: ${scratch.train_norm_std}
+  val_transforms:
+  - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
+    transforms:
+    - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
+      sizes: ${scratch.resolution}
+      max_size:
+        _target_: sam3.train.transforms.basic.get_random_resize_max_size
+        size: ${scratch.resolution}
+      square: true
+      consistent_transform: false
+    - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+    - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
+      mean: ${scratch.train_norm_mean}
+      std: ${scratch.train_norm_std}
+  loss:
+    _target_: sam3.train.loss.sam3_loss.Sam3LossWrapper
+    matcher: ${scratch.matcher}
+    o2m_weight: 2.0
+    o2m_matcher:
+      _target_: sam3.train.matcher.BinaryOneToManyMatcher
+      alpha: 0.3
+      threshold: 0.4
+      topk: 4
+    use_o2m_matcher_on_o2m_aux: false
+    loss_fns_find:
+    - _target_: sam3.train.loss.loss_fns.Boxes
+      weight_dict:
+        loss_bbox: 5.0
+        loss_giou: 2.0
+    - _target_: sam3.train.loss.loss_fns.IABCEMdetr
+      weak_loss: false
+      weight_dict:
+        loss_ce: 20.0
+        presence_loss: 20.0
+      pos_weight: 10.0
+      alpha: 0.25
+      gamma: 2
+      use_presence: true
+      pos_focal: false
+      pad_n_queries: 200
+      pad_scale_pos: 1.0
+    - _target_: sam3.train.loss.loss_fns.Masks
+      focal_alpha: 0.25
+      focal_gamma: 2.0
+      weight_dict:
+        loss_mask: 200.0
+        loss_dice: 10.0
+      compute_aux: false
+    loss_fn_semantic_seg: null
+    scale_by_find_batch_size: ${scratch.scale_by_find_batch_size}
+scratch:
+  enable_segmentation: true
+  d_model: 256
+  pos_embed:
+    _target_: sam3.model.position_encoding.PositionEmbeddingSine
+    num_pos_feats: ${scratch.d_model}
+    normalize: true
+    scale: null
+    temperature: 10000
+  use_presence_eval: true
+  original_box_postprocessor:
+    _target_: sam3.eval.postprocessors.PostProcessImage
+    max_dets_per_img: -1
+    use_original_ids: true
+    use_original_sizes_box: true
+  use_presence: ${scratch.use_presence_eval}
+  matcher:
+    _target_: sam3.train.matcher.BinaryHungarianMatcherV2
+    focal: true
+    cost_class: 2.0
+    cost_bbox: 5.0
+    cost_giou: 2.0
+    alpha: 0.25
+    gamma: 2
+    stable: false
+  scale_by_find_batch_size: true
+  resolution: 1008
+  consistent_transform: false
+  max_ann_per_img: 20
+  train_norm_mean:
+  - 0.5
+  - 0.5
+  - 0.5
+  train_norm_std:
+  - 0.5
+  - 0.5
+  - 0.5
+  val_norm_mean:
+  - 0.5
+  - 0.5
+  - 0.5
+  val_norm_std:
+  - 0.5
+  - 0.5
+  - 0.5
+  num_train_workers: 0
+  num_val_workers: 0
+  max_data_epochs: 30
+  target_epoch_size: 1500
+  hybrid_repeats: 1
+  context_length: 2
+  gather_pred_via_filesys: false
+  lr_scale: 1.0
+  lr_transformer: 0.0008
+  lr_vision_backbone: 0.0
+  lr_language_backbone: 0.0
+  lrd_vision_backbone: 0.9
+  wd: 0.1
+  scheduler_timescale: 15
+  scheduler_warmup: 5
+  scheduler_cooldown: 15
+  val_batch_size: 1
+  collate_fn_val:
+    _target_: sam3.train.data.collator.collate_fn_api
+    _partial_: true
+    repeats: ${scratch.hybrid_repeats}
+    dict_key: seismic_facies
+    with_seg_masks: true
+  gradient_accumulation_steps: 1
+  train_batch_size: 1
+  collate_fn:
+    _target_: sam3.train.data.collator.collate_fn_api
+    _partial_: true
+    repeats: ${scratch.hybrid_repeats}
+    dict_key: all
+    with_seg_masks: true
+trainer:
+  _target_: sam3.train.trainer.Trainer
+  skip_saving_ckpts: false
+  empty_gpu_mem_cache_after_eval: true
+  skip_first_val: false
+  max_epochs: 30
+  accelerator: cuda
+  seed_value: 123
+  val_epoch_freq: 1
+  mode: train
+  gradient_accumulation_steps: ${scratch.gradient_accumulation_steps}
+  distributed:
+    backend: gloo
+    find_unused_parameters: true
+    gradient_as_bucket_view: true
+  loss:
+    all: ${seismic_train.loss}
+    default:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+  data:
+    train:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
+          include_negatives: true
+          category_chunk_size: 1
+          _partial_: true
+        load_segmentation: true
+        transforms: ${seismic_train.train_transforms}
+        max_ann_per_img: 20
+        multiplier: 1
+        max_train_queries: 100
+        max_val_queries: 100
+        training: true
+        use_caching: false
+        img_folder: ${paths.dataset_root}/images/train/
+        ann_file: ${paths.dataset_root}/train.json
+      shuffle: true
+      batch_size: ${scratch.train_batch_size}
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: true
+      drop_last: true
+      collate_fn: ${scratch.collate_fn}
+    val:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        load_segmentation: true
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
+          include_negatives: true
+          category_chunk_size: 1
+          _partial_: true
+        img_folder: ${paths.dataset_root}/images/val/
+        ann_file: ${paths.dataset_root}/val.json
+        transforms: ${seismic_train.val_transforms}
+        max_ann_per_img: 100
+        multiplier: 1
+        training: false
+      shuffle: false
+      batch_size: ${scratch.val_batch_size}
+      num_workers: ${scratch.num_val_workers}
+      pin_memory: true
+      drop_last: false
+      collate_fn: ${scratch.collate_fn_val}
+  model:
+    _target_: sam3.model_builder.build_sam3_image_model
+    bpe_path: ${paths.bpe_path}
+    device: cpu
+    eval_mode: false
+    enable_segmentation: ${scratch.enable_segmentation}
+    checkpoint_path: ${paths.init_checkpoint}
+    load_from_HF: false
+  optim:
+    amp:
+      enabled: true
+      amp_dtype: bfloat16
+    optimizer:
+      _target_: torch.optim.AdamW
+    gradient_clip:
+      _target_: sam3.train.optim.optimizer.GradientClipper
+      max_norm: 0.1
+      norm_type: 2
+    param_group_modifiers:
+    - _target_: sam3.train.optim.optimizer.layer_decay_param_modifier
+      _partial_: true
+      layer_decay_value: ${scratch.lrd_vision_backbone}
+      apply_to: backbone.vision_backbone.trunk
+      overrides:
+      - pattern: '*pos_embed*'
+        value: 1.0
+    options:
+      lr:
+      - scheduler:
+          _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+          base_lr: ${scratch.lr_transformer}
+          timescale: ${scratch.scheduler_timescale}
+          warmup_steps: ${scratch.scheduler_warmup}
+          cooldown_steps: ${scratch.scheduler_cooldown}
+      - scheduler:
+          _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+          base_lr: ${scratch.lr_vision_backbone}
+          timescale: ${scratch.scheduler_timescale}
+          warmup_steps: ${scratch.scheduler_warmup}
+          cooldown_steps: ${scratch.scheduler_cooldown}
+        param_names:
+        - backbone.vision_backbone.*
+      - scheduler:
+          _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+          base_lr: ${scratch.lr_language_backbone}
+          timescale: ${scratch.scheduler_timescale}
+          warmup_steps: ${scratch.scheduler_warmup}
+          cooldown_steps: ${scratch.scheduler_cooldown}
+        param_names:
+        - backbone.language_backbone.*
+      weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: ${scratch.wd}
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.0
+        param_names:
+        - '*bias*'
+        module_cls_names:
+        - torch.nn.LayerNorm
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 5
+    resume_from: null
+  logging:
+    tensorboard_writer:
+      _target_: sam3.train.utils.logger.make_tensorboard_logger
+      log_dir: ${launcher.experiment_log_dir}/tensorboard
+      flush_secs: 120
+      should_log: true
+    wandb_writer: null
+    log_dir: ${launcher.experiment_log_dir}/logs/seismic_facies_phase1
+    log_freq: 10
+launcher:
+  num_nodes: 1
+  gpus_per_node: 1
+  experiment_log_dir: ${paths.experiment_log_dir}
+  multiprocessing_context: forkserver
+submitit:
+  account: null
+  partition: null
+  qos: null
+  timeout_hour: 72
+  use_cluster: false
+  cpus_per_task: 8
+  port_range:
+  - 10000
+  - 65000
+  constraint: null
+
+############################################################
+Experiment Log Dir:
+C:/Users/umair_tariq/Downloads/Downloads/seismic_prototype/finetune_logs/seismic_facies_phase1
+INFO 2026-08-31 12:09:51,217 train_utils.py: 106: MACHINE SEED: 3690
+INFO 2026-08-31 12:09:51,240 train_utils.py: 152: Logging ENV_VARIABLES
+INFO 2026-08-31 12:09:51,240 train_utils.py: 153: AI_AGENT=github_copilot_vscode_agent
+ALLUSERSPROFILE=C:\ProgramData
+APPDATA=C:\Users\umair_tariq\AppData\Roaming
+BUNDLED_DEBUGPY_PATH=c:\Users\umair_tariq\.vscode\extensions\ms-python.debugpy-2026.6.0-win32-x64\bundled\libs\debugpy
+CHROME_CRASHPAD_PIPE_NAME=\\.\pipe\crashpad_36860_BAIDNWLPTSFNGNUY
+COLORTERM=truecolor
+COMMONPROGRAMFILES=C:\Program Files\Common Files
+COMMONPROGRAMFILES(X86)=C:\Program Files (x86)\Common Files
+COMMONPROGRAMW6432=C:\Program Files\Common Files
+COMPONENT_INSTALLER_DIR=C:\Users\umair_tariq\AppData\Local\Microsoft\Edge\User Data
+COMPUTERNAME=SPGI-PF55L57N
+COMSPEC=C:\Windows\system32\cmd.exe
+COPILOT_AGENT=1
+COPILOT_DEBUG_NONCE=9152a430e4fb12f688a89942b65a0c71
+DEBIAN_FRONTEND=noninteractive
+DRIVERDATA=C:\Windows\System32\Drivers\DriverData
+EDGE_BROWSER_PID=21392
+EDGE_CRASHPAD_PIPE_NAME=\\.\pipe\crashpad_21392_CVOHMYIPKATWCRYS
+EDGE_METRICS_CLIENT_ID_HASH=-7979284350400451291
+EDGE_METRICS_SESSION_ID=25
+EDGE_USER_DATA_DIR=C:\Users\umair_tariq\AppData\Local\Microsoft\Edge\User Data
+EFC_12184_1262719628=1
+EFC_12184_1592913036=1
+EFC_12184_2283032206=1
+EFC_12184_2775293581=1
+EFC_12184_3789132940=1
+EFC_12184_4126798990=0
+FPS_BROWSER_APP_PROFILE_STRING=Internet Explorer
+FPS_BROWSER_USER_PROFILE_STRING=Default
+GIT_ASKPASS=c:\Users\umair_tariq\AppData\Roaming\Code\User\globalStorage\vscode.git\askpass\70789581cae28aa7\askpass.sh
+GIT_EDITOR=:
+GIT_MERGE_AUTOEDIT=no
+GIT_PAGER=cat
+HOMEDRIVE=C:
+HOMEPATH=\Users\umair_tariq
+HYDRA_FULL_ERROR=1
+LANG=en_US.UTF-8
+LOCALAPPDATA=C:\Users\umair_tariq\AppData\Local
+LOCAL_RANK=0
+LOGONSERVER=\\SPGI-PF55L57N
+MASTER_ADDR=localhost
+MASTER_PORT=10547
+NEXTHINK=C:\Program Files\Nexthink\Collector
+NUMBER_OF_PROCESSORS=28
+ONEDRIVE=C:\Users\umair_tariq\OneDrive - S&P Global
+ONEDRIVECOMMERCIAL=C:\Users\umair_tariq\OneDrive - S&P Global
+OS=Windows_NT
+PATH=C:\Program Files\PowerShell\7;c:\Users\umair_tariq\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;c:\Users\umair_tariq\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\copilotCli;C:\Program Files (x86)\Microsoft\Edge\Application;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files (x86)\Microsoft SQL Server\160\Tools\Binn\;C:\Program Files\Microsoft SQL Server\160\Tools\Binn\;C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\;C:\Program Files\Microsoft SQL Server\160\DTS\Binn\;C:\Program Files\Git\cmd;C:\Program Files\PowerShell\7\;C:\Users\umair_tariq\AppData\Local\Programs\Python\Python312\Scripts\;C:\Users\umair_tariq\AppData\Local\Programs\Python\Python312\;C:\Users\umair_tariq\AppData\Local\Programs\Python\Python311\Scripts\;C:\Users\umair_tariq\AppData\Local\Programs\Python\Python311\;C:\Users\umair_tariq\AppData\Local\Microsoft\WindowsApps;C:\Users\umair_tariq\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\umair_tariq\AppData\Local\GitHubDesktop\bin;c:\Users\umair_tariq\.vscode\extensions\ms-python.debugpy-2026.6.0-win32-x64\bundled\scripts\noConfigScripts
+PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL
+POWERSHELL_DISTRIBUTION_CHANNEL=MSI:Windows 10 Enterprise
+PROCESSOR_ARCHITECTURE=AMD64
+PROCESSOR_IDENTIFIER=Intel64 Family 6 Model 183 Stepping 1, GenuineIntel
+PROCESSOR_LEVEL=6
+PROCESSOR_REVISION=b701
+PROGRAMDATA=C:\ProgramData
+PROGRAMFILES=C:\Program Files
+PROGRAMFILES(X86)=C:\Program Files (x86)
+PROGRAMW6432=C:\Program Files
+PSMODULEPATH=C:\Users\umair_tariq\OneDrive - S&P Global\Documents\PowerShell\Modules;C:\Program Files\PowerShell\Modules;c:\program files\powershell\7\Modules;C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules;C:\Program Files (x86)\Microsoft SQL Server\160\Tools\PowerShell\Modules\;C:\Program Files (x86)\Microsoft Purview Information Protection\Powershell
+PUBLIC=C:\Users\Public
+PYDEVD_DISABLE_FILE_VALIDATION=1
+PYTHONFAULTHANDLER=1
+PYTHONSTARTUP=c:\Users\umair_tariq\AppData\Roaming\Code\User\workspaceStorage\91dd76ec310c39155706d2dc5baea839\ms-python.python\pythonrc.py
+PYTHON_BASIC_REPL=1
+RANK=0
+SESSIONNAME=Console
+SYSTEMDRIVE=C:
+SYSTEMROOT=C:\Windows
+TEMP=C:\Users\UMAIR_~1\AppData\Local\Temp
+TERM_PROGRAM=vscode
+TERM_PROGRAM_VERSION=1.135.0
+TMP=C:\Users\UMAIR_~1\AppData\Local\Temp
+TOKENIZERS_PARALLELISM=false
+TORCHINDUCTOR_CACHE_DIR=C:\Users\UMAIR_~1\AppData\Local\Temp\torchinductor_umair_tariq
+TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+USERDNSDOMAIN=mhf.mhc
+USERDOMAIN=MHF
+USERDOMAIN_ROAMINGPROFILE=MHF
+USERNAME=umair_tariq
+USERPROFILE=C:\Users\umair_tariq
+VSCODE_DEBUGPY_ADAPTER_ENDPOINTS=c:\Users\umair_tariq\.vscode\extensions\ms-python.debugpy-2026.6.0-win32-x64\.noConfigDebugAdapterEndpoints\endpoint-88dd41187c94acc2.txt
+VSCODE_GIT_ASKPASS_EXTRA_ARGS=
+VSCODE_GIT_ASKPASS_MAIN=c:\Users\umair_tariq\AppData\Roaming\Code\User\globalStorage\vscode.git\askpass\70789581cae28aa7\askpass-main.js
+VSCODE_GIT_ASKPASS_NODE=C:\Users\umair_tariq\AppData\Local\Programs\Microsoft VS Code\Code.exe
+VSCODE_GIT_IPC_HANDLE=\\.\pipe\vscode-git-4df0aaa26b-sock
+VSCODE_INJECTION=1
+VSCODE_PYTHON_AUTOACTIVATE_GUARD=1
+WINDIR=C:\Windows
+WORLD_SIZE=1
+__COMPAT_LAYER=RunAsInvoker
+
+INFO 2026-08-31 12:09:51,241 trainer.py:1088: Setting up components: Model, loss, optim, meters etc.
+INFO 2026-08-31 12:09:51,242 logger.py:  62: TensorBoard SummaryWriter instantiated. Files will be stored in: C:/Users/umair_tariq/Downloads/Downloads/seismic_prototype/finetune_logs/seismic_facies_phase1/tensorboard
+INFO 2026-08-31 12:09:57,820 trainer.py:1158: ====================
+INFO 2026-08-31 12:09:57,820 trainer.py:1159: Summary for model <class 'sam3.model.sam3_image.Sam3Image'>
+INFO 2026-08-31 12:09:57,825 trainer.py:1160: Model is Sam3Image(
+  (backbone): SAM3VLBackbone(
+    (vision_backbone): Sam3DualViTDetNeck(
+      (trunk): ViT(
+        (patch_embed): PatchEmbed(
+          (proj): Conv2d(3, 1024, kernel_size=(14, 14), stride=(14, 14), bias=False)
+        )
+        (blocks): ModuleList(
+          (0): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): Identity()
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (1): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.003)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (2): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.006)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (3): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.010)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (4): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.013)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (5): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.016)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (6): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.019)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (7): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.023)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (8): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.026)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (9): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.029)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (10): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.032)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (11): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.035)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (12): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.039)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (13): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.042)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (14): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.045)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (15): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.048)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (16): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.052)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (17): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.055)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (18): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.058)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (19): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.061)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (20): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.065)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (21): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.068)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (22): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.071)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (23): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.074)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (24): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.077)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (25): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.081)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (26): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.084)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (27): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.087)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (28): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.090)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (29): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.094)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (30): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.097)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+          (31): Block(
+            (norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (attn): Attention(
+              (qkv): Linear(in_features=1024, out_features=3072, bias=True)
+              (proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (ls1): Identity()
+            (drop_path): DropPath(drop_prob=0.100)
+            (norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (mlp): Mlp(
+              (fc1): Linear(in_features=1024, out_features=4736, bias=True)
+              (act): GELU(approximate='none')
+              (drop1): Dropout(p=0.0, inplace=False)
+              (norm): Identity()
+              (fc2): Linear(in_features=4736, out_features=1024, bias=True)
+              (drop2): Dropout(p=0.0, inplace=False)
+            )
+            (ls2): Identity()
+            (dropout): Dropout(p=0.0, inplace=False)
+          )
+        )
+        (ln_pre): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+        (ln_post): Identity()
+      )
+      (position_encoding): PositionEmbeddingSine()
+      (convs): ModuleList(
+        (0): Sequential(
+          (dconv_2x2_0): ConvTranspose2d(1024, 512, kernel_size=(2, 2), stride=(2, 2))
+          (gelu): GELU(approximate='none')
+          (dconv_2x2_1): ConvTranspose2d(512, 256, kernel_size=(2, 2), stride=(2, 2))
+          (conv_1x1): Conv2d(256, 256, kernel_size=(1, 1), stride=(1, 1))
+          (conv_3x3): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        )
+        (1): Sequential(
+          (dconv_2x2): ConvTranspose2d(1024, 512, kernel_size=(2, 2), stride=(2, 2))
+          (conv_1x1): Conv2d(512, 256, kernel_size=(1, 1), stride=(1, 1))
+          (conv_3x3): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        )
+        (2): Sequential(
+          (conv_1x1): Conv2d(1024, 256, kernel_size=(1, 1), stride=(1, 1))
+          (conv_3x3): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        )
+        (3): Sequential(
+          (maxpool_2x2): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+          (conv_1x1): Conv2d(1024, 256, kernel_size=(1, 1), stride=(1, 1))
+          (conv_3x3): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        )
+      )
+    )
+    (language_backbone): VETextEncoder(
+      (encoder): TextTransformer(
+        (token_embedding): Embedding(49408, 1024)
+        (transformer): Transformer(
+          (resblocks): ModuleList(
+            (0-23): 24 x ResidualAttentionBlock(
+              (attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=1024, out_features=1024, bias=True)
+              )
+              (ln_1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+              (ln_2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+              (ls_1): Identity()
+              (ls_2): Identity()
+              (mlp): Sequential(
+                (c_fc): Linear(in_features=1024, out_features=4096, bias=True)
+                (gelu): GELU(approximate='none')
+                (c_proj): Linear(in_features=4096, out_features=1024, bias=True)
+              )
+            )
+          )
+        )
+        (ln_final): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+      )
+      (resizer): Linear(in_features=1024, out_features=256, bias=True)
+    )
+  )
+  (geometry_encoder): SequenceGeometryEncoder(
+    (pos_enc): PositionEmbeddingSine()
+    (label_embed): Embedding(2, 256)
+    (cls_embed): Embedding(1, 256)
+    (points_direct_project): Linear(in_features=2, out_features=256, bias=True)
+    (points_pool_project): Linear(in_features=256, out_features=256, bias=True)
+    (points_pos_enc_project): Linear(in_features=256, out_features=256, bias=True)
+    (boxes_direct_project): Linear(in_features=4, out_features=256, bias=True)
+    (boxes_pool_project): Conv2d(256, 256, kernel_size=(7, 7), stride=(1, 1))
+    (boxes_pos_enc_project): Linear(in_features=258, out_features=256, bias=True)
+    (final_proj): Linear(in_features=256, out_features=256, bias=True)
+    (norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+    (img_pre_norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+    (encode): ModuleList(
+      (0-2): 3 x TransformerEncoderLayer(
+        (self_attn): MultiheadAttention(
+          (out_proj): NonDynamicallyQuantizableLinear(in_features=256, out_features=256, bias=True)
+        )
+        (cross_attn_image): MultiheadAttention(
+          (out_proj): NonDynamicallyQuantizableLinear(in_features=256, out_features=256, bias=True)
+        )
+        (linear1): Linear(in_features=256, out_features=2048, bias=True)
+        (dropout): Dropout(p=0.1, inplace=False)
+        (linear2): Linear(in_features=2048, out_features=256, bias=True)
+        (norm1): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+        (norm2): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+        (norm3): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+        (dropout1): Dropout(p=0.1, inplace=False)
+        (dropout2): Dropout(p=0.1, inplace=False)
+        (dropout3): Dropout(p=0.1, inplace=False)
+      )
+    )
+    (encode_norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+  )
+  (transformer): TransformerWrapper(
+    (encoder): TransformerEncoderFusion(
+      (layers): ModuleList(
+        (0-5): 6 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=256, out_features=256, bias=True)
+          )
+          (cross_attn_image): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=256, out_features=256, bias=True)
+          )
+          (linear1): Linear(in_features=256, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=256, bias=True)
+          (norm1): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+          (norm3): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+          (dropout3): Dropout(p=0.1, inplace=False)
+        )
+      )
+    )
+    (decoder): TransformerDecoder(
+      (layers): ModuleList(
+        (0-5): 6 x TransformerDecoderLayer(
+          (cross_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=256, out_features=256, bias=True)
+          )
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (norm1): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+          (ca_text): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=256, out_features=256, bias=True)
+          )
+          (catext_dropout): Dropout(p=0.1, inplace=False)
+          (catext_norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=256, out_features=256, bias=True)
+          )
+          (dropout2): Dropout(p=0.1, inplace=False)
+          (norm2): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+          (linear1): Linear(in_features=256, out_features=2048, bias=True)
+          (dropout3): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=256, bias=True)
+          (dropout4): Dropout(p=0.1, inplace=False)
+          (norm3): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+        )
+      )
+      (norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+      (bbox_embed): MLP(
+        (layers): ModuleList(
+          (0-1): 2 x Linear(in_features=256, out_features=256, bias=True)
+          (2): Linear(in_features=256, out_features=4, bias=True)
+        )
+        (drop): Identity()
+        (out_norm): Identity()
+      )
+      (query_embed): Embedding(200, 256)
+      (reference_points): Embedding(200, 4)
+      (boxRPB_embed_x): MLP(
+        (layers): ModuleList(
+          (0): Linear(in_features=2, out_features=256, bias=True)
+          (1): Linear(in_features=256, out_features=8, bias=True)
+        )
+        (drop): Identity()
+        (out_norm): Identity()
+      )
+      (boxRPB_embed_y): MLP(
+        (layers): ModuleList(
+          (0): Linear(in_features=2, out_features=256, bias=True)
+          (1): Linear(in_features=256, out_features=8, bias=True)
+        )
+        (drop): Identity()
+        (out_norm): Identity()
+      )
+      (presence_token): Embedding(1, 256)
+      (presence_token_head): MLP(
+        (layers): ModuleList(
+          (0-1): 2 x Linear(in_features=256, out_features=256, bias=True)
+          (2): Linear(in_features=256, out_features=1, bias=True)
+        )
+        (drop): Identity()
+        (out_norm): Identity()
+      )
+      (presence_token_out_norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+      (ref_point_head): MLP(
+        (layers): ModuleList(
+          (0): Linear(in_features=512, out_features=256, bias=True)
+          (1): Linear(in_features=256, out_features=256, bias=True)
+        )
+        (drop): Identity()
+        (out_norm): Identity()
+      )
+    )
+  )
+  (segmentation_head): UniversalSegmentationHead(
+    (pixel_decoder): PixelDecoder(
+      (conv_layers): ModuleList(
+        (0-2): 3 x Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+      )
+      (norms): ModuleList(
+        (0-2): 3 x GroupNorm(8, 256, eps=1e-05, affine=True)
+      )
+    )
+    (mask_predictor): MaskPredictor(
+      (mask_embed): MLP(
+        (layers): ModuleList(
+          (0-2): 3 x Linear(in_features=256, out_features=256, bias=True)
+        )
+        (drop): Identity()
+        (out_norm): Identity()
+      )
+    )
+    (cross_attend_prompt): MultiheadAttention(
+      (out_proj): NonDynamicallyQuantizableLinear(in_features=256, out_features=256, bias=True)
+    )
+    (cross_attn_norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+    (semantic_seg_head): Conv2d(256, 1, kernel_size=(1, 1), stride=(1, 1))
+    (instance_seg_head): Conv2d(256, 256, kernel_size=(1, 1), stride=(1, 1))
+  )
+  (dot_prod_scoring): DotProductScoring(
+    (prompt_mlp): MLP(
+      (layers): ModuleList(
+        (0): Linear(in_features=256, out_features=2048, bias=True)
+        (1): Linear(in_features=2048, out_features=256, bias=True)
+      )
+      (drop): Dropout(p=0.1, inplace=False)
+      (out_norm): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+    )
+    (prompt_proj): Linear(in_features=256, out_features=256, bias=True)
+    (hs_proj): Linear(in_features=256, out_features=256, bias=True)
+  )
+  (matcher): BinaryHungarianMatcherV2(
+    (norm): Sigmoid()
+  )
+)
+INFO 2026-08-31 12:09:57,827 trainer.py:1161: 	Total parameters 840 M
+INFO 2026-08-31 12:09:57,827 trainer.py:1162: 	Trainable parameters 840 M
+INFO 2026-08-31 12:09:57,827 trainer.py:1165: 	Non-Trainable parameters 0  
+INFO 2026-08-31 12:09:57,828 trainer.py:1168: ====================
+INFO 2026-08-31 12:09:58,632 trainer.py:1122: Finished setting up components: Model, loss, optim, meters etc.
+INFO 2026-08-31 12:09:58,632 trainer.py: 333: Moving components to device cuda:0 and local rank 0.
+INFO 2026-08-31 12:09:59,806 trainer.py: 339: Done moving components to device cuda:0 and local rank 0.
+INFO 2026-08-31 12:09:59,820 optimizer.py: 248: Matches for param_name [backbone.vision_backbone.*]: {'backbone.vision_backbone.trunk.blocks.4.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.22.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.6.norm2.bias', 'backbone.vision_backbone.trunk.blocks.16.norm2.weight', 'backbone.vision_backbone.trunk.blocks.8.norm2.weight', 'backbone.vision_backbone.trunk.blocks.20.norm2.bias', 'backbone.vision_backbone.trunk.blocks.18.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.22.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.7.norm2.bias', 'backbone.vision_backbone.trunk.blocks.19.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.15.norm2.weight', 'backbone.vision_backbone.trunk.blocks.8.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.31.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.27.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.31.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.10.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.27.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.26.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.14.norm2.weight', 'backbone.vision_backbone.trunk.blocks.27.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.12.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.13.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.15.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.28.norm2.weight', 'backbone.vision_backbone.trunk.blocks.30.norm1.weight', 'backbone.vision_backbone.trunk.blocks.26.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.13.norm2.weight', 'backbone.vision_backbone.trunk.blocks.22.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.10.norm1.weight', 'backbone.vision_backbone.trunk.blocks.8.norm1.bias', 'backbone.vision_backbone.trunk.blocks.16.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.30.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.13.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.13.norm2.bias', 'backbone.vision_backbone.trunk.blocks.20.norm2.weight', 'backbone.vision_backbone.trunk.blocks.4.norm2.weight', 'backbone.vision_backbone.trunk.blocks.10.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.8.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.16.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.5.norm2.weight', 'backbone.vision_backbone.trunk.blocks.8.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.25.norm1.bias', 'backbone.vision_backbone.trunk.ln_pre.weight', 'backbone.vision_backbone.trunk.blocks.24.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.5.norm1.weight', 'backbone.vision_backbone.trunk.blocks.12.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.19.norm2.bias', 'backbone.vision_backbone.trunk.blocks.5.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.11.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.14.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.30.norm2.bias', 'backbone.vision_backbone.trunk.blocks.9.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.6.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.17.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.17.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.12.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.17.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.28.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.3.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.20.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.12.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.23.norm1.bias', 'backbone.vision_backbone.trunk.blocks.26.norm2.bias', 'backbone.vision_backbone.trunk.blocks.7.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.0.norm1.weight', 'backbone.vision_backbone.trunk.blocks.1.norm1.bias', 'backbone.vision_backbone.trunk.blocks.29.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.21.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.11.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.16.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.15.norm1.bias', 'backbone.vision_backbone.trunk.blocks.23.norm2.bias', 'backbone.vision_backbone.trunk.blocks.1.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.30.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.1.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.4.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.31.norm2.weight', 'backbone.vision_backbone.trunk.blocks.19.norm1.bias', 'backbone.vision_backbone.trunk.blocks.27.norm1.bias', 'backbone.vision_backbone.trunk.blocks.29.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.30.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.11.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.23.norm1.weight', 'backbone.vision_backbone.trunk.blocks.31.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.13.norm1.bias', 'backbone.vision_backbone.trunk.blocks.3.norm2.weight', 'backbone.vision_backbone.convs.2.conv_1x1.weight', 'backbone.vision_backbone.convs.1.conv_3x3.weight', 'backbone.vision_backbone.trunk.blocks.25.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.10.norm2.bias', 'backbone.vision_backbone.trunk.blocks.4.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.24.norm1.weight', 'backbone.vision_backbone.trunk.blocks.28.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.31.norm1.weight', 'backbone.vision_backbone.trunk.blocks.21.norm2.weight', 'backbone.vision_backbone.trunk.blocks.23.mlp.fc2.weight', 'backbone.vision_backbone.convs.0.dconv_2x2_0.bias', 'backbone.vision_backbone.trunk.patch_embed.proj.weight', 'backbone.vision_backbone.trunk.blocks.5.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.4.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.30.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.12.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.0.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.27.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.8.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.8.norm1.weight', 'backbone.vision_backbone.trunk.blocks.23.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.24.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.6.mlp.fc2.bias', 'backbone.vision_backbone.convs.0.dconv_2x2_1.bias', 'backbone.vision_backbone.trunk.blocks.26.norm2.weight', 'backbone.vision_backbone.trunk.blocks.0.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.4.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.6.norm1.bias', 'backbone.vision_backbone.trunk.blocks.0.norm2.bias', 'backbone.vision_backbone.trunk.blocks.21.norm1.weight', 'backbone.vision_backbone.trunk.blocks.15.norm1.weight', 'backbone.vision_backbone.trunk.blocks.15.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.11.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.28.norm1.weight', 'backbone.vision_backbone.trunk.blocks.28.norm2.bias', 'backbone.vision_backbone.trunk.blocks.4.norm1.weight', 'backbone.vision_backbone.trunk.blocks.16.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.30.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.31.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.25.norm1.weight', 'backbone.vision_backbone.trunk.blocks.26.norm1.bias', 'backbone.vision_backbone.trunk.blocks.28.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.29.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.26.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.3.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.25.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.29.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.17.norm1.weight', 'backbone.vision_backbone.trunk.blocks.4.norm2.bias', 'backbone.vision_backbone.trunk.blocks.17.norm2.bias', 'backbone.vision_backbone.trunk.blocks.27.norm1.weight', 'backbone.vision_backbone.trunk.blocks.25.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.5.norm2.bias', 'backbone.vision_backbone.trunk.blocks.5.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.9.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.6.norm1.weight', 'backbone.vision_backbone.trunk.blocks.4.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.7.norm1.weight', 'backbone.vision_backbone.trunk.blocks.5.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.30.attn.qkv.weight', 'backbone.vision_backbone.convs.1.dconv_2x2.bias', 'backbone.vision_backbone.convs.1.conv_3x3.bias', 'backbone.vision_backbone.trunk.blocks.2.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.22.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.23.norm2.weight', 'backbone.vision_backbone.trunk.blocks.17.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.19.norm1.weight', 'backbone.vision_backbone.trunk.blocks.9.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.2.norm1.bias', 'backbone.vision_backbone.trunk.blocks.13.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.13.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.5.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.1.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.29.norm1.bias', 'backbone.vision_backbone.trunk.blocks.17.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.21.norm2.bias', 'backbone.vision_backbone.trunk.blocks.22.norm1.bias', 'backbone.vision_backbone.trunk.blocks.28.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.7.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.17.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.15.norm2.bias', 'backbone.vision_backbone.trunk.blocks.15.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.21.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.13.norm1.weight', 'backbone.vision_backbone.trunk.blocks.18.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.22.norm1.weight', 'backbone.vision_backbone.trunk.blocks.29.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.8.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.9.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.29.norm2.weight', 'backbone.vision_backbone.trunk.blocks.10.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.25.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.12.norm1.weight', 'backbone.vision_backbone.trunk.blocks.18.norm1.weight', 'backbone.vision_backbone.trunk.blocks.7.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.20.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.5.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.12.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.26.norm1.weight', 'backbone.vision_backbone.trunk.blocks.9.norm1.bias', 'backbone.vision_backbone.trunk.blocks.9.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.5.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.0.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.14.norm2.bias', 'backbone.vision_backbone.trunk.blocks.12.norm2.weight', 'backbone.vision_backbone.trunk.blocks.24.attn.qkv.weight', 'backbone.vision_backbone.convs.3.conv_1x1.weight', 'backbone.vision_backbone.trunk.blocks.22.norm2.bias', 'backbone.vision_backbone.trunk.blocks.13.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.22.norm2.weight', 'backbone.vision_backbone.trunk.blocks.27.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.22.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.11.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.3.norm1.weight', 'backbone.vision_backbone.trunk.blocks.19.attn.proj.weight', 'backbone.vision_backbone.convs.3.conv_1x1.bias', 'backbone.vision_backbone.trunk.blocks.10.norm2.weight', 'backbone.vision_backbone.trunk.blocks.17.norm2.weight', 'backbone.vision_backbone.trunk.blocks.19.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.29.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.11.norm1.weight', 'backbone.vision_backbone.trunk.blocks.18.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.21.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.23.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.24.norm2.bias', 'backbone.vision_backbone.trunk.blocks.15.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.2.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.18.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.1.norm2.bias', 'backbone.vision_backbone.trunk.blocks.18.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.23.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.23.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.19.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.8.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.30.norm1.bias', 'backbone.vision_backbone.trunk.blocks.27.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.14.norm1.bias', 'backbone.vision_backbone.trunk.blocks.29.norm2.bias', 'backbone.vision_backbone.trunk.blocks.21.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.28.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.28.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.5.norm1.bias', 'backbone.vision_backbone.convs.1.conv_1x1.weight', 'backbone.vision_backbone.trunk.blocks.26.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.18.norm1.bias', 'backbone.vision_backbone.trunk.blocks.30.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.1.norm2.weight', 'backbone.vision_backbone.trunk.blocks.24.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.0.norm1.bias', 'backbone.vision_backbone.trunk.blocks.24.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.24.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.22.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.7.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.31.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.19.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.29.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.10.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.18.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.6.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.23.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.16.norm1.weight', 'backbone.vision_backbone.trunk.blocks.18.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.1.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.21.norm1.bias', 'backbone.vision_backbone.trunk.blocks.24.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.0.norm2.weight', 'backbone.vision_backbone.trunk.blocks.28.norm1.bias', 'backbone.vision_backbone.trunk.blocks.10.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.5.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.21.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.25.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.31.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.3.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.11.norm1.bias', 'backbone.vision_backbone.trunk.blocks.6.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.0.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.25.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.22.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.20.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.2.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.16.attn.qkv.bias', 'backbone.vision_backbone.trunk.ln_pre.bias', 'backbone.vision_backbone.trunk.blocks.1.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.4.norm1.bias', 'backbone.vision_backbone.trunk.blocks.17.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.7.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.25.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.25.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.2.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.3.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.24.norm1.bias', 'backbone.vision_backbone.trunk.blocks.9.norm2.bias', 'backbone.vision_backbone.trunk.blocks.27.norm2.bias', 'backbone.vision_backbone.convs.3.conv_3x3.bias', 'backbone.vision_backbone.trunk.blocks.3.norm2.bias', 'backbone.vision_backbone.trunk.blocks.19.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.14.norm1.weight', 'backbone.vision_backbone.trunk.blocks.4.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.9.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.29.attn.proj.weight', 'backbone.vision_backbone.convs.1.dconv_2x2.weight', 'backbone.vision_backbone.trunk.blocks.31.norm1.bias', 'backbone.vision_backbone.trunk.blocks.2.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.20.attn.qkv.weight', 'backbone.vision_backbone.convs.2.conv_3x3.bias', 'backbone.vision_backbone.trunk.blocks.24.norm2.weight', 'backbone.vision_backbone.trunk.blocks.2.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.31.norm2.bias', 'backbone.vision_backbone.trunk.blocks.23.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.7.norm1.bias', 'backbone.vision_backbone.convs.1.conv_1x1.bias', 'backbone.vision_backbone.convs.0.conv_1x1.weight', 'backbone.vision_backbone.trunk.blocks.3.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.9.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.15.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.21.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.16.norm1.bias', 'backbone.vision_backbone.trunk.blocks.30.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.20.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.31.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.29.norm1.weight', 'backbone.vision_backbone.trunk.blocks.9.norm1.weight', 'backbone.vision_backbone.trunk.blocks.18.norm2.bias', 'backbone.vision_backbone.trunk.blocks.20.norm1.weight', 'backbone.vision_backbone.trunk.blocks.10.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.28.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.14.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.14.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.15.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.16.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.21.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.11.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.7.norm2.weight', 'backbone.vision_backbone.trunk.blocks.25.norm2.weight', 'backbone.vision_backbone.convs.0.dconv_2x2_1.weight', 'backbone.vision_backbone.convs.0.conv_1x1.bias', 'backbone.vision_backbone.trunk.blocks.1.norm1.weight', 'backbone.vision_backbone.trunk.blocks.1.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.6.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.20.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.16.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.3.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.8.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.30.norm2.weight', 'backbone.vision_backbone.trunk.blocks.25.norm2.bias', 'backbone.vision_backbone.trunk.blocks.2.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.2.norm2.weight', 'backbone.vision_backbone.trunk.blocks.18.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.28.attn.qkv.weight', 'backbone.vision_backbone.convs.3.conv_3x3.weight', 'backbone.vision_backbone.trunk.blocks.17.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.14.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.11.attn.proj.weight', 'backbone.vision_backbone.convs.0.conv_3x3.bias', 'backbone.vision_backbone.convs.0.dconv_2x2_0.weight', 'backbone.vision_backbone.trunk.blocks.4.mlp.fc1.bias', 'backbone.vision_backbone.trunk.pos_embed', 'backbone.vision_backbone.trunk.blocks.21.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.11.norm2.weight', 'backbone.vision_backbone.trunk.blocks.15.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.6.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.13.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.22.attn.qkv.weight', 'backbone.vision_backbone.convs.2.conv_1x1.bias', 'backbone.vision_backbone.trunk.blocks.8.norm2.bias', 'backbone.vision_backbone.trunk.blocks.2.norm2.bias', 'backbone.vision_backbone.trunk.blocks.27.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.1.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.2.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.12.norm1.bias', 'backbone.vision_backbone.trunk.blocks.10.norm1.bias', 'backbone.vision_backbone.trunk.blocks.6.norm2.weight', 'backbone.vision_backbone.trunk.blocks.13.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.26.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.20.attn.qkv.bias', 'backbone.vision_backbone.convs.2.conv_3x3.weight', 'backbone.vision_backbone.trunk.blocks.16.norm2.bias', 'backbone.vision_backbone.trunk.blocks.27.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.6.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.11.norm2.bias', 'backbone.vision_backbone.trunk.blocks.13.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.9.norm2.weight', 'backbone.vision_backbone.trunk.blocks.3.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.7.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.23.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.0.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.8.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.1.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.15.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.16.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.17.norm1.bias', 'backbone.vision_backbone.convs.0.conv_3x3.weight', 'backbone.vision_backbone.trunk.blocks.6.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.3.norm1.bias', 'backbone.vision_backbone.trunk.blocks.3.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.19.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.14.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.26.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.20.norm1.bias', 'backbone.vision_backbone.trunk.blocks.19.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.24.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.26.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.9.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.10.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.26.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.0.mlp.fc1.weight', 'backbone.vision_backbone.trunk.blocks.14.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.2.norm1.weight', 'backbone.vision_backbone.trunk.blocks.14.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.31.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.12.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.14.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.12.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.11.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.7.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.0.mlp.fc2.weight', 'backbone.vision_backbone.trunk.blocks.27.norm2.weight', 'backbone.vision_backbone.trunk.blocks.19.norm2.weight', 'backbone.vision_backbone.trunk.blocks.20.attn.proj.weight', 'backbone.vision_backbone.trunk.blocks.12.norm2.bias', 'backbone.vision_backbone.trunk.blocks.7.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.18.norm2.weight', 'backbone.vision_backbone.trunk.blocks.10.attn.qkv.weight', 'backbone.vision_backbone.trunk.blocks.0.attn.qkv.bias'}
+INFO 2026-08-31 12:09:59,822 optimizer.py: 248: Matches for param_name [backbone.language_backbone.*]: {'backbone.language_backbone.encoder.token_embedding.weight', 'backbone.language_backbone.encoder.transformer.resblocks.4.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.18.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.14.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.12.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.4.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.20.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.9.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.9.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.23.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.14.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.20.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.6.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.21.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.17.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.6.attn.in_proj_bias', 'backbone.language_backbone.encoder.ln_final.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.13.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.22.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.7.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.3.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.21.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.2.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.10.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.5.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.9.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.1.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.1.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.21.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.4.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.9.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.1.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.22.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.0.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.3.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.15.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.20.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.21.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.7.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.11.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.6.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.15.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.2.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.0.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.4.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.19.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.5.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.14.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.10.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.17.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.11.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.18.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.7.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.21.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.22.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.11.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.12.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.6.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.1.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.15.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.9.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.20.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.16.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.12.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.5.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.12.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.17.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.10.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.7.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.6.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.16.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.20.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.13.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.23.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.11.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.18.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.6.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.17.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.15.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.12.ln_1.bias', 'backbone.language_backbone.encoder.ln_final.weight', 'backbone.language_backbone.encoder.transformer.resblocks.15.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.2.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.17.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.3.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.11.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.10.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.19.attn.out_proj.weight', 'backbone.language_backbone.encoder.text_projection', 'backbone.language_backbone.encoder.transformer.resblocks.19.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.1.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.19.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.16.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.15.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.1.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.16.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.21.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.20.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.0.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.17.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.23.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.10.attn.out_proj.bias', 'backbone.language_backbone.resizer.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.5.mlp.c_fc.weight', 'backbone.language_backbone.resizer.weight', 'backbone.language_backbone.encoder.transformer.resblocks.5.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.9.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.5.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.2.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.3.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.5.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.22.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.15.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.18.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.3.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.18.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.11.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.12.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.10.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.19.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.2.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.16.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.5.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.19.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.mlp.c_fc.weight', 'backbone.language_backbone.encoder.positional_embedding', 'backbone.language_backbone.encoder.transformer.resblocks.1.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.3.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.6.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.10.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.12.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.2.mlp.c_fc.weight', 'backbone.language_backbone.encoder.transformer.resblocks.11.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.4.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.mlp.c_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.22.attn.in_proj_weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.attn.out_proj.weight', 'backbone.language_backbone.encoder.transformer.resblocks.15.mlp.c_proj.weight'}
+INFO 2026-08-31 12:09:59,824 optimizer.py: 248: Matches for param_name [*bias*]: {'geometry_encoder.encode.2.cross_attn_image.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.4.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.22.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.6.norm2.bias', 'transformer.encoder.layers.0.self_attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.20.norm2.bias', 'transformer.decoder.layers.1.linear1.bias', 'backbone.vision_backbone.trunk.blocks.18.mlp.fc2.bias', 'transformer.encoder.layers.2.cross_attn_image.in_proj_bias', 'transformer.decoder.layers.5.ca_text.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.7.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.mlp.c_proj.bias', 'backbone.vision_backbone.trunk.blocks.8.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.mlp.c_proj.bias', 'transformer.decoder.layers.5.ca_text.in_proj_bias', 'transformer.decoder.layers.1.ca_text.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.10.attn.proj.bias', 'transformer.encoder.layers.2.cross_attn_image.out_proj.bias', 'transformer.decoder.boxRPB_embed_x.layers.0.bias', 'backbone.vision_backbone.trunk.blocks.27.mlp.fc2.bias', 'geometry_encoder.points_pos_enc_project.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.13.mlp.fc2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.26.mlp.fc1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.mlp.c_fc.bias', 'dot_prod_scoring.prompt_mlp.out_norm.bias', 'backbone.vision_backbone.trunk.blocks.22.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.8.norm1.bias', 'backbone.vision_backbone.trunk.blocks.13.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.13.norm2.bias', 'transformer.decoder.layers.1.self_attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.10.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.16.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.8.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.25.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.attn.in_proj_bias', 'transformer.encoder.layers.0.cross_attn_image.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.12.mlp.fc1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.14.ln_2.bias', 'geometry_encoder.encode.1.norm2.bias', 'backbone.vision_backbone.trunk.blocks.19.norm2.bias', 'backbone.vision_backbone.trunk.blocks.5.mlp.fc2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.11.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.7.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.30.norm2.bias', 'segmentation_head.pixel_decoder.conv_layers.1.bias', 'geometry_encoder.encode.2.self_attn.out_proj.bias', 'transformer.decoder.norm.bias', 'transformer.decoder.layers.1.norm1.bias', 'transformer.decoder.layers.0.norm1.bias', 'transformer.decoder.layers.3.cross_attn.in_proj_bias', 'transformer.decoder.ref_point_head.layers.0.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.17.mlp.fc1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.12.attn.qkv.bias', 'geometry_encoder.encode.0.self_attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.3.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.20.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.12.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.23.norm1.bias', 'backbone.vision_backbone.trunk.blocks.26.norm2.bias', 'geometry_encoder.encode.1.norm3.bias', 'backbone.vision_backbone.trunk.blocks.1.norm1.bias', 'backbone.vision_backbone.trunk.blocks.29.attn.proj.bias', 'transformer.decoder.layers.4.ca_text.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.15.norm1.bias', 'transformer.decoder.layers.5.linear1.bias', 'transformer.decoder.layers.4.self_attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.23.norm2.bias', 'backbone.vision_backbone.trunk.blocks.1.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.30.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.ln_1.bias', 'transformer.decoder.layers.3.norm1.bias', 'transformer.decoder.layers.4.linear2.bias', 'backbone.vision_backbone.trunk.blocks.19.norm1.bias', 'backbone.vision_backbone.trunk.blocks.27.norm1.bias', 'backbone.vision_backbone.trunk.blocks.29.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.30.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.11.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.31.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.13.norm1.bias', 'transformer.encoder.layers.5.self_attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.ln_2.bias', 'transformer.decoder.bbox_embed.layers.2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.attn.in_proj_bias', 'transformer.encoder.layers.0.self_attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.25.mlp.fc2.bias', 'transformer.decoder.layers.2.catext_norm.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.attn.out_proj.bias', 'geometry_encoder.encode.2.norm1.bias', 'backbone.vision_backbone.trunk.blocks.10.norm2.bias', 'segmentation_head.mask_predictor.mask_embed.layers.1.bias', 'backbone.vision_backbone.trunk.blocks.4.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.ln_1.bias', 'segmentation_head.pixel_decoder.norms.1.bias', 'backbone.vision_backbone.trunk.blocks.28.mlp.fc1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.ln_1.bias', 'segmentation_head.cross_attend_prompt.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.ln_1.bias', 'backbone.vision_backbone.convs.0.dconv_2x2_0.bias', 'transformer.decoder.layers.2.linear2.bias', 'backbone.vision_backbone.trunk.blocks.5.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.30.mlp.fc1.bias', 'transformer.encoder.layers.3.norm2.bias', 'backbone.vision_backbone.trunk.blocks.0.mlp.fc1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.14.ln_1.bias', 'transformer.encoder.layers.4.self_attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.27.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.8.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.24.attn.qkv.bias', 'transformer.encoder.layers.1.self_attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.6.mlp.fc2.bias', 'backbone.vision_backbone.convs.0.dconv_2x2_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.attn.out_proj.bias', 'transformer.decoder.layers.4.norm2.bias', 'dot_prod_scoring.prompt_mlp.layers.1.bias', 'backbone.vision_backbone.trunk.blocks.0.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.4.mlp.fc2.bias', 'transformer.encoder.layers.4.cross_attn_image.in_proj_bias', 'segmentation_head.pixel_decoder.norms.2.bias', 'backbone.vision_backbone.trunk.blocks.6.norm1.bias', 'transformer.decoder.layers.4.self_attn.in_proj_bias', 'transformer.encoder.layers.5.cross_attn_image.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.0.norm2.bias', 'transformer.encoder.layers.3.cross_attn_image.in_proj_bias', 'transformer.encoder.layers.2.self_attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.attn.out_proj.bias', 'transformer.encoder.layers.2.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.mlp.c_fc.bias', 'transformer.decoder.layers.5.norm2.bias', 'backbone.vision_backbone.trunk.blocks.11.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.7.attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.28.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.attn.out_proj.bias', 'transformer.decoder.layers.1.linear2.bias', 'backbone.vision_backbone.trunk.blocks.16.mlp.fc1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.mlp.c_proj.bias', 'backbone.vision_backbone.trunk.blocks.31.mlp.fc1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.attn.out_proj.bias', 'transformer.decoder.layers.2.ca_text.in_proj_bias', 'transformer.decoder.layers.4.norm1.bias', 'dot_prod_scoring.prompt_proj.bias', 'backbone.vision_backbone.trunk.blocks.26.norm1.bias', 'dot_prod_scoring.prompt_mlp.layers.0.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.28.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.29.mlp.fc2.bias', 'transformer.encoder.layers.1.norm2.bias', 'backbone.vision_backbone.trunk.blocks.26.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.3.mlp.fc2.bias', 'transformer.decoder.presence_token_head.layers.1.bias', 'geometry_encoder.encode.0.self_attn.in_proj_bias', 'transformer.decoder.layers.2.cross_attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.4.norm2.bias', 'backbone.vision_backbone.trunk.blocks.17.norm2.bias', 'geometry_encoder.encode.0.cross_attn_image.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.5.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.mlp.c_proj.bias', 'backbone.vision_backbone.trunk.blocks.9.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.ln_2.bias', 'transformer.encoder.layers.3.linear1.bias', 'geometry_encoder.encode.1.self_attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.ln_1.bias', 'transformer.decoder.layers.0.cross_attn.in_proj_bias', 'transformer.decoder.layers.0.ca_text.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.attn.in_proj_bias', 'segmentation_head.instance_seg_head.bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.mlp.c_fc.bias', 'transformer.decoder.layers.4.linear1.bias', 'backbone.vision_backbone.convs.1.dconv_2x2.bias', 'geometry_encoder.points_direct_project.bias', 'backbone.vision_backbone.convs.1.conv_3x3.bias', 'backbone.vision_backbone.trunk.blocks.2.mlp.fc1.bias', 'transformer.decoder.layers.5.linear2.bias', 'backbone.vision_backbone.trunk.blocks.17.attn.qkv.bias', 'segmentation_head.pixel_decoder.norms.0.bias', 'backbone.vision_backbone.trunk.blocks.2.norm1.bias', 'transformer.decoder.presence_token_head.layers.0.bias', 'backbone.vision_backbone.trunk.blocks.1.attn.proj.bias', 'transformer.encoder.layers.3.norm1.bias', 'transformer.encoder.layers.1.cross_attn_image.out_proj.bias', 'transformer.decoder.layers.5.norm1.bias', 'backbone.vision_backbone.trunk.blocks.29.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.7.ln_1.bias', 'geometry_encoder.encode.2.cross_attn_image.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.21.norm2.bias', 'backbone.vision_backbone.trunk.blocks.22.norm1.bias', 'transformer.decoder.bbox_embed.layers.0.bias', 'transformer.decoder.layers.4.ca_text.out_proj.bias', 'transformer.decoder.layers.1.cross_attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.17.attn.proj.bias', 'transformer.decoder.layers.5.self_attn.out_proj.bias', 'transformer.decoder.boxRPB_embed_x.layers.1.bias', 'backbone.vision_backbone.trunk.blocks.15.norm2.bias', 'transformer.encoder.layers.5.self_attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.ln_1.bias', 'transformer.encoder.layers.0.linear2.bias', 'transformer.decoder.layers.2.self_attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.8.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.9.mlp.fc1.bias', 'transformer.encoder.layers.1.linear2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.attn.out_proj.bias', 'transformer.encoder.layers.5.linear2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.10.mlp.fc1.bias', 'transformer.encoder.layers.1.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.ln_2.bias', 'transformer.decoder.layers.2.norm3.bias', 'backbone.vision_backbone.trunk.blocks.7.mlp.fc2.bias', 'transformer.decoder.layers.3.self_attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.20.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.5.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.12.mlp.fc2.bias', 'transformer.encoder.layers.2.norm3.bias', 'geometry_encoder.encode.1.norm1.bias', 'backbone.vision_backbone.trunk.blocks.9.norm1.bias', 'transformer.decoder.layers.3.linear2.bias', 'backbone.vision_backbone.trunk.blocks.0.mlp.fc2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.mlp.c_proj.bias', 'transformer.encoder.layers.3.cross_attn_image.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.mlp.c_proj.bias', 'backbone.vision_backbone.trunk.blocks.14.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.mlp.c_proj.bias', 'transformer.decoder.layers.2.self_attn.in_proj_bias', 'transformer.encoder.layers.3.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.mlp.c_proj.bias', 'backbone.vision_backbone.trunk.blocks.22.norm2.bias', 'geometry_encoder.encode.2.self_attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.27.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.11.mlp.fc1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.ln_2.bias', 'transformer.decoder.presence_token_out_norm.bias', 'transformer.encoder.layers.1.linear1.bias', 'transformer.decoder.presence_token_head.layers.2.bias', 'backbone.vision_backbone.convs.3.conv_1x1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.18.attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.19.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.29.mlp.fc1.bias', 'transformer.encoder.layers.1.cross_attn_image.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.18.mlp.fc1.bias', 'transformer.decoder.layers.1.catext_norm.bias', 'segmentation_head.cross_attend_prompt.in_proj_bias', 'transformer.encoder.layers.5.linear1.bias', 'backbone.vision_backbone.trunk.blocks.23.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.24.norm2.bias', 'transformer.decoder.layers.3.ca_text.out_proj.bias', 'transformer.decoder.layers.2.ca_text.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.15.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.18.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.1.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.mlp.c_proj.bias', 'backbone.language_backbone.encoder.ln_final.bias', 'geometry_encoder.encode.2.linear2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.23.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.mlp.c_proj.bias', 'transformer.encoder.layers.0.linear1.bias', 'transformer.encoder.layers.0.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.14.mlp.c_proj.bias', 'transformer.decoder.layers.5.self_attn.in_proj_bias', 'transformer.decoder.layers.0.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.19.attn.qkv.bias', 'transformer.decoder.layers.0.cross_attn.out_proj.bias', 'transformer.encoder.layers.0.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.30.norm1.bias', 'geometry_encoder.encode.0.cross_attn_image.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.14.norm1.bias', 'transformer.decoder.layers.2.norm1.bias', 'backbone.vision_backbone.trunk.blocks.29.norm2.bias', 'backbone.vision_backbone.trunk.blocks.21.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.28.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.mlp.c_fc.bias', 'transformer.decoder.ref_point_head.layers.1.bias', 'transformer.decoder.layers.5.norm3.bias', 'geometry_encoder.encode.2.norm2.bias', 'transformer.encoder.layers.2.linear1.bias', 'geometry_encoder.encode.0.linear1.bias', 'transformer.encoder.layers.2.norm2.bias', 'backbone.vision_backbone.trunk.blocks.28.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.5.norm1.bias', 'transformer.encoder.layers.4.norm1.bias', 'transformer.decoder.layers.0.linear1.bias', 'backbone.vision_backbone.trunk.blocks.18.norm1.bias', 'backbone.vision_backbone.trunk.blocks.30.mlp.fc2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.0.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.14.attn.out_proj.bias', 'transformer.decoder.layers.2.linear1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.7.attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.24.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.22.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.7.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.7.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.31.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.mlp.c_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.6.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.23.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.ln_2.bias', 'geometry_encoder.boxes_pos_enc_project.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.21.norm1.bias', 'backbone.vision_backbone.trunk.blocks.24.mlp.fc1.bias', 'geometry_encoder.encode.2.norm3.bias', 'backbone.vision_backbone.trunk.blocks.28.norm1.bias', 'backbone.vision_backbone.trunk.blocks.5.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.21.mlp.fc2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.25.mlp.fc1.bias', 'transformer.encoder.layers.2.self_attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.31.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.11.norm1.bias', 'backbone.vision_backbone.trunk.blocks.6.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.22.mlp.fc2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.2.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.16.attn.qkv.bias', 'backbone.vision_backbone.trunk.ln_pre.bias', 'transformer.encoder.layers.3.self_attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.4.norm1.bias', 'backbone.vision_backbone.trunk.blocks.17.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.7.attn.proj.bias', 'transformer.decoder.layers.2.cross_attn.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.25.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.25.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.2.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.attn.out_proj.bias', 'segmentation_head.semantic_seg_head.bias', 'dot_prod_scoring.hs_proj.bias', 'backbone.vision_backbone.trunk.blocks.24.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.mlp.c_proj.bias', 'transformer.encoder.layers.4.linear1.bias', 'backbone.vision_backbone.trunk.blocks.9.norm2.bias', 'backbone.vision_backbone.trunk.blocks.27.norm2.bias', 'backbone.vision_backbone.convs.3.conv_3x3.bias', 'backbone.vision_backbone.trunk.blocks.3.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.mlp.c_proj.bias', 'backbone.vision_backbone.trunk.blocks.19.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.9.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.31.norm1.bias', 'backbone.vision_backbone.convs.2.conv_3x3.bias', 'backbone.vision_backbone.trunk.blocks.31.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.7.norm1.bias', 'backbone.vision_backbone.convs.1.conv_1x1.bias', 'transformer.encoder.layers.4.linear2.bias', 'backbone.vision_backbone.trunk.blocks.15.mlp.fc2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.ln_2.bias', 'geometry_encoder.encode.1.cross_attn_image.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.16.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.mlp.c_fc.bias', 'transformer.decoder.layers.3.linear1.bias', 'backbone.vision_backbone.trunk.blocks.20.mlp.fc2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.attn.in_proj_bias', 'transformer.encoder.layers.1.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.18.norm2.bias', 'transformer.decoder.boxRPB_embed_y.layers.1.bias', 'transformer.decoder.layers.3.ca_text.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.10.mlp.fc2.bias', 'geometry_encoder.encode.0.norm2.bias', 'transformer.encoder.layers.4.cross_attn_image.out_proj.bias', 'transformer.encoder.layers.4.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.mlp.c_proj.bias', 'transformer.decoder.layers.1.norm3.bias', 'transformer.decoder.layers.3.norm3.bias', 'backbone.vision_backbone.trunk.blocks.15.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.ln_2.bias', 'geometry_encoder.boxes_direct_project.bias', 'backbone.language_backbone.encoder.transformer.resblocks.14.mlp.c_fc.bias', 'transformer.decoder.layers.5.catext_norm.bias', 'geometry_encoder.encode.1.linear2.bias', 'geometry_encoder.encode.1.cross_attn_image.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.attn.in_proj_bias', 'geometry_encoder.encode.0.linear2.bias', 'backbone.vision_backbone.trunk.blocks.21.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.ln_2.bias', 'backbone.vision_backbone.convs.0.conv_1x1.bias', 'backbone.vision_backbone.trunk.blocks.1.mlp.fc1.bias', 'transformer.decoder.layers.5.cross_attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.3.mlp.fc1.bias', 'transformer.encoder.layers.2.linear2.bias', 'geometry_encoder.norm.bias', 'backbone.vision_backbone.trunk.blocks.25.norm2.bias', 'transformer.decoder.layers.1.ca_text.out_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.mlp.c_proj.bias', 'transformer.decoder.layers.5.cross_attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.18.attn.proj.bias', 'transformer.encoder.layers.5.norm2.bias', 'transformer.decoder.layers.1.norm2.bias', 'transformer.encoder.layers.1.self_attn.in_proj_bias', 'transformer.encoder.layers.5.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.mlp.c_fc.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.14.attn.qkv.bias', 'transformer.encoder.layers.4.norm2.bias', 'backbone.vision_backbone.convs.0.conv_3x3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.attn.in_proj_bias', 'transformer.decoder.layers.4.catext_norm.bias', 'backbone.vision_backbone.trunk.blocks.4.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.21.mlp.fc1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.attn.out_proj.bias', 'transformer.decoder.layers.3.cross_attn.out_proj.bias', 'geometry_encoder.encode_norm.bias', 'backbone.vision_backbone.trunk.blocks.6.attn.qkv.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.mlp.c_proj.bias', 'transformer.encoder.layers.0.cross_attn_image.out_proj.bias', 'backbone.vision_backbone.convs.2.conv_1x1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.attn.in_proj_bias', 'transformer.decoder.layers.2.norm2.bias', 'backbone.vision_backbone.trunk.blocks.8.norm2.bias', 'geometry_encoder.encode.1.linear1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.2.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.27.mlp.fc1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.1.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.2.attn.proj.bias', 'geometry_encoder.boxes_pool_project.bias', 'backbone.vision_backbone.trunk.blocks.12.norm1.bias', 'transformer.encoder.layers.5.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.attn.out_proj.bias', 'transformer.encoder.layers.3.self_attn.out_proj.bias', 'transformer.decoder.layers.4.cross_attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.10.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.mlp.c_proj.bias', 'transformer.decoder.layers.3.catext_norm.bias', 'backbone.vision_backbone.trunk.blocks.13.attn.qkv.bias', 'backbone.vision_backbone.trunk.blocks.20.attn.qkv.bias', 'segmentation_head.pixel_decoder.conv_layers.2.bias', 'backbone.vision_backbone.trunk.blocks.16.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.ln_2.bias', 'transformer.decoder.layers.0.ca_text.in_proj_bias', 'transformer.decoder.layers.0.catext_norm.bias', 'transformer.decoder.layers.0.self_attn.out_proj.bias', 'transformer.encoder.layers.4.self_attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.ln_2.bias', 'transformer.decoder.layers.0.norm2.bias', 'segmentation_head.cross_attn_norm.bias', 'backbone.language_backbone.encoder.transformer.resblocks.17.mlp.c_fc.bias', 'backbone.vision_backbone.trunk.blocks.11.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.ln_1.bias', 'transformer.decoder.layers.1.self_attn.in_proj_bias', 'transformer.decoder.layers.1.cross_attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.13.attn.proj.bias', 'transformer.decoder.layers.3.self_attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.23.mlp.fc2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.8.mlp.c_proj.bias', 'transformer.decoder.bbox_embed.layers.1.bias', 'segmentation_head.mask_predictor.mask_embed.layers.2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.attn.out_proj.bias', 'geometry_encoder.encode.0.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.attn.out_proj.bias', 'backbone.language_backbone.resizer.bias', 'geometry_encoder.img_pre_norm.bias', 'backbone.vision_backbone.trunk.blocks.15.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.16.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.17.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.9.mlp.c_fc.bias', 'geometry_encoder.encode.0.norm3.bias', 'geometry_encoder.encode.2.linear1.bias', 'transformer.encoder.layers.3.linear2.bias', 'backbone.vision_backbone.trunk.blocks.3.norm1.bias', 'geometry_encoder.encode.1.self_attn.out_proj.bias', 'backbone.vision_backbone.trunk.blocks.3.attn.proj.bias', 'backbone.vision_backbone.trunk.blocks.19.mlp.fc1.bias', 'transformer.decoder.layers.4.norm3.bias', 'backbone.vision_backbone.trunk.blocks.14.mlp.fc1.bias', 'backbone.vision_backbone.trunk.blocks.26.mlp.fc2.bias', 'segmentation_head.pixel_decoder.conv_layers.0.bias', 'transformer.encoder.layers.5.cross_attn_image.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.20.norm1.bias', 'transformer.decoder.layers.0.linear2.bias', 'transformer.encoder.layers.0.norm2.bias', 'backbone.vision_backbone.trunk.blocks.24.mlp.fc2.bias', 'geometry_encoder.final_proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.ln_2.bias', 'transformer.decoder.layers.3.norm2.bias', 'backbone.vision_backbone.trunk.blocks.9.mlp.fc2.bias', 'backbone.vision_backbone.trunk.blocks.26.attn.proj.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.14.attn.proj.bias', 'geometry_encoder.points_pool_project.bias', 'backbone.vision_backbone.trunk.blocks.14.mlp.fc2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.attn.out_proj.bias', 'transformer.decoder.layers.4.cross_attn.in_proj_bias', 'backbone.language_backbone.encoder.transformer.resblocks.14.attn.in_proj_bias', 'transformer.decoder.boxRPB_embed_y.layers.0.bias', 'segmentation_head.mask_predictor.mask_embed.layers.0.bias', 'backbone.language_backbone.encoder.transformer.resblocks.7.mlp.c_proj.bias', 'backbone.vision_backbone.trunk.blocks.12.norm2.bias', 'backbone.vision_backbone.trunk.blocks.7.mlp.fc1.bias', 'transformer.decoder.layers.0.self_attn.in_proj_bias', 'backbone.vision_backbone.trunk.blocks.0.attn.qkv.bias'}
+INFO 2026-08-31 12:09:59,825 optimizer.py: 219: Matches for module_cls_name [torch.nn.LayerNorm]: {'backbone.vision_backbone.trunk.blocks.6.norm2.bias', 'backbone.vision_backbone.trunk.blocks.8.norm2.weight', 'backbone.vision_backbone.trunk.blocks.16.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.20.ln_1.weight', 'backbone.vision_backbone.trunk.blocks.20.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.7.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.ln_1.weight', 'backbone.vision_backbone.trunk.blocks.15.norm2.weight', 'transformer.decoder.layers.4.norm3.weight', 'backbone.vision_backbone.trunk.blocks.14.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.13.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.21.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.1.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.ln_1.weight', 'segmentation_head.cross_attn_norm.weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.ln_2.weight', 'backbone.vision_backbone.trunk.blocks.28.norm2.weight', 'backbone.vision_backbone.trunk.blocks.30.norm1.weight', 'backbone.vision_backbone.trunk.blocks.13.norm2.weight', 'dot_prod_scoring.prompt_mlp.out_norm.bias', 'backbone.vision_backbone.trunk.blocks.10.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.9.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.8.norm1.bias', 'backbone.vision_backbone.trunk.blocks.13.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.16.ln_2.weight', 'backbone.vision_backbone.trunk.blocks.20.norm2.weight', 'backbone.vision_backbone.trunk.blocks.4.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.18.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.17.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.5.norm2.weight', 'backbone.vision_backbone.trunk.blocks.25.norm1.bias', 'backbone.vision_backbone.trunk.ln_pre.weight', 'transformer.encoder.layers.3.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.22.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.18.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.13.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.5.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.ln_2.bias', 'geometry_encoder.encode.1.norm2.bias', 'backbone.vision_backbone.trunk.blocks.19.norm2.bias', 'dot_prod_scoring.prompt_mlp.out_norm.weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.30.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.ln_1.weight', 'transformer.decoder.layers.3.norm1.weight', 'transformer.decoder.layers.0.norm1.weight', 'transformer.decoder.norm.bias', 'transformer.decoder.layers.1.norm1.bias', 'transformer.decoder.layers.0.norm1.bias', 'transformer.decoder.layers.0.catext_norm.weight', 'backbone.vision_backbone.trunk.blocks.23.norm1.bias', 'backbone.vision_backbone.trunk.blocks.26.norm2.bias', 'geometry_encoder.encode.1.norm3.bias', 'backbone.vision_backbone.trunk.blocks.0.norm1.weight', 'backbone.vision_backbone.trunk.blocks.1.norm1.bias', 'transformer.encoder.layers.1.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.11.ln_2.weight', 'backbone.vision_backbone.trunk.blocks.15.norm1.bias', 'backbone.vision_backbone.trunk.blocks.23.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.23.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.1.ln_1.weight', 'transformer.decoder.layers.3.norm1.bias', 'backbone.vision_backbone.trunk.blocks.31.norm2.weight', 'backbone.vision_backbone.trunk.blocks.19.norm1.bias', 'backbone.vision_backbone.trunk.blocks.27.norm1.bias', 'backbone.vision_backbone.trunk.blocks.23.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.21.ln_2.weight', 'backbone.vision_backbone.trunk.blocks.13.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.3.norm2.weight', 'transformer.decoder.layers.1.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.18.ln_2.bias', 'transformer.decoder.layers.2.catext_norm.bias', 'backbone.language_backbone.encoder.transformer.resblocks.10.ln_2.weight', 'geometry_encoder.encode.2.norm1.bias', 'backbone.vision_backbone.trunk.blocks.10.norm2.bias', 'backbone.vision_backbone.trunk.blocks.24.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.19.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.31.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.19.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.21.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.10.ln_1.bias', 'transformer.encoder.layers.4.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.17.ln_2.weight', 'transformer.encoder.layers.3.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.14.ln_1.bias', 'geometry_encoder.norm.weight', 'transformer.decoder.layers.1.norm3.weight', 'backbone.vision_backbone.trunk.blocks.8.norm1.weight', 'backbone.vision_backbone.trunk.blocks.26.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.9.ln_2.weight', 'transformer.decoder.layers.4.norm2.bias', 'transformer.encoder.layers.5.norm3.weight', 'geometry_encoder.encode.2.norm1.weight', 'backbone.vision_backbone.trunk.blocks.6.norm1.bias', 'transformer.decoder.presence_token_out_norm.weight', 'backbone.vision_backbone.trunk.blocks.0.norm2.bias', 'backbone.vision_backbone.trunk.blocks.21.norm1.weight', 'backbone.vision_backbone.trunk.blocks.15.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.4.ln_2.weight', 'transformer.encoder.layers.2.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.0.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.1.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.9.ln_1.weight', 'transformer.decoder.layers.5.norm2.bias', 'backbone.vision_backbone.trunk.blocks.28.norm1.weight', 'backbone.vision_backbone.trunk.blocks.28.norm2.bias', 'backbone.vision_backbone.trunk.blocks.4.norm1.weight', 'geometry_encoder.encode.1.norm2.weight', 'transformer.decoder.layers.4.norm1.bias', 'backbone.vision_backbone.trunk.blocks.25.norm1.weight', 'transformer.decoder.layers.4.norm1.weight', 'backbone.vision_backbone.trunk.blocks.26.norm1.bias', 'transformer.encoder.layers.1.norm2.bias', 'backbone.vision_backbone.trunk.blocks.17.norm1.weight', 'backbone.vision_backbone.trunk.blocks.4.norm2.bias', 'backbone.vision_backbone.trunk.blocks.17.norm2.bias', 'backbone.vision_backbone.trunk.blocks.27.norm1.weight', 'backbone.vision_backbone.trunk.blocks.5.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.ln_2.weight', 'backbone.vision_backbone.trunk.blocks.6.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.1.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.ln_1.bias', 'transformer.encoder.layers.0.norm1.weight', 'backbone.vision_backbone.trunk.blocks.7.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.ln_2.weight', 'transformer.decoder.layers.2.norm3.weight', 'backbone.vision_backbone.trunk.blocks.23.norm2.weight', 'backbone.vision_backbone.trunk.blocks.19.norm1.weight', 'backbone.vision_backbone.trunk.blocks.2.norm1.bias', 'transformer.encoder.layers.3.norm1.bias', 'transformer.decoder.layers.5.norm1.bias', 'backbone.vision_backbone.trunk.blocks.29.norm1.bias', 'geometry_encoder.encode.2.norm3.weight', 'backbone.language_backbone.encoder.transformer.resblocks.7.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.21.norm2.bias', 'backbone.vision_backbone.trunk.blocks.22.norm1.bias', 'backbone.vision_backbone.trunk.blocks.15.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.ln_2.weight', 'backbone.vision_backbone.trunk.blocks.13.norm1.weight', 'backbone.vision_backbone.trunk.blocks.22.norm1.weight', 'backbone.vision_backbone.trunk.blocks.29.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.0.ln_2.bias', 'transformer.encoder.layers.1.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.23.ln_2.bias', 'transformer.decoder.layers.2.norm3.bias', 'transformer.encoder.layers.0.norm3.weight', 'backbone.vision_backbone.trunk.blocks.12.norm1.weight', 'geometry_encoder.encode.0.norm1.weight', 'backbone.vision_backbone.trunk.blocks.18.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.2.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.ln_1.weight', 'transformer.encoder.layers.2.norm3.bias', 'backbone.vision_backbone.trunk.blocks.26.norm1.weight', 'geometry_encoder.encode.1.norm1.bias', 'backbone.vision_backbone.trunk.blocks.9.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.ln_1.weight', 'backbone.vision_backbone.trunk.blocks.14.norm2.bias', 'backbone.vision_backbone.trunk.blocks.12.norm2.weight', 'transformer.encoder.layers.3.norm3.bias', 'backbone.vision_backbone.trunk.blocks.22.norm2.bias', 'geometry_encoder.encode.2.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.18.ln_1.weight', 'transformer.decoder.layers.1.norm1.weight', 'backbone.vision_backbone.trunk.blocks.22.norm2.weight', 'transformer.encoder.layers.0.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.3.ln_1.bias', 'transformer.decoder.layers.0.norm2.weight', 'backbone.vision_backbone.trunk.blocks.3.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.ln_2.bias', 'transformer.decoder.presence_token_out_norm.bias', 'transformer.encoder.layers.1.norm3.weight', 'backbone.vision_backbone.trunk.blocks.10.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.4.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.17.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.0.ln_1.bias', 'geometry_encoder.encode.0.norm2.weight', 'transformer.decoder.layers.5.norm3.weight', 'transformer.encoder.layers.5.norm1.weight', 'backbone.vision_backbone.trunk.blocks.11.norm1.weight', 'transformer.decoder.layers.1.catext_norm.bias', 'backbone.vision_backbone.trunk.blocks.24.norm2.bias', 'transformer.encoder.layers.3.norm2.weight', 'backbone.vision_backbone.trunk.blocks.1.norm2.bias', 'backbone.language_backbone.encoder.ln_final.bias', 'backbone.language_backbone.encoder.transformer.resblocks.22.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.3.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.ln_1.bias', 'transformer.encoder.layers.0.norm3.bias', 'transformer.decoder.layers.0.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.ln_1.weight', 'transformer.encoder.layers.0.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.15.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.30.norm1.bias', 'backbone.vision_backbone.trunk.blocks.14.norm1.bias', 'transformer.decoder.layers.2.norm1.bias', 'backbone.vision_backbone.trunk.blocks.29.norm2.bias', 'transformer.decoder.layers.5.norm3.bias', 'geometry_encoder.encode.2.norm2.bias', 'transformer.encoder.layers.2.norm2.bias', 'backbone.vision_backbone.trunk.blocks.5.norm1.bias', 'transformer.encoder.layers.4.norm1.bias', 'backbone.vision_backbone.trunk.blocks.18.norm1.bias', 'backbone.vision_backbone.trunk.blocks.1.norm2.weight', 'backbone.vision_backbone.trunk.blocks.0.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.ln_2.bias', 'geometry_encoder.encode.0.norm3.weight', 'backbone.language_backbone.encoder.transformer.resblocks.4.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.12.ln_2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.20.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.16.norm1.weight', 'backbone.vision_backbone.trunk.blocks.21.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.ln_1.weight', 'backbone.vision_backbone.trunk.blocks.0.norm2.weight', 'backbone.vision_backbone.trunk.blocks.28.norm1.bias', 'geometry_encoder.encode.2.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.11.norm1.bias', 'geometry_encoder.img_pre_norm.weight', 'backbone.vision_backbone.trunk.ln_pre.bias', 'backbone.vision_backbone.trunk.blocks.4.norm1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.2.ln_2.weight', 'transformer.decoder.layers.5.norm1.weight', 'transformer.decoder.layers.5.catext_norm.weight', 'backbone.vision_backbone.trunk.blocks.24.norm1.bias', 'backbone.vision_backbone.trunk.blocks.9.norm2.bias', 'backbone.vision_backbone.trunk.blocks.27.norm2.bias', 'backbone.vision_backbone.trunk.blocks.3.norm2.bias', 'backbone.vision_backbone.trunk.blocks.14.norm1.weight', 'backbone.vision_backbone.trunk.blocks.31.norm1.bias', 'backbone.vision_backbone.trunk.blocks.24.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.20.ln_2.weight', 'backbone.vision_backbone.trunk.blocks.31.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.4.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.7.norm1.bias', 'transformer.decoder.layers.3.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.10.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.16.norm1.bias', 'transformer.encoder.layers.2.norm2.weight', 'transformer.encoder.layers.1.norm1.bias', 'backbone.vision_backbone.trunk.blocks.29.norm1.weight', 'backbone.vision_backbone.trunk.blocks.9.norm1.weight', 'backbone.vision_backbone.trunk.blocks.18.norm2.bias', 'backbone.vision_backbone.trunk.blocks.20.norm1.weight', 'geometry_encoder.encode.0.norm2.bias', 'transformer.encoder.layers.4.norm3.bias', 'transformer.decoder.layers.1.norm3.bias', 'transformer.decoder.layers.3.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.21.ln_2.bias', 'transformer.decoder.layers.5.catext_norm.bias', 'backbone.language_backbone.encoder.transformer.resblocks.16.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.13.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.ln_1.weight', 'transformer.decoder.layers.0.norm3.weight', 'backbone.vision_backbone.trunk.blocks.7.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.9.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.25.norm2.weight', 'backbone.vision_backbone.trunk.blocks.1.norm1.weight', 'geometry_encoder.norm.bias', 'backbone.vision_backbone.trunk.blocks.30.norm2.weight', 'backbone.vision_backbone.trunk.blocks.25.norm2.bias', 'transformer.decoder.layers.1.catext_norm.weight', 'backbone.vision_backbone.trunk.blocks.2.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.21.ln_1.bias', 'transformer.encoder.layers.5.norm2.bias', 'transformer.decoder.layers.1.norm2.bias', 'transformer.encoder.layers.5.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.15.ln_1.bias', 'transformer.encoder.layers.4.norm2.weight', 'transformer.encoder.layers.4.norm2.bias', 'transformer.decoder.layers.4.catext_norm.bias', 'transformer.decoder.layers.3.catext_norm.weight', 'backbone.vision_backbone.trunk.blocks.11.norm2.weight', 'geometry_encoder.encode_norm.bias', 'transformer.decoder.layers.5.norm2.weight', 'geometry_encoder.encode.1.norm1.weight', 'transformer.decoder.layers.2.norm2.bias', 'backbone.vision_backbone.trunk.blocks.8.norm2.bias', 'geometry_encoder.encode.1.norm3.weight', 'transformer.encoder.layers.1.norm2.weight', 'transformer.encoder.layers.2.norm1.weight', 'backbone.vision_backbone.trunk.blocks.2.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.ln_2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.17.ln_1.bias', 'backbone.vision_backbone.trunk.blocks.12.norm1.bias', 'transformer.encoder.layers.5.norm1.bias', 'transformer.decoder.layers.2.norm1.weight', 'backbone.vision_backbone.trunk.blocks.10.norm1.bias', 'transformer.decoder.layers.3.catext_norm.bias', 'backbone.vision_backbone.trunk.blocks.6.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.11.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.14.ln_2.weight', 'transformer.decoder.norm.weight', 'backbone.vision_backbone.trunk.blocks.16.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.11.ln_1.bias', 'backbone.language_backbone.encoder.transformer.resblocks.19.ln_2.bias', 'transformer.decoder.layers.0.catext_norm.bias', 'backbone.language_backbone.encoder.transformer.resblocks.6.ln_2.bias', 'transformer.decoder.layers.0.norm2.bias', 'segmentation_head.cross_attn_norm.bias', 'transformer.encoder.layers.2.norm3.weight', 'transformer.decoder.layers.4.catext_norm.weight', 'backbone.vision_backbone.trunk.blocks.11.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.12.ln_1.bias', 'backbone.language_backbone.encoder.ln_final.weight', 'backbone.vision_backbone.trunk.blocks.9.norm2.weight', 'transformer.encoder.layers.3.norm3.weight', 'backbone.language_backbone.encoder.transformer.resblocks.17.ln_1.weight', 'geometry_encoder.encode_norm.weight', 'backbone.language_backbone.encoder.transformer.resblocks.16.ln_1.bias', 'transformer.encoder.layers.5.norm2.weight', 'geometry_encoder.encode.0.norm1.bias', 'transformer.decoder.layers.3.norm3.weight', 'backbone.language_backbone.encoder.transformer.resblocks.8.ln_1.weight', 'transformer.decoder.layers.2.catext_norm.weight', 'geometry_encoder.img_pre_norm.bias', 'backbone.vision_backbone.trunk.blocks.17.norm1.bias', 'geometry_encoder.encode.0.norm3.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.ln_2.weight', 'transformer.decoder.layers.4.norm2.weight', 'backbone.vision_backbone.trunk.blocks.3.norm1.bias', 'transformer.decoder.layers.4.norm3.bias', 'backbone.vision_backbone.trunk.blocks.20.norm1.bias', 'transformer.encoder.layers.0.norm2.bias', 'transformer.decoder.layers.2.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.20.ln_2.bias', 'transformer.decoder.layers.3.norm2.bias', 'backbone.language_backbone.encoder.transformer.resblocks.5.ln_2.bias', 'backbone.vision_backbone.trunk.blocks.2.norm1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.6.ln_1.weight', 'backbone.language_backbone.encoder.transformer.resblocks.0.ln_2.weight', 'backbone.vision_backbone.trunk.blocks.27.norm2.weight', 'backbone.language_backbone.encoder.transformer.resblocks.6.ln_2.weight', 'backbone.vision_backbone.trunk.blocks.19.norm2.weight', 'transformer.encoder.layers.4.norm3.weight', 'backbone.vision_backbone.trunk.blocks.12.norm2.bias', 'backbone.vision_backbone.trunk.blocks.18.norm2.weight'} 
+Windows fatal exception: access violation
+
+Thread 0x00007e48 (most recent call first):
+  File "C:\Users\umair_tariq\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 338 in wait
+  File "C:\Users\umair_tariq\AppData\Local\Programs\Python\Python312\Lib\queue.py", line 180 in get
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3-finetune-env\Lib\site-packages\tensorboard\summary\writer\event_file_writer.py", line 269 in _run
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3-finetune-env\Lib\site-packages\tensorboard\summary\writer\event_file_writer.py", line 244 in run
+  File "C:\Users\umair_tariq\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1052 in _bootstrap_inner
+  File "C:\Users\umair_tariq\AppData\Local\Programs\Python\Python312\Lib\threading.py", line 1009 in _bootstrap
+
+Current thread 0x000085c0 (most recent call first):
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3-finetune-env\Lib\site-packages\torch\distributed\distributed_c10d.py", line 3068 in all_reduce
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3-finetune-env\Lib\site-packages\torch\distributed\c10d_logger.py", line 83 in wrapper
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\loss\sam3_loss.py", line 75 in _get_num_boxes
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\loss\sam3_loss.py", line 84 in compute_loss
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\loss\sam3_loss.py", line 173 in forward
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3-finetune-env\Lib\site-packages\torch\nn\modules\module.py", line 1790 in _call_impl
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3-finetune-env\Lib\site-packages\torch\nn\modules\module.py", line 1779 in _wrapped_call_impl
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\trainer.py", line 515 in _step
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\trainer.py", line 961 in _run_step
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\trainer.py", line 818 in train_epoch
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\trainer.py", line 597 in run_train
+  File "C:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\trainer.py", line 576 in run
+  File "c:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\train.py", line 58 in single_proc_run
+  File "c:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\train.py", line 71 in single_node_runner
+  File "c:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\train.py", line 310 in main
+  File "c:\Users\umair_tariq\Downloads\Downloads\seismic_prototype\sam3\sam3\train\train.py", line 339 in <module>

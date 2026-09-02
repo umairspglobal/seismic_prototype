@@ -1,0 +1,5 @@
+# Extra dependencies for the fine-tuning scripts in this folder, on top of
+# the main project's requirements.txt (numpy/pillow/torch/transformers are
+# already covered there).
+pycocotools
+tensorboard

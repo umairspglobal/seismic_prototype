@@ -70,6 +70,12 @@ IDs from 6 upward. Use ParaView's Threshold filter per label ID.
 | CLI | [seismic_app/cli.py](seismic_app/cli.py) |
 | Streamlit viewer (tabs: automatic + point picking) | [app.py](app.py) |
 
+## Fine-tuning SAM 3
+
+This build runs SAM 3 zero-shot. To fine-tune on your own labeled data (and
+plug the result back in as a one-line checkpoint swap), see
+[finetuning/README.md](finetuning/README.md).
+
 ## Setup
 
 ```powershell

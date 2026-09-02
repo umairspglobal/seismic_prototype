@@ -1,0 +1,102 @@
+# @package _global_
+#
+# Phase 2 snippet - NOT a full config. Copy seismic_facies_phase1.yaml to
+# seismic_facies_phase2.yaml, keep everything else identical, and apply the
+# overrides below: unfreeze the *last 8 of the 32* ViT encoder blocks
+# (blocks 24-31; the ViT trunk depth=32 is set in sam3/model_builder.py's
+# _create_vit_backbone). Text encoder stays frozen.
+#
+# VERIFY before running: confirm the block attribute name in your installed
+# sam3 checkout with:
+#   grep -n "self.blocks" <SAM3_REPO_CHECKOUT>/sam3/model/vitdet.py
+# The pattern below assumes `backbone.vision_backbone.trunk.blocks.<N>.*`,
+# consistent with `apply_to: 'backbone.vision_backbone.trunk'` used by
+# layer_decay_param_modifier in the base config.
+# ============================================================================
+
+paths:
+  experiment_log_dir: <PATH_TO_LOG_DIR>/seismic_facies_phase2
+  # Start from Phase 1's final weights, not the original pretrained checkpoint.
+  # Phase 1 always writes a rolling checkpoints/checkpoint.pt (verified in
+  # sam3/train/trainer.py's save_checkpoint) - use the highest-numbered
+  # checkpoints/checkpoint_<epoch>.pt instead if you want a specific earlier
+  # epoch (e.g. picked by eyeballing val loss in TensorBoard).
+  init_checkpoint: <PATH_TO_phase1_experiment_log_dir>/checkpoints/checkpoint.pt
+
+scratch:
+  max_data_epochs: 20
+  lr_vision_backbone: 2.5e-5   # was 0.0 in Phase 1 - small, since only 8/32 blocks unfreeze
+  scheduler_timescale: 10
+  scheduler_warmup: 2
+  scheduler_cooldown: 10
+
+trainer:
+  max_epochs: 20
+
+  optim:
+    options:
+      lr:
+        - scheduler:  # decoder / transformer - unchanged from Phase 1
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: ${scratch.lr_transformer}
+            timescale: ${scratch.scheduler_timescale}
+            warmup_steps: ${scratch.scheduler_warmup}
+            cooldown_steps: ${scratch.scheduler_cooldown}
+        - scheduler:  # frozen vision blocks 0-23 (still lr 0)
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: 0.0
+            timescale: ${scratch.scheduler_timescale}
+            warmup_steps: ${scratch.scheduler_warmup}
+            cooldown_steps: ${scratch.scheduler_cooldown}
+          param_names:
+            - 'backbone.vision_backbone.trunk.blocks.0.*'
+            - 'backbone.vision_backbone.trunk.blocks.1.*'
+            - 'backbone.vision_backbone.trunk.blocks.2.*'
+            - 'backbone.vision_backbone.trunk.blocks.3.*'
+            - 'backbone.vision_backbone.trunk.blocks.4.*'
+            - 'backbone.vision_backbone.trunk.blocks.5.*'
+            - 'backbone.vision_backbone.trunk.blocks.6.*'
+            - 'backbone.vision_backbone.trunk.blocks.7.*'
+            - 'backbone.vision_backbone.trunk.blocks.8.*'
+            - 'backbone.vision_backbone.trunk.blocks.9.*'
+            - 'backbone.vision_backbone.trunk.blocks.10.*'
+            - 'backbone.vision_backbone.trunk.blocks.11.*'
+            - 'backbone.vision_backbone.trunk.blocks.12.*'
+            - 'backbone.vision_backbone.trunk.blocks.13.*'
+            - 'backbone.vision_backbone.trunk.blocks.14.*'
+            - 'backbone.vision_backbone.trunk.blocks.15.*'
+            - 'backbone.vision_backbone.trunk.blocks.16.*'
+            - 'backbone.vision_backbone.trunk.blocks.17.*'
+            - 'backbone.vision_backbone.trunk.blocks.18.*'
+            - 'backbone.vision_backbone.trunk.blocks.19.*'
+            - 'backbone.vision_backbone.trunk.blocks.20.*'
+            - 'backbone.vision_backbone.trunk.blocks.21.*'
+            - 'backbone.vision_backbone.trunk.blocks.22.*'
+            - 'backbone.vision_backbone.trunk.blocks.23.*'
+        - scheduler:  # unfrozen vision blocks 24-31 (last 8 of 32)
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: ${scratch.lr_vision_backbone}
+            timescale: ${scratch.scheduler_timescale}
+            warmup_steps: ${scratch.scheduler_warmup}
+            cooldown_steps: ${scratch.scheduler_cooldown}
+          param_names:
+            - 'backbone.vision_backbone.trunk.blocks.24.*'
+            - 'backbone.vision_backbone.trunk.blocks.25.*'
+            - 'backbone.vision_backbone.trunk.blocks.26.*'
+            - 'backbone.vision_backbone.trunk.blocks.27.*'
+            - 'backbone.vision_backbone.trunk.blocks.28.*'
+            - 'backbone.vision_backbone.trunk.blocks.29.*'
+            - 'backbone.vision_backbone.trunk.blocks.30.*'
+            - 'backbone.vision_backbone.trunk.blocks.31.*'
+        - scheduler:  # text/language backbone - stays frozen in Phase 2 too
+            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
+            base_lr: 0.0
+            timescale: ${scratch.scheduler_timescale}
+            warmup_steps: ${scratch.scheduler_warmup}
+            cooldown_steps: ${scratch.scheduler_cooldown}
+          param_names:
+            - 'backbone.language_backbone.*'
+
+# Phase 3 (mentioned in finetuning/README.md) is the same pattern with the
+# "frozen 0-23 / unfrozen 24-31" list above replaced by "frozen 0-15 /
+# unfrozen 16-31" (last 16 of 32) and a slightly higher lr_vision_backbone.
