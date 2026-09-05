@@ -16,6 +16,13 @@ export interface ModelInfo {
   gated: boolean;
 }
 
+export interface TextCheckpointInfo {
+  id: string;
+  label: string;
+  path: string;
+  source: "official" | "local" | "env";
+}
+
 export interface Point {
   col: number;
   row: number;
@@ -126,6 +133,9 @@ export interface RuntimeInfo {
     torch: string;
     transformers: string | null;
   };
+  text_checkpoint: string;
+  available_text_checkpoints: TextCheckpointInfo[];
+  text_detector_loaded: boolean;
 }
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "http://127.0.0.1:8000";
@@ -206,6 +216,16 @@ export async function setModel(
   );
 }
 
+export async function setTextCheckpoint(
+  checkpoint: string,
+): Promise<{ checkpoint: string; label: string; loaded: boolean }> {
+  return postJson(
+    "/api/text-checkpoint",
+    { checkpoint },
+    "Failed to switch fine-tuned checkpoint",
+  );
+}
+
 export function sliceUrl(file: string, axis: Axis, index: number): string {
   const params = new URLSearchParams({ file, axis, index: String(index) });
   return apiUrl(`/api/slice?${params}`);
@@ -225,6 +245,20 @@ export async function prepareSlice(
     const detail = await res.text();
     throw new Error(detail || `Prepare failed: ${res.status}`);
   }
+}
+
+export async function autoSegment(
+  file: string,
+  axis: Axis,
+  index: number,
+  signal?: AbortSignal,
+): Promise<SegmentResult & { prompt: string; checkpoint: string; unloaded_tracker: boolean }> {
+  return postJson(
+    "/api/auto-segment",
+    { file, axis, index },
+    "Facies detection failed",
+    signal,
+  );
 }
 
 export async function segment(

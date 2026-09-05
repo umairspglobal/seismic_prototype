@@ -4,10 +4,10 @@ outputs/
 # Seismic data (large binary files - keep local only)
 data/
 
-# Fine-tuning working files
+# Fine-tuning working files (regenerated on each machine / run)
 finetune_data/
 finetuned_checkpoints/
-finetune_logs/seismic_facies_phase1/checkpoints/checkpoint.pt
+finetune_logs/
 sam3-finetune-env/
 sam3/
 

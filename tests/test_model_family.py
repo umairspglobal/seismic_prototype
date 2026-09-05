@@ -40,6 +40,61 @@ def test_sam2_checkpoint_is_the_improved_hiera_large():
     assert config.family_spec("sam3")["gated"] is True
 
 
+@pytest.fixture(autouse=True)
+def _reset_text_checkpoint_override():
+    config._TEXT_CHECKPOINT_OVERRIDE = None
+    yield
+    config._TEXT_CHECKPOINT_OVERRIDE = None
+
+
+def test_text_checkpoint_falls_back_to_stock_sam3(monkeypatch, tmp_path):
+    monkeypatch.delenv("SAM3_TEXT_CHECKPOINT", raising=False)
+    monkeypatch.setattr(config, "DEFAULT_TEXT_CHECKPOINT_DIR", tmp_path / "missing")
+    assert config.text_checkpoint() == "facebook/sam3"
+
+
+def test_text_checkpoint_env_override(monkeypatch):
+    monkeypatch.setenv("SAM3_TEXT_CHECKPOINT", r"C:\weights\facies")
+    assert config.text_checkpoint() == r"C:\weights\facies"
+
+
+def test_text_checkpoint_local_converted_dir(monkeypatch, tmp_path):
+    monkeypatch.delenv("SAM3_TEXT_CHECKPOINT", raising=False)
+    (tmp_path / "config.json").write_text("{}")
+    monkeypatch.setattr(config, "DEFAULT_TEXT_CHECKPOINT_DIR", tmp_path)
+    assert config.text_checkpoint() == str(tmp_path)
+
+
+def test_list_text_checkpoints_includes_official_and_converted(monkeypatch, tmp_path):
+    monkeypatch.delenv("SAM3_TEXT_CHECKPOINT", raising=False)
+    (tmp_path / "run_a").mkdir()
+    (tmp_path / "run_a" / "config.json").write_text("{}")
+    (tmp_path / "notes.txt").write_text("ignore")
+    (tmp_path / "incomplete").mkdir()
+    monkeypatch.setattr(config, "FINETUNED_CHECKPOINTS_DIR", tmp_path)
+    listed = config.list_text_checkpoints()
+    assert listed[0]["path"] == "facebook/sam3"
+    assert listed[0]["source"] == "official"
+    local = [item for item in listed if item["source"] == "local"]
+    assert [item["id"] for item in local] == ["run_a"]
+    assert local[0]["path"] == str(tmp_path / "run_a")
+
+
+def test_set_text_checkpoint_accepts_folder_name(monkeypatch, tmp_path):
+    (tmp_path / "seismic_facies_phase1").mkdir()
+    (tmp_path / "seismic_facies_phase1" / "config.json").write_text("{}")
+    monkeypatch.setattr(config, "FINETUNED_CHECKPOINTS_DIR", tmp_path)
+    path = config.set_text_checkpoint("seismic_facies_phase1")
+    assert path == str(tmp_path / "seismic_facies_phase1")
+    assert config.text_checkpoint() == path
+
+
+def test_resolve_text_checkpoint_rejects_raw_trainer_pt(tmp_path):
+    (tmp_path / "checkpoint.pt").write_bytes(b"not-hf")
+    with pytest.raises(ValueError, match="config.json"):
+        config.resolve_text_checkpoint(str(tmp_path))
+
+
 def test_tracker_classes_match_family():
     sam3_model, sam3_proc = _point_tracker_classes("sam3")
     sam2_model, sam2_proc = _point_tracker_classes("sam2")

@@ -8,7 +8,9 @@ it to the visual concept it was trained/prompted on.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 # --- Tracker models (SAM 3 default, SAM 2 optional) --------------------
@@ -65,6 +67,123 @@ def family_spec(family: str | None = None) -> dict[str, str | bool]:
 
 def checkpoint_for(family: str | None = None) -> str:
     return str(family_spec(family)["checkpoint"])
+
+
+# --- Text-prompt detector (fine-tuned "seismic facies") ----------------
+# Distinct from SAM_FAMILIES["sam3"]["checkpoint"], which the React
+# click/volume tracker loads. Phase 1 fine-tuning produces a Sam3Model
+# directory, not a tracker checkpoint. convert_sam3_to_hf.py writes those
+# folders under finetuned_checkpoints/; the React dropdown lists them.
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+FINETUNED_CHECKPOINTS_DIR = _REPO_ROOT / "finetuned_checkpoints"
+DEFAULT_TEXT_CHECKPOINT_DIR = FINETUNED_CHECKPOINTS_DIR / "seismic_facies_phase1"
+OFFICIAL_TEXT_CHECKPOINT = "facebook/sam3"
+FACIES_PROMPT = "seismic facies"
+
+# Runtime override from POST /api/text-checkpoint. None means "use env /
+# first converted folder / official SAM 3" as text_checkpoint() describes.
+_TEXT_CHECKPOINT_OVERRIDE: str | None = None
+
+
+def _is_hf_model_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "config.json").is_file()
+
+
+def _checkpoint_key(path: str) -> str:
+    """Compare hub ids and local folders without slash/case noise."""
+    raw = path.strip().replace("\\", "/")
+    local = Path(path.strip())
+    try:
+        if local.exists():
+            return str(local.resolve()).lower()
+    except OSError:
+        pass
+    return raw.lower()
+
+
+def list_text_checkpoints() -> list[dict[str, str]]:
+    """Official SAM 3 plus every converted HF folder under finetuned_checkpoints/."""
+    items: list[dict[str, str]] = [
+        {
+            "id": OFFICIAL_TEXT_CHECKPOINT,
+            "label": "SAM 3 (official)",
+            "path": OFFICIAL_TEXT_CHECKPOINT,
+            "source": "official",
+        }
+    ]
+    seen = {_checkpoint_key(OFFICIAL_TEXT_CHECKPOINT)}
+    if FINETUNED_CHECKPOINTS_DIR.is_dir():
+        for child in sorted(FINETUNED_CHECKPOINTS_DIR.iterdir(), key=lambda p: p.name.lower()):
+            if not _is_hf_model_dir(child):
+                continue
+            key = _checkpoint_key(str(child))
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(
+                {
+                    "id": child.name,
+                    "label": child.name,
+                    "path": str(child),
+                    "source": "local",
+                }
+            )
+    env = os.environ.get("SAM3_TEXT_CHECKPOINT", "").strip()
+    if env and _checkpoint_key(env) not in seen:
+        items.append(
+            {
+                "id": Path(env).name or env,
+                "label": Path(env).name or env,
+                "path": env,
+                "source": "env",
+            }
+        )
+    return items
+
+
+def resolve_text_checkpoint(path: str) -> str:
+    """Accept a hub id, an HF folder, or a name under finetuned_checkpoints/."""
+    raw = (path or "").strip()
+    if not raw:
+        raise ValueError("checkpoint path is empty")
+    if raw in (OFFICIAL_TEXT_CHECKPOINT, "sam3", "SAM 3"):
+        return OFFICIAL_TEXT_CHECKPOINT
+    candidate = Path(raw)
+    if _is_hf_model_dir(candidate):
+        return str(candidate)
+    nested = FINETUNED_CHECKPOINTS_DIR / raw
+    if _is_hf_model_dir(nested):
+        return str(nested)
+    raise ValueError(
+        f"No converted SAM 3 checkpoint at {raw!r}; "
+        "need a Hugging Face folder with config.json "
+        f"(convert into {FINETUNED_CHECKPOINTS_DIR})."
+    )
+
+
+def set_text_checkpoint(path: str) -> str:
+    """Pin the detector to ``path`` until the process exits or it is set again."""
+    global _TEXT_CHECKPOINT_OVERRIDE
+    _TEXT_CHECKPOINT_OVERRIDE = resolve_text_checkpoint(path)
+    return _TEXT_CHECKPOINT_OVERRIDE
+
+
+def text_checkpoint() -> str:
+    """HF dir or hub id for Sam3SeismicSegmenter.
+
+    Preference: UI/API override, then ``SAM3_TEXT_CHECKPOINT``, then the
+    default converted folder when ``config.json`` is present, else stock
+    SAM 3.
+    """
+    if _TEXT_CHECKPOINT_OVERRIDE:
+        return _TEXT_CHECKPOINT_OVERRIDE
+    env = os.environ.get("SAM3_TEXT_CHECKPOINT", "").strip()
+    if env:
+        return env
+    if _is_hf_model_dir(DEFAULT_TEXT_CHECKPOINT_DIR):
+        return str(DEFAULT_TEXT_CHECKPOINT_DIR)
+    return DEFAULT_CHECKPOINT
 
 # --- Fixed noun_phrase vocabulary --------------------------------------
 # Order matters only for the color map below; SAM 3 is prompted with each

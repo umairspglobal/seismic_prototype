@@ -236,6 +236,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--val-fraction", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--max-cubes",
+        type=int,
+        default=None,
+        help="After shuffling, keep at most this many cubes (then split 85/15). "
+        "Use a subset so Phase 1 can finish in a same-day budget.",
+    )
     return parser
 
 
@@ -251,7 +258,13 @@ def main() -> None:
     rng = random.Random(args.seed)
     shuffled = cubes[:]
     rng.shuffle(shuffled)
+    if args.max_cubes is not None:
+        if args.max_cubes < 2:
+            raise SystemExit("--max-cubes must be at least 2 so both train and val have a cube.")
+        shuffled = shuffled[: args.max_cubes]
+        print(f"Subsampled to {len(shuffled)} cubes (--max-cubes {args.max_cubes}).")
     n_val = max(1, round(len(shuffled) * args.val_fraction))
+    n_val = min(n_val, len(shuffled) - 1)
     val_cubes, train_cubes = shuffled[:n_val], shuffled[n_val:]
     print(f"Split: {len(train_cubes)} train cubes, {len(val_cubes)} val cubes.")
 

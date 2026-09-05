@@ -42,12 +42,15 @@ from seismic_app.geometry import SectionGeometry
 from seismic_app.inference import (
     LiveTracker,
     Sam3PointSegmenter,
+    Sam3SeismicSegmenter,
     Sam3VolumePropagator,
     transformers_version,
 )
 from seismic_app.logutil import get_logger
 from seismic_app.preprocessing import inline_to_rgb_25d, normalize_to_uint8, to_rgb
+from seismic_app.pipeline import _segment_section_rgb
 from seismic_app.sgy_loader import load_any
+from seismic_app.stitching import binarize
 from seismic_app.vtk_export import FIRST_INTERACTIVE_LABEL_ID, export_volume_vti
 
 log = get_logger("server")
@@ -80,6 +83,7 @@ _family_lock = threading.Lock()
 _file_cache: dict[str, tuple[np.ndarray, SectionGeometry, np.ndarray]] = {}
 _point_segmenter: Sam3PointSegmenter | None = None
 _propagator: Sam3VolumePropagator | None = None
+_text_segmenter: Sam3SeismicSegmenter | None = None
 _active_family: ModelFamily = config.DEFAULT_MODEL_FAMILY
 _load_id = 0
 _load_state: dict[str, str | bool | None] = {
@@ -226,6 +230,55 @@ def _request_family(family: ModelFamily) -> dict:
     return {"family": family, "ready": False, "label": spec["label"]}
 
 
+def _unload_text_segmenter_locked() -> None:
+    global _text_segmenter
+    if _text_segmenter is not None:
+        _text_segmenter.model = None
+        _text_segmenter.processor = None
+        _text_segmenter = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _load_text_segmenter_locked() -> Sam3SeismicSegmenter:
+    global _text_segmenter
+    checkpoint = config.text_checkpoint()
+    if _text_segmenter is not None and getattr(_text_segmenter, "checkpoint", None) == checkpoint:
+        return _text_segmenter
+    if _text_segmenter is not None:
+        _unload_text_segmenter_locked()
+    log.info("Loading text-prompt detector from %s", checkpoint)
+    _text_segmenter = Sam3SeismicSegmenter(
+        checkpoint=checkpoint,
+        prompts=[config.FACIES_PROMPT],
+    )
+    return _text_segmenter
+
+
+def _ensure_text_segmenter_locked() -> tuple[Sam3SeismicSegmenter, bool]:
+    """Load Sam3Model for facies detection. Caller must hold ``_gpu_lock``.
+
+    Returns (segmenter, unloaded_tracker). On CUDA OOM the click/volume
+    trackers are dropped so the detector can occupy the GPU.
+    """
+    if _text_segmenter is not None:
+        return _text_segmenter, False
+    try:
+        return _load_text_segmenter_locked(), False
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+        if "out of memory" not in str(exc).lower():
+            raise
+        log.warning(
+            "CUDA OOM loading text detector alongside the tracker; "
+            "unloading tracker so facies detection can run."
+        )
+        _unload_models_locked()
+        _load_state["stage"] = "ready"
+        _load_state["error"] = None
+        return _load_text_segmenter_locked(), True
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     threading.Thread(target=_warmup_models, daemon=True, name="model-warmup").start()
@@ -331,6 +384,13 @@ def _mask_png_base64(mask: np.ndarray, object_id: int = 0) -> str:
     return _rgba_png_base64(rgba)
 
 
+def _facies_mask_png_base64(mask: np.ndarray) -> str:
+    color = config.LABEL_COLORS[config.FACIES_PROMPT]
+    rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    rgba[mask] = (*color, MASK_ALPHA)
+    return _rgba_png_base64(rgba)
+
+
 def _masks_png_base64(masks: np.ndarray, object_ids: list[int]) -> str:
     """Encode a (n_objects, H, W) bool stack as one combined tinted PNG."""
     rgba = np.zeros((*masks.shape[1:], 4), dtype=np.uint8)
@@ -385,6 +445,10 @@ class SetModelRequest(BaseModel):
     family: str
 
 
+class SetTextCheckpointRequest(BaseModel):
+    checkpoint: str
+
+
 @app.post("/api/model")
 def set_model(req: SetModelRequest) -> dict:
     """Switch the resident tracker between SAM 2 and SAM 3.
@@ -398,6 +462,25 @@ def set_model(req: SetModelRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     return _request_family(family)
+
+
+@app.post("/api/text-checkpoint")
+def set_text_checkpoint(req: SetTextCheckpointRequest) -> dict:
+    """Switch the facies text detector to a converted local folder or official SAM 3.
+
+    Does not touch the click/volume tracker. The previous detector is
+    dropped; the new weights load on the next Detect request.
+    """
+    try:
+        checkpoint = config.set_text_checkpoint(req.checkpoint)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    with _gpu_lock:
+        loaded = getattr(_text_segmenter, "checkpoint", None)
+        if loaded != checkpoint:
+            _unload_text_segmenter_locked()
+    label = Path(checkpoint).name if Path(checkpoint).exists() else checkpoint
+    return {"checkpoint": checkpoint, "label": label, "loaded": False}
 
 
 @app.get("/api/files")
@@ -482,6 +565,9 @@ def runtime_info() -> dict:
             for item in config.SAM_FAMILIES.values()
         ],
         "checkpoint": getattr(point, "checkpoint", None) or spec["checkpoint"],
+        "text_checkpoint": config.text_checkpoint(),
+        "available_text_checkpoints": config.list_text_checkpoints(),
+        "text_detector_loaded": _text_segmenter is not None,
         "architecture": spec["architecture"],
         "point_model": spec["point_model"],
         "video_model": spec["video_model"],
@@ -576,6 +662,43 @@ def segment(req: SegmentRequest) -> dict:
             **{k: float(v) for k, v in segmenter.last_timings.items()},
             "server_total": time.perf_counter() - started,
         },
+    }
+
+
+@app.post("/api/auto-segment")
+def auto_segment(req: SliceRef) -> dict:
+    """Run the fine-tuned text detector for ``seismic facies`` on one slice.
+
+    Uses ``Sam3SeismicSegmenter`` (not the click tracker). The tracker
+    stays loaded when VRAM allows; otherwise it is unloaded for this pass.
+    """
+    data, geometry, data_u8 = _get_file(req.file)
+    _validate_slice(data, geometry, req.axis, req.index)
+    rgb = _slice_rgb(data_u8, geometry, req.axis, req.index)
+    started = time.perf_counter()
+    prompts = [config.FACIES_PROMPT]
+    with _gpu_lock:
+        segmenter, unloaded_tracker = _ensure_text_segmenter_locked()
+        try:
+            prob_maps = _segment_section_rgb(rgb, segmenter, prompts)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            log.warning("CUDA OOM during facies detection; unloading tracker and retrying.")
+            _unload_models_locked()
+            unloaded_tracker = True
+            _load_state["stage"] = "ready"
+            segmenter = _load_text_segmenter_locked()
+            prob_maps = _segment_section_rgb(rgb, segmenter, prompts)
+    masks = binarize(prob_maps, config.MASK_THRESHOLD)
+    mask = np.asarray(masks[config.FACIES_PROMPT], dtype=bool)
+    return {
+        "mask": _facies_mask_png_base64(mask),
+        "coverage": float(mask.mean()),
+        "prompt": config.FACIES_PROMPT,
+        "checkpoint": config.text_checkpoint(),
+        "unloaded_tracker": unloaded_tracker,
+        "timings": {"server_total": time.perf_counter() - started},
     }
 
 

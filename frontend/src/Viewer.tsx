@@ -20,6 +20,7 @@ interface ViewerProps {
   displayHeight: number;
   maskOpacity: number;
   busy: boolean;
+  autoMaskUrl?: string | null;
   onPick: (col: number, row: number, label: 0 | 1) => void;
 }
 
@@ -54,6 +55,7 @@ export function Viewer({
   displayHeight,
   maskOpacity,
   busy,
+  autoMaskUrl = null,
   onPick,
 }: ViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -90,6 +92,15 @@ export function Viewer({
       onContextMenu={handleContextMenu}
     >
       <img className="viewer-layer" src={imageUrl} alt="Seismic section" draggable={false} />
+      {autoMaskUrl && (
+        <img
+          className="viewer-layer viewer-mask"
+          src={autoMaskUrl}
+          alt=""
+          style={{ opacity: maskOpacity }}
+          draggable={false}
+        />
+      )}
       {propagatedMaskUrl && (
         <img
           className="viewer-layer viewer-mask"

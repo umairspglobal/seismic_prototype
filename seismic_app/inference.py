@@ -130,6 +130,7 @@ class Sam3SeismicSegmenter:
                 "environment; run without compile_model."
             )
         self.prompts = prompts or config.SEISMIC_PROMPTS
+        self.checkpoint = checkpoint
 
         log.info(
             "Loading Sam3Model from '%s' onto device=%s (first run may download "

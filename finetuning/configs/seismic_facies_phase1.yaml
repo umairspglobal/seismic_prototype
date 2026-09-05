@@ -20,12 +20,12 @@ defaults:
   - _self_
 
 paths:
-  dataset_root: C:/Users/umair_tariq/Downloads/Downloads/seismic_prototype/finetune_data
-  experiment_log_dir: C:/Users/umair_tariq/Downloads/Downloads/seismic_prototype/finetune_logs/seismic_facies_phase1
-  bpe_path: C:/Users/umair_tariq/Downloads/Downloads/seismic_prototype/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  dataset_root: C:/Users/U/Downloads/Seismic_SAM/seismic_prototype/finetune_data
+  experiment_log_dir: C:/Users/U/Downloads/Seismic_SAM/seismic_prototype/finetune_logs/seismic_facies_phase1_subset
+  bpe_path: C:/Users/U/Downloads/Seismic_SAM/seismic_prototype/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
   # Local sam3.pt (or HF snapshot) to start from - the pretrained checkpoint,
   # NOT a checkpoint you already fine-tuned.
-  init_checkpoint: C:/Users/umair_tariq/.cache/huggingface/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt
+  init_checkpoint: C:/Users/U/.cache/huggingface/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt
 
 seismic_train:
   # Single noun_phrase for this dataset - see finetuning/prepare_dataset.py
@@ -163,7 +163,7 @@ scratch:
   val_norm_mean: [0.5, 0.5, 0.5]
   val_norm_std: [0.5, 0.5, 0.5]
 
-  num_train_workers: 8
+  num_train_workers: 0
   num_val_workers: 0
   max_data_epochs: 2
   target_epoch_size: 1500
@@ -205,11 +205,11 @@ trainer:
   _target_: sam3.train.trainer.Trainer
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: true
-  skip_first_val: false
-  max_epochs: 2  # ~10h/epoch at 2272 train images -> ~20h total, fits a 1-day budget
+  skip_first_val: true
+  max_epochs: 1  # subset run (~1000 images) so Phase 1 fits a same-day budget
   accelerator: cuda
   seed_value: 123
-  val_epoch_freq: 1   # per guide: watch val/mIoU frequently in the first 10-15 epochs
+  val_epoch_freq: 100  # skip in-loop val; use finetuning/validate_checkpoint.py after convert
   mode: train
   gradient_accumulation_steps: ${scratch.gradient_accumulation_steps}
 
@@ -218,12 +218,8 @@ trainer:
     # fine here since this is a single-GPU/single-process run.
     backend: gloo
     find_unused_parameters: true
-    gradient_as_bucket_view: true
-    # Same set of params participates in every iteration here (freezing is
-    # via lr=0, not architecture changes) - avoids DDP's "Expected to have
-    # finished reduction..." error that activation checkpointing triggers
-    # with the default per-iteration unused-parameter re-detection.
-    static_graph: true
+    gradient_as_bucket_view: false
+    static_graph: false
 
   loss:
     all: ${seismic_train.loss}
@@ -256,7 +252,7 @@ trainer:
       shuffle: true
       batch_size: ${scratch.train_batch_size}
       num_workers: ${scratch.num_train_workers}
-      pin_memory: true
+      pin_memory: false
       drop_last: true
       collate_fn: ${scratch.collate_fn}
 
@@ -279,7 +275,7 @@ trainer:
       shuffle: false
       batch_size: ${scratch.val_batch_size}
       num_workers: ${scratch.num_val_workers}
-      pin_memory: true
+      pin_memory: false
       drop_last: false
       collate_fn: ${scratch.collate_fn_val}
 
@@ -295,24 +291,21 @@ trainer:
   optim:
     amp:
       enabled: true
-      amp_dtype: bfloat16
+      amp_dtype: float16
 
     optimizer:
       _target_: torch.optim.AdamW
+      fused: false
+      foreach: false
 
     gradient_clip:
       _target_: sam3.train.optim.optimizer.GradientClipper
       max_norm: 0.1
       norm_type: 2
 
-    param_group_modifiers:
-      - _target_: sam3.train.optim.optimizer.layer_decay_param_modifier
-        _partial_: true
-        layer_decay_value: ${scratch.lrd_vision_backbone}
-        apply_to: 'backbone.vision_backbone.trunk'
-        overrides:
-          - pattern: '*pos_embed*'
-            value: 1.0
+    # Vision/text encoders are frozen in trainer._freeze_phase1_backbones
+    # (requires_grad=False + no_grad). Do not put them in AdamW.
+    param_group_modifiers: []
 
     options:
       lr:
@@ -322,22 +315,6 @@ trainer:
             timescale: ${scratch.scheduler_timescale}
             warmup_steps: ${scratch.scheduler_warmup}
             cooldown_steps: ${scratch.scheduler_cooldown}
-        - scheduler:  # vision backbone - frozen (lr 0) in Phase 1
-            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
-            base_lr: ${scratch.lr_vision_backbone}
-            timescale: ${scratch.scheduler_timescale}
-            warmup_steps: ${scratch.scheduler_warmup}
-            cooldown_steps: ${scratch.scheduler_cooldown}
-          param_names:
-            - 'backbone.vision_backbone.*'
-        - scheduler:  # text/language backbone - frozen (lr 0) in Phase 1
-            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
-            base_lr: ${scratch.lr_language_backbone}
-            timescale: ${scratch.scheduler_timescale}
-            warmup_steps: ${scratch.scheduler_warmup}
-            cooldown_steps: ${scratch.scheduler_cooldown}
-          param_names:
-            - 'backbone.language_backbone.*'
 
       weight_decay:
         - scheduler:
@@ -359,8 +336,8 @@ trainer:
     # above and list its key in `save_best_meters` - not configured here,
     # since there's no verified segmentation-mIoU meter class in this repo;
     # use finetuning/validate_checkpoint.py against saved checkpoints instead.
-    save_freq: 5
-    resume_from: null  # was pointed at the epoch-0 checkpoint, but that checkpoint is corrupted (NaN weights) - see repo memory
+    save_freq: 1
+    resume_from: null  # do not resume the previous NaN-crashed run
 
   logging:
     tensorboard_writer:
@@ -379,7 +356,7 @@ launcher:
   num_nodes: 1
   gpus_per_node: 1
   experiment_log_dir: ${paths.experiment_log_dir}
-  multiprocessing_context: forkserver
+  multiprocessing_context: spawn
 
 submitit:
   account: null

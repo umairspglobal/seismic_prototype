@@ -7,6 +7,7 @@ import {
   Point,
   PropagationEvent,
   RuntimeInfo,
+  TextCheckpointInfo,
   downloadExportedVolume,
   exportVolume,
   getRuntime,
@@ -18,7 +19,9 @@ import {
   refine,
   resweep,
   segment,
+  autoSegment,
   setModel,
+  setTextCheckpoint,
   sliceUrl,
 } from "./api";
 import { Viewer, ViewerObject } from "./Viewer";
@@ -41,6 +44,36 @@ interface SegObject extends ViewerObject {
 }
 
 const freshObject = (id: number): SegObject => ({ id, points: [], maskUrl: null });
+
+const FALLBACK_TRACKERS = [
+  { id: "sam3" as const, label: "SAM 3", checkpoint: "facebook/sam3", gated: true },
+  { id: "sam2" as const, label: "SAM 2", checkpoint: "facebook/sam2.1-hiera-large", gated: false },
+];
+
+const FALLBACK_TEXT_CHECKPOINTS: TextCheckpointInfo[] = [
+  {
+    id: "facebook/sam3",
+    label: "SAM 3 (official)",
+    path: "facebook/sam3",
+    source: "official",
+  },
+];
+
+function matchTextCheckpoint(
+  current: string | null,
+  options: TextCheckpointInfo[],
+): string {
+  if (!options.length) return current ?? "";
+  if (!current) return options[0].path;
+  const exact = options.find((item) => item.path === current);
+  if (exact) return exact.path;
+  const normalized = current.replace(/\\/g, "/").toLowerCase();
+  const fuzzy = options.find((item) => {
+    const path = item.path.replace(/\\/g, "/").toLowerCase();
+    return path === normalized || item.id.toLowerCase() === normalized;
+  });
+  return fuzzy?.path ?? current;
+}
 
 export default function App() {
   const [files, setFiles] = useState<FileInfo[]>([]);
@@ -75,6 +108,13 @@ export default function App() {
   // response during a long sweep cannot hide export or disable refine.
   const [trackedObjectIds, setTrackedObjectIds] = useState<number[]>([]);
   const [modelFamily, setModelFamily] = useState<ModelFamily>("sam3");
+  const [autoMaskUrl, setAutoMaskUrl] = useState<string | null>(null);
+  const [autoCoverage, setAutoCoverage] = useState<number | null>(null);
+  const [autoDetecting, setAutoDetecting] = useState(false);
+  const [autoError, setAutoError] = useState<string | null>(null);
+  const [autoCheckpoint, setAutoCheckpoint] = useState<string | null>(null);
+  const [textCheckpoint, setTextCheckpointPath] = useState<string | null>(null);
+  const userPickedTextCheckpoint = useRef(false);
   const pointReady = Boolean(runtime?.point_loaded) && runtime?.family === modelFamily;
   const videoReady = Boolean(runtime?.video_loaded) && runtime?.family === modelFamily;
 
@@ -146,6 +186,11 @@ export default function App() {
     setModelFamily(runtime.family);
   }, [runtime?.family]);
 
+  useEffect(() => {
+    if (!runtime?.text_checkpoint || userPickedTextCheckpoint.current) return;
+    setTextCheckpointPath(runtime.text_checkpoint);
+  }, [runtime?.text_checkpoint]);
+
   const axisCount = file ? file.axes[axis] : 1;
   const sliceSize = useMemo(() => {
     if (!file) return { w: 1, h: 1 };
@@ -195,6 +240,9 @@ export default function App() {
     setTrackedObjectIds([]);
     setExportInfo(null);
     setExportError(null);
+    setAutoMaskUrl(null);
+    setAutoCoverage(null);
+    setAutoError(null);
   }, [abortAll]);
 
   const handleModelChange = useCallback(
@@ -225,6 +273,30 @@ export default function App() {
         });
     },
     [modelFamily, propagation?.running, abortAll, runtime?.family],
+  );
+
+  const handleTextCheckpointChange = useCallback(
+    (checkpoint: string) => {
+      if (!checkpoint || checkpoint === textCheckpoint) return;
+      userPickedTextCheckpoint.current = true;
+      const previous = textCheckpoint;
+      setTextCheckpointPath(checkpoint);
+      setAutoMaskUrl(null);
+      setAutoCoverage(null);
+      setAutoError(null);
+      setAutoCheckpoint(null);
+      setTextCheckpoint(checkpoint)
+        .then((result) => {
+          setTextCheckpointPath(result.checkpoint);
+          return getRuntime().then(setRuntime);
+        })
+        .catch((err: Error) => {
+          setStatus(`Could not switch checkpoint: ${err.message}`);
+          userPickedTextCheckpoint.current = false;
+          setTextCheckpointPath(previous);
+        });
+    },
+    [textCheckpoint],
   );
 
   // A new file or axis invalidates all picks; a slice change does NOT -
@@ -326,6 +398,31 @@ export default function App() {
     },
     [trackedIds, runSegment, runRefine],
   );
+
+  useEffect(() => {
+    setAutoMaskUrl(null);
+    setAutoCoverage(null);
+    setAutoError(null);
+  }, [file?.name, axis, index]);
+
+  const handleAutoDetect = useCallback(() => {
+    if (!file || autoDetecting) return;
+    setAutoDetecting(true);
+    setAutoError(null);
+    autoSegment(file.name, axis, index)
+      .then((result) => {
+        setAutoMaskUrl(maskDataUrl(result.mask));
+        setAutoCoverage(result.coverage);
+        setAutoCheckpoint(result.checkpoint);
+        if (result.unloaded_tracker) {
+          setStatus(
+            "Facies detector needed the GPU, so the click tracker was unloaded. Switch SAM 3 / SAM 2 to reload it.",
+          );
+        }
+      })
+      .catch((err: Error) => setAutoError(err.message))
+      .finally(() => setAutoDetecting(false));
+  }, [file, axis, index, autoDetecting]);
 
   // On slice change: keep every object and its points, drop the stale
   // single-slice previews, pre-encode the slice, then re-preview objects
@@ -568,8 +665,16 @@ export default function App() {
   const progressPct = propagation
     ? Math.round((100 * propagation.done) / propagation.total)
     : 0;
-  const modelsLoading = !pointReady;
+  const modelsLoading = !pointReady && !runtime?.text_detector_loaded;
   const familyLabel = runtime?.family_label ?? (modelFamily === "sam2" ? "SAM 2" : "SAM 3");
+  const textCheckpointOptions =
+    runtime?.available_text_checkpoints?.length
+      ? runtime.available_text_checkpoints
+      : FALLBACK_TEXT_CHECKPOINTS;
+  const selectedTextCheckpoint = matchTextCheckpoint(
+    textCheckpoint ?? runtime?.text_checkpoint ?? null,
+    textCheckpointOptions,
+  );
   const loadMessage = runtime?.load_error && !pointReady
     ? runtime.load_error
     : (runtime?.load_stage as string | undefined) ?? "Connecting to inference server...";
@@ -595,31 +700,73 @@ export default function App() {
         <h1>Seismic SAM</h1>
         <p className="subtitle">Interactive point segmentation</p>
 
-        <div className="field">
+        <label className="field">
           <span>Tracker model</span>
-          <div className="toggle-row">
-            <button
-              className={modelFamily === "sam3" ? "toggle active-model" : "toggle"}
-              onClick={() => handleModelChange("sam3")}
-              disabled={propagation?.running}
-              title="SAM 3 tracker (default)"
-            >
-              SAM 3
-            </button>
-            <button
-              className={modelFamily === "sam2" ? "toggle active-model" : "toggle"}
-              onClick={() => handleModelChange("sam2")}
-              disabled={propagation?.running}
-              title="SAM 2.1 hiera-large, for comparison"
-            >
-              SAM 2
-            </button>
-          </div>
+          <select
+            value={modelFamily}
+            onChange={(e) => handleModelChange(e.target.value as ModelFamily)}
+            disabled={propagation?.running}
+            title="Click and volume tracker"
+          >
+            {(runtime?.available_models ?? FALLBACK_TRACKERS).map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.label}
+              </option>
+            ))}
+          </select>
           <p className="hint">
-            SAM 3 is the default. Switch to SAM 2 to compare masks on the
-            same clicks; only one model stays on the GPU.
+            Official click/volume trackers only. Switch to compare masks on
+            the same clicks; only one stays on the GPU.
           </p>
-        </div>
+        </label>
+
+        {modelFamily === "sam3" && (
+          <>
+            <label className="field">
+              <span>Fine-tuned checkpoint</span>
+              <select
+                value={selectedTextCheckpoint}
+                onChange={(e) => handleTextCheckpointChange(e.target.value)}
+                disabled={autoDetecting}
+                title="Converted SAM 3 detector weights"
+              >
+                {textCheckpointOptions.map((item) => (
+                  <option key={`${item.source}:${item.path}`} value={item.path}>
+                    {item.source === "local" ? `${item.label} (trained)` : item.label}
+                  </option>
+                ))}
+              </select>
+              <p className="hint">
+                Folders in <code>finetuned_checkpoints/</code> appear here after
+                you convert a training run. Detect uses this checkpoint; point
+                clicks still use the official SAM 3 tracker.
+              </p>
+            </label>
+
+            <div className="field">
+              <span>Fine-tuned text detector</span>
+              <button
+                className="primary"
+                onClick={handleAutoDetect}
+                disabled={!file || autoDetecting}
+                title="Run the seismic facies text-prompt model on this slice"
+              >
+                {autoDetecting ? "Detecting facies..." : "Detect seismic facies"}
+              </button>
+              {(autoCheckpoint || textCheckpoint) && (
+                <p className="hint">
+                  Detector: <code>{autoCheckpoint ?? textCheckpoint}</code>
+                </p>
+              )}
+              {autoCoverage !== null && (
+                <p className="hint">
+                  Facies coverage {(100 * autoCoverage).toFixed(1)}%
+                </p>
+              )}
+              {autoError && <p className="error">{autoError}</p>}
+            </div>
+          </>
+        )}
 
         <label className="field">
           <span>Seismic file</span>
@@ -904,6 +1051,10 @@ export default function App() {
               <dd>{runtime.family_label}</dd>
               <dt>Checkpoint</dt>
               <dd className="runtime-mono">{runtime.checkpoint}</dd>
+              <dt>Facies detector</dt>
+              <dd className="runtime-mono">{runtime.text_checkpoint}</dd>
+              <dt>Detector loaded</dt>
+              <dd>{runtime.text_detector_loaded ? "yes" : "not yet"}</dd>
               <dt>Point model</dt>
               <dd>
                 {runtime.point_model}
@@ -979,6 +1130,12 @@ export default function App() {
               <span>{(100 * coverage).toFixed(2)}%</span>
             </div>
           )}
+          {autoCoverage !== null && (
+            <div>
+              <span className="stat-label">Facies coverage</span>
+              <span>{(100 * autoCoverage).toFixed(2)}%</span>
+            </div>
+          )}
         </div>
         {status && <p className="error">{status}</p>}
         {runtime?.load_error && pointReady && (
@@ -990,6 +1147,7 @@ export default function App() {
         <Viewer
           imageUrl={imageUrl}
           propagatedMaskUrl={propMaskUrl}
+          autoMaskUrl={autoMaskUrl}
           objects={viewerObjects}
           activeObjectId={activeObjectId}
           sliceWidth={sliceSize.w}
@@ -999,8 +1157,9 @@ export default function App() {
           maskOpacity={maskOpacity}
           busy={
             propagation?.running ||
-            !pointReady ||
-            (!prepared && trackedIds.length === 0)
+            autoDetecting ||
+            (!pointReady && !runtime?.text_detector_loaded) ||
+            (!prepared && trackedIds.length === 0 && !autoMaskUrl)
           }
           onPick={handlePick}
         />
