@@ -1,0 +1,538 @@
+diff --git a/sam3/model/decoder.py b/sam3/model/decoder.py
+index 578a2bf..af25d0a 100644
+--- a/sam3/model/decoder.py
++++ b/sam3/model/decoder.py
+@@ -7,6 +7,7 @@ Inspired from Pytorch's version, adds the pre-norm variant
+ """
+ 
+ import math
++import sys
+ from functools import partial
+ from typing import Any, Dict, List, Optional, Union
+ 
+@@ -1059,7 +1060,8 @@ def functional_attention(
+         assert dropout == 0.0
+         out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+     else:
+-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
++        backend = SDPBackend.MATH if sys.platform == "win32" else SDPBackend.FLASH_ATTENTION
++        with sdpa_kernel(backend):
+             out = torchF.scaled_dot_product_attention(q, k, v, dropout_p=dropout)
+         out = out.transpose(1, 2)  #  B * n * n_heads * (cv // num_heads)
+ 
+diff --git a/sam3/model/edt.py b/sam3/model/edt.py
+index c4d6e7c..66064f3 100644
+--- a/sam3/model/edt.py
++++ b/sam3/model/edt.py
+@@ -5,8 +5,16 @@
+ """Triton kernel for euclidean distance transform (EDT)"""
+ 
+ import torch
+-import triton
+-import triton.language as tl
++
++try:
++    import triton
++    import triton.language as tl
++
++    _HAS_TRITON = True
++except ImportError:  # Triton is not published for Windows wheels.
++    triton = None
++    tl = None
++    _HAS_TRITON = False
+ 
+ """
+ Disclaimer: This implementation is not meant to be extremely efficient. A CUDA kernel would likely be more efficient.
+@@ -52,8 +60,16 @@ Overall, despite being quite naive, this implementation is roughly 5.5x faster t
+ """
+ 
+ 
+-@triton.jit
+-def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: tl.constexpr):
++def _passthrough_decorator(fn):
++    return fn
++
++
++_jit = triton.jit if _HAS_TRITON else _passthrough_decorator
++_Const = tl.constexpr if _HAS_TRITON else type(None)
++
++
++@_jit
++def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: _Const):
+     # This is a somewhat verbatim implementation of the efficient 1D EDT algorithm described above
+     # It can be applied horizontally or vertically depending if we're doing the first or second stage.
+     # It's parallelized across batch+row (or batch+col if horizontal=False)
+@@ -127,6 +143,11 @@ def edt_triton(data: torch.Tensor):
+         A tensor of the same shape as data containing the EDT.
+         It should be equivalent to a batched version of cv2.distanceTransform(input, cv2.DIST_L2, 0)
+     """
++    if not _HAS_TRITON:
++        raise RuntimeError(
++            "Triton EDT kernels are unavailable on this platform; "
++            "SAM 3 image-model training does not need them."
++        )
+     assert data.dim() == 3
+     assert data.is_cuda
+     B, H, W = data.shape
+diff --git a/sam3/model/model_misc.py b/sam3/model/model_misc.py
+index 670d370..59acacd 100644
+--- a/sam3/model/model_misc.py
++++ b/sam3/model/model_misc.py
+@@ -6,6 +6,7 @@
+ 
+ import copy
+ import math
++import sys
+ import warnings
+ import weakref
+ from collections.abc import Iterator
+@@ -402,9 +403,14 @@ def multi_head_attention_forward(
+                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+             ).transpose(1, 2)
+         else:
+-            torch.backends.cuda.enable_flash_sdp(True)
+-            torch.backends.cuda.enable_math_sdp(True)
+-            torch.backends.cuda.enable_mem_efficient_sdp(True)
++            if sys.platform == "win32":
++                torch.backends.cuda.enable_flash_sdp(False)
++                torch.backends.cuda.enable_mem_efficient_sdp(False)
++                torch.backends.cuda.enable_math_sdp(True)
++            else:
++                torch.backends.cuda.enable_flash_sdp(True)
++                torch.backends.cuda.enable_math_sdp(True)
++                torch.backends.cuda.enable_mem_efficient_sdp(True)
+ 
+             attn_output = F.scaled_dot_product_attention(
+                 q, k, v, attn_mask, dropout_p, is_causal
+diff --git a/sam3/model/vitdet.py b/sam3/model/vitdet.py
+index fe8e402..308d25f 100644
+--- a/sam3/model/vitdet.py
++++ b/sam3/model/vitdet.py
+@@ -15,6 +15,7 @@ Rope embedding code adopted from:
+ import math
+ from functools import partial
+ from typing import Callable, List, Optional, Tuple, Union
++import sys
+ 
+ import torch
+ import torch.nn as nn
+@@ -626,7 +627,14 @@ class Attention(nn.Module):
+                     q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                 ).transpose(1, 2)
+             else:
+-                x = F.scaled_dot_product_attention(q, k, v)
++                if sys.platform == "win32":
++                    # Flash/mem-efficient SDPA native-crashes on Windows CUDA.
++                    from torch.nn.attention import SDPBackend, sdpa_kernel
++
++                    with sdpa_kernel(SDPBackend.MATH):
++                        x = F.scaled_dot_product_attention(q, k, v)
++                else:
++                    x = F.scaled_dot_product_attention(q, k, v)
+         else:
+             raise NotImplementedError
+ 
+diff --git a/sam3/model/vl_combiner.py b/sam3/model/vl_combiner.py
+index c07fe91..56938a6 100644
+--- a/sam3/model/vl_combiner.py
++++ b/sam3/model/vl_combiner.py
+@@ -149,7 +149,9 @@ class SAM3VLBackbone(nn.Module):
+             text_to_encode += additional_text
+ 
+         sdpa_context = sdpa_kernel(
+-            [
++            [SDPBackend.MATH]
++            if __import__("sys").platform == "win32"
++            else [
+                 SDPBackend.MATH,
+                 SDPBackend.EFFICIENT_ATTENTION,
+                 SDPBackend.FLASH_ATTENTION,
+diff --git a/sam3/perflib/fused.py b/sam3/perflib/fused.py
+index 6800cca..5096d60 100644
+--- a/sam3/perflib/fused.py
++++ b/sam3/perflib/fused.py
+@@ -8,8 +8,10 @@ addmm_act_op = torch.ops.aten._addmm_activation
+ 
+ 
+ def addmm_act(activation, linear, mat1):
+-    if torch.is_grad_enabled():
+-        raise ValueError("Expected grad to be disabled.")
++    # Windows / training: the fused aten._addmm_activation path assumes
++    # inference (no grad) and can illegal-memory-access under AMP+checkpoint.
++    act = activation() if isinstance(activation, type) else activation
++    return act(linear(mat1))
+     self = linear.bias.detach()
+     mat2 = linear.weight.detach()
+     self = self.to(torch.bfloat16)
+diff --git a/sam3/sam/transformer.py b/sam3/sam/transformer.py
+index 9babcee..6dd1f9d 100644
+--- a/sam3/sam/transformer.py
++++ b/sam3/sam/transformer.py
+@@ -5,6 +5,7 @@
+ import math
+ from functools import partial
+ from typing import Tuple, Type
++import sys
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -254,9 +255,14 @@ class Attention(nn.Module):
+                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+             ).transpose(1, 2)
+         else:
+-            torch.backends.cuda.enable_flash_sdp(True)
+-            torch.backends.cuda.enable_math_sdp(True)
+-            torch.backends.cuda.enable_mem_efficient_sdp(True)
++            if sys.platform == "win32":
++                torch.backends.cuda.enable_flash_sdp(False)
++                torch.backends.cuda.enable_mem_efficient_sdp(False)
++                torch.backends.cuda.enable_math_sdp(True)
++            else:
++                torch.backends.cuda.enable_flash_sdp(True)
++                torch.backends.cuda.enable_math_sdp(True)
++                torch.backends.cuda.enable_mem_efficient_sdp(True)
+             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+ 
+         out = self._recombine_heads(out)
+@@ -349,9 +355,14 @@ class RoPEAttention(Attention):
+                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+             ).transpose(1, 2)
+         else:
+-            torch.backends.cuda.enable_flash_sdp(True)
+-            torch.backends.cuda.enable_math_sdp(True)
+-            torch.backends.cuda.enable_mem_efficient_sdp(True)
++            if sys.platform == "win32":
++                torch.backends.cuda.enable_flash_sdp(False)
++                torch.backends.cuda.enable_mem_efficient_sdp(False)
++                torch.backends.cuda.enable_math_sdp(True)
++            else:
++                torch.backends.cuda.enable_flash_sdp(True)
++                torch.backends.cuda.enable_math_sdp(True)
++                torch.backends.cuda.enable_mem_efficient_sdp(True)
+             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+ 
+         out = self._recombine_heads(out)
+diff --git a/sam3/train/data/torch_dataset.py b/sam3/train/data/torch_dataset.py
+index 97a0a6f..5239443 100644
+--- a/sam3/train/data/torch_dataset.py
++++ b/sam3/train/data/torch_dataset.py
+@@ -4,6 +4,7 @@
+ 
+ from typing import Callable, Iterable, Optional
+ 
++import torch.distributed as dist
+ from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset
+ 
+ 
+@@ -29,7 +30,10 @@ class TorchDataset:
+         self.collate_fn = collate_fn
+         self.worker_init_fn = worker_init_fn
+         assert not isinstance(self.dataset, IterableDataset), "Not supported yet"
+-        if enable_distributed_sampler:
++        # DistributedSampler needs an initialized process group. Single-process
++        # Windows runs may have none (gloo device creation broken); fall back
++        # to the DataLoader's own shuffling in that case.
++        if enable_distributed_sampler and dist.is_available() and dist.is_initialized():
+             self.sampler = DistributedSampler(self.dataset, shuffle=self.shuffle)
+         else:
+             # pyrefly: ignore [bad-assignment]
+@@ -51,6 +55,8 @@ class TorchDataset:
+             pin_memory=self.pin_memory,
+             drop_last=self.drop_last,
+             sampler=self.sampler,
++            # Without a DistributedSampler the loader must shuffle itself.
++            shuffle=self.shuffle if self.sampler is None else False,
+             collate_fn=self.collate_fn,
+             worker_init_fn=self.worker_init_fn,
+         )
+diff --git a/sam3/train/loss/loss_fns.py b/sam3/train/loss/loss_fns.py
+index e6d2396..dd8e4cf 100644
+--- a/sam3/train/loss/loss_fns.py
++++ b/sam3/train/loss/loss_fns.py
+@@ -11,10 +11,17 @@ import torch.nn.functional as F
+ import torchmetrics
+ from sam3.model import box_ops
+ from sam3.model.data_misc import interpolate
+-from sam3.train.loss.sigmoid_focal_loss import (
+-    triton_sigmoid_focal_loss,
+-    triton_sigmoid_focal_loss_reduce,
+-)
++try:
++    from sam3.train.loss.sigmoid_focal_loss import (
++        triton_sigmoid_focal_loss,
++        triton_sigmoid_focal_loss_reduce,
++    )
++
++    _HAS_TRITON_FOCAL = True
++except ImportError:  # Triton is not published for Windows wheels.
++    triton_sigmoid_focal_loss = None
++    triton_sigmoid_focal_loss_reduce = None
++    _HAS_TRITON_FOCAL = False
+ from torch import nn
+ 
+ from .mask_sampling import (
+@@ -147,6 +154,8 @@ def sigmoid_focal_loss(
+     Returns:
+         Loss tensor
+     """
++    if triton and not _HAS_TRITON_FOCAL:
++        triton = False
+     if not (0 <= alpha <= 1) and triton:
+         raise RuntimeError(f"Alpha should be in [0,1], got {alpha}")
+     if triton:
+diff --git a/sam3/train/loss/sam3_loss.py b/sam3/train/loss/sam3_loss.py
+index 5aa5791..41c797f 100644
+--- a/sam3/train/loss/sam3_loss.py
++++ b/sam3/train/loss/sam3_loss.py
+@@ -72,7 +72,13 @@ class Sam3LossWrapper(torch.nn.Module):
+         else:
+             num_boxes = targets["num_boxes"].sum().float()
+         if self.normalization == "global":
+-            torch.distributed.all_reduce(num_boxes)
++            # Skip all_reduce on a single process. On Windows, gloo all_reduce
++            # of CUDA tensors native-crashes (0xC0000005).
++            if get_world_size() > 1:
++                device = num_boxes.device
++                num_cpu = num_boxes.detach().to("cpu")
++                torch.distributed.all_reduce(num_cpu)
++                num_boxes = num_cpu.to(device=device, dtype=num_boxes.dtype)
+             num_boxes = torch.clamp(num_boxes / get_world_size(), min=1)
+         elif self.normalization == "local":
+             num_boxes = torch.clamp(num_boxes, min=1)
+diff --git a/sam3/train/matcher.py b/sam3/train/matcher.py
+index 5adc6a4..8bf50a2 100644
+--- a/sam3/train/matcher.py
++++ b/sam3/train/matcher.py
+@@ -17,6 +17,7 @@ def _do_matching(cost, repeats=1, return_tgt_indices=False, do_filtering=False):
+     if repeats > 1:
+         cost = np.tile(cost, (1, repeats))
+ 
++    cost = np.nan_to_num(np.asarray(cost, dtype=np.float64), nan=1e8, posinf=1e8, neginf=1e8)
+     i, j = linear_sum_assignment(cost)
+     if do_filtering:
+         # filter out invalid entries (i.e. those with cost > 1e8)
+diff --git a/sam3/train/optim/optimizer.py b/sam3/train/optim/optimizer.py
+index 3e9c20a..fc291f4 100644
+--- a/sam3/train/optim/optimizer.py
++++ b/sam3/train/optim/optimizer.py
+@@ -380,7 +380,9 @@ def construct_optimizer(
+     )
+     if validate_param_groups:
+         validate_param_group_params(param_groups, model)
++    logging.info("Instantiating optimizer with %s param groups", len(param_groups))
+     optimizer = hydra.utils.instantiate(optimizer_conf, param_groups)
++    logging.info("Optimizer instantiated")
+     return Optimizer(optimizer, schedulers)
+ 
+ 
+diff --git a/sam3/train/train.py b/sam3/train/train.py
+index ad347f8..91da342 100644
+--- a/sam3/train/train.py
++++ b/sam3/train/train.py
+@@ -44,7 +44,10 @@ def handle_custom_resolving(cfg):
+ 
+ def single_proc_run(local_rank, main_port, cfg, world_size):
+     """Single GPU process"""
+-    os.environ["MASTER_ADDR"] = "localhost"
++    # 127.0.0.1, not "localhost": on Windows, gloo's makeDeviceForHostname()
++    # fails to resolve "localhost" ("unsupported gloo device").
++    os.environ["MASTER_ADDR"] = "127.0.0.1"
++    os.environ.setdefault("USE_LIBUV", "0")
+     os.environ["MASTER_PORT"] = str(main_port)
+     os.environ["RANK"] = str(local_rank)
+     os.environ["LOCAL_RANK"] = str(local_rank)
+diff --git a/sam3/train/trainer.py b/sam3/train/trainer.py
+index 59a8609..722301f 100644
+--- a/sam3/train/trainer.py
++++ b/sam3/train/trainer.py
+@@ -218,9 +218,12 @@ class Trainer:
+         set_seeds(seed_value, self.max_epochs, self.distributed_rank)
+         log_env_variables()
+ 
+-        assert is_dist_avail_and_initialized(), (
+-            "Torch distributed needs to be initialized before calling the trainer."
+-        )
++        # Single-process Windows runs may legitimately have no process group
++        # (gloo device creation is broken in some torch builds); all dist
++        # helpers used below no-op in that case.
++        assert is_dist_avail_and_initialized() or int(
++            os.environ.get("WORLD_SIZE", "1")
++        ) == 1, "Torch distributed needs to be initialized before calling the trainer."
+ 
+         self._setup_components()  # Except Optimizer everything is setup here.
+         self._move_to_device()
+@@ -245,6 +248,10 @@ class Trainer:
+         self.load_checkpoint()
+         self._setup_ddp_distributed_training(distributed, accelerator)
+         barrier()
++        # `logging` is a constructor arg (Hydra), so use the stdlib module here.
++        __import__("logging").info(
++            "Trainer constructor finished; CUDA setup is complete."
++        )
+ 
+     def _setup_timers(self):
+         """
+@@ -306,8 +313,76 @@ class Trainer:
+         else:
+             raise ValueError(f"Unsupported accelerator: {accelerator}")
+ 
++    def _freeze_phase1_backbones(self) -> None:
++        """Freeze vision/text encoders for real, not just lr=0.
++
++        lr=0 still backprops through the ViT and (on Windows) can native-crash
++        while AdamW/DDP allocate state for all 840M params on a 16GB GPU.
++        """
++        backbone = getattr(self.model, "backbone", None)
++        if backbone is None:
++            return
++        frozen = 0
++        for attr in ("vision_backbone", "language_backbone"):
++            mod = getattr(backbone, attr, None)
++            if mod is None:
++                continue
++            for p in mod.parameters():
++                p.requires_grad = False
++                frozen += 1
++            # Keep frozen encoders in eval(). Trainer.train_epoch() calls
++            # model.train(), which would otherwise re-enable ViT activation
++            # checkpointing inside our no_grad wrap and illegal-memory-access
++            # on Windows CUDA.
++            mod.eval()
++
++            def _stay_eval(mode=True, _mod=mod):
++                # Call nn.Module.train directly. mod.eval() would recurse
++                # because eval() is implemented as self.train(False).
++                return torch.nn.Module.train(_mod, False)
++
++            mod.train = _stay_eval
++            trunk = getattr(mod, "trunk", None)
++            if trunk is not None and hasattr(trunk, "use_act_checkpoint"):
++                trunk.use_act_checkpoint = False
++        logging.info(
++            "Phase 1: requires_grad=False on %s vision/text backbone parameters",
++            frozen,
++        )
++        if hasattr(backbone, "forward_image"):
++            orig_img = backbone.forward_image
++
++            def forward_image(*args, **kwargs):
++                with torch.no_grad():
++                    amp = torch.amp.autocast("cuda", enabled=False) if torch.cuda.is_available() else contextlib.nullcontext()
++                    with amp:
++                        return orig_img(*args, **kwargs)
++
++            backbone.forward_image = forward_image
++        if hasattr(backbone, "forward_text"):
++            orig_txt = backbone.forward_text
++
++            def forward_text(*args, **kwargs):
++                with torch.no_grad():
++                    return orig_txt(*args, **kwargs)
++
++            backbone.forward_text = forward_text
++        logging.info("Phase 1: vision/text backbone forwards wrapped in torch.no_grad")
++        # Activation checkpoint + AMP native-crashes on Windows CUDA
++        # (illegal memory access inside conv/attention recompute).
++        if hasattr(self.model, "use_act_checkpoint_seg_head"):
++            self.model.use_act_checkpoint_seg_head = False
++        seg = getattr(self.model, "segmentation_head", None)
++        if seg is not None and hasattr(seg, "act_ckpt"):
++            seg.act_ckpt = False
++        logging.info("Phase 1: disabled segmentation-head activation checkpointing")
++
+     def _setup_ddp_distributed_training(self, distributed_conf, accelerator):
+         assert isinstance(self.model, torch.nn.Module)
++        world_size = dist.get_world_size() if dist.is_initialized() else 1
++        if world_size <= 1:
++            logging.info("Single process: skipping DistributedDataParallel wrap")
++            return
+ 
+         self.model = nn.parallel.DistributedDataParallel(
+             self.model,
+@@ -564,6 +639,7 @@ class Trainer:
+ 
+     def run(self):
+         assert self.mode in ["train", "train_only", "val"]
++        logging.info("Trainer.run() mode=%s epoch=%s", self.mode, self.epoch)
+         if self.mode == "train":
+             if self.epoch > 0:
+                 logging.info(f"Resuming training from epoch: {self.epoch}")
+@@ -592,7 +668,9 @@ class Trainer:
+ 
+     def run_train(self):
+         while self.epoch < self.max_epochs:
++            logging.info("run_train: getting loader for epoch %s", self.epoch)
+             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch))
++            logging.info("run_train: loader ready, entering train_epoch")
+             barrier()
+             outs = self.train_epoch(dataloader)
+             self.logger.log_dict(outs, self.epoch)  # Logged only on rank 0
+@@ -803,7 +881,9 @@ class Trainer:
+         )
+ 
+         # Model training loop
++        logging.info("train_epoch: calling model.train() then first batch")
+         self.model.train()
++        logging.info("train_epoch: model.train() returned")
+         end = time.time()
+ 
+         for data_iter, batch in enumerate(train_loader):
+@@ -1092,6 +1172,7 @@ class Trainer:
+         self.logger = Logger(self.logging_conf)
+ 
+         self.model = instantiate(self.model_conf, _convert_="all")
++        self._freeze_phase1_backbones()
+         print_model_summary(self.model)
+ 
+         self.loss = None
+@@ -1122,11 +1203,21 @@ class Trainer:
+         logging.info("Finished setting up components: Model, loss, optim, meters etc.")
+ 
+     def _construct_optimizers(self):
++        allowlist = {
++            name for name, p in self.model.named_parameters() if p.requires_grad
++        }
++        logging.info(
++            "Constructing optimizer for %s trainable / %s total parameters",
++            len(allowlist),
++            sum(1 for _ in self.model.named_parameters()),
++        )
+         self.optim = construct_optimizer(
+             self.model,
+             self.optim_conf.optimizer,
+             self.optim_conf.options,
+             self.optim_conf.param_group_modifiers,
++            param_allowlist=allowlist,
++            validate_param_groups=False,
+         )
+ 
+     def _log_loss_detailed_and_return_core_loss(self, loss, loss_str, step):
+diff --git a/sam3/train/utils/train_utils.py b/sam3/train/utils/train_utils.py
+index ca259a3..4620094 100644
+--- a/sam3/train/utils/train_utils.py
++++ b/sam3/train/utils/train_utils.py
+@@ -72,7 +72,23 @@ def setup_distributed_backend(backend, timeout_mins):
+     # of waiting
+     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+     logging.info(f"Setting up torch.distributed with a timeout of {timeout_mins} mins")
+-    dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout_mins))
++    try:
++        dist.init_process_group(
++            backend=backend, timeout=timedelta(minutes=timeout_mins)
++        )
++    except RuntimeError as e:
++        # Windows: some torch builds cannot create a gloo device at all
++        # ("makeDeviceForHostname(): unsupported gloo device"). For a
++        # single-process run no process group is needed; every dist helper
++        # in this repo already no-ops when dist is uninitialized.
++        if int(os.environ.get("WORLD_SIZE", "1")) == 1:
++            logging.warning(
++                "torch.distributed init failed (%s); continuing WITHOUT a "
++                "process group since WORLD_SIZE=1.",
++                e,
++            )
++            return 0
++        raise
+     return dist.get_rank()
+ 
+ 
