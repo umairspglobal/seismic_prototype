@@ -295,6 +295,20 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+def root() -> dict:
+    """Browser-friendly status for the API process (not the React UI)."""
+    return {
+        "service": "Seismic SAM interactive API",
+        "frontend": "http://127.0.0.1:5173",
+        "docs": "/docs",
+        "runtime": "/api/runtime",
+        "load_stage": _load_state["stage"],
+        "load_error": _load_state["error"],
+        "ready": _point_segmenter is not None and _load_state["stage"] != "error",
+    }
+
+
 def _list_sgy() -> list[Path]:
     if not DATA_DIR.exists():
         return []
