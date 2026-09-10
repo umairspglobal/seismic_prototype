@@ -1,5 +1,6 @@
 export interface FileInfo {
   name: string;
+  format: "sgy" | "npy";
   kind: "2d" | "3d";
   shape: number[];
   axes: { inline: number; crossline: number; time: number };
@@ -194,8 +195,9 @@ async function readEventStream(
   }
 }
 
-export async function listFiles(): Promise<FileInfo[]> {
-  const res = await fetch(apiUrl("/api/files"));
+export async function listFiles(format?: "npy" | "sgy"): Promise<FileInfo[]> {
+  const query = format ? `?format=${format}` : "";
+  const res = await fetch(apiUrl(`/api/files${query}`));
   if (!res.ok) throw new Error(`Failed to list files: ${res.status}`);
   return res.json();
 }

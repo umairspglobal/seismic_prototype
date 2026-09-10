@@ -132,16 +132,37 @@ export default function App() {
   const userPickedFamily = useRef<ModelFamily | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
+    // NPY metadata is effectively instant. Show those files immediately
+    // instead of waiting for SEG-Y geometry scans over every trace header.
+    listFiles("npy")
+      .then((npyFiles) => {
+        if (cancelled || !npyFiles.length) return;
+        setFiles(npyFiles);
+        setFile((current) => current ?? npyFiles.find((x) => x.kind === "3d") ?? npyFiles[0]);
+        setStatus("");
+      })
+      .catch(() => undefined);
+
     listFiles()
       .then((f) => {
+        if (cancelled) return;
         setFiles(f);
-        const preferred = f.find((x) => x.kind === "3d") ?? f[0] ?? null;
-        setFile(preferred);
-        setStatus(f.length ? "" : "No .sgy files found in data/");
+        setFile((current) => {
+          if (current) return f.find((item) => item.name === current.name) ?? current;
+          return f.find((x) => x.kind === "3d") ?? f[0] ?? null;
+        });
+        setStatus(f.length ? "" : "No .sgy or .npy files found in data/");
       })
-      .catch(() =>
-        setStatus("Cannot reach the inference server. Start it with: uvicorn server.main:app"),
-      );
+      .catch(() => {
+        if (!cancelled) {
+          setStatus("Cannot reach the inference server. Start it with: uvicorn server.main:app");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -783,9 +804,18 @@ export default function App() {
             }}
           >
             {files.map((f) => (
-              <option key={f.name}>{f.name}</option>
+              <option key={f.name} value={f.name}>
+                {f.name} — {f.kind.toUpperCase()} {f.shape.join(" × ")}
+              </option>
             ))}
           </select>
+          {file.format === "npy" && (
+            <p className="hint">
+              NumPy axes: samples × traces for 2D, or inline × crossline ×
+              samples for 3D. VTI export uses 25 m bins and a 4 ms sample
+              interval because .npy files do not contain survey headers.
+            </p>
+          )}
         </label>
 
         {file.kind === "3d" && (

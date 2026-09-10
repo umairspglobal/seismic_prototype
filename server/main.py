@@ -49,7 +49,7 @@ from seismic_app.inference import (
 from seismic_app.logutil import get_logger
 from seismic_app.preprocessing import inline_to_rgb_25d, normalize_to_uint8, to_rgb
 from seismic_app.pipeline import _segment_section_rgb
-from seismic_app.sgy_loader import load_any
+from seismic_app.sgy_loader import SUPPORTED_SEISMIC_SUFFIXES, inspect_any, load_any
 from seismic_app.stitching import binarize
 from seismic_app.vtk_export import FIRST_INTERACTIVE_LABEL_ID, export_volume_vti
 
@@ -309,20 +309,32 @@ def root() -> dict:
     }
 
 
-def _list_sgy() -> list[Path]:
+def _list_seismic_files() -> list[Path]:
     if not DATA_DIR.exists():
         return []
-    return sorted(p for p in DATA_DIR.iterdir() if p.suffix.lower() == ".sgy")
+    return sorted(
+        (
+            p
+            for p in DATA_DIR.iterdir()
+            if p.is_file() and p.suffix.lower() in SUPPORTED_SEISMIC_SUFFIXES
+        ),
+        key=lambda p: p.name.lower(),
+    )
 
 
 def _get_file(name: str) -> tuple[np.ndarray, SectionGeometry, np.ndarray]:
-    allowed = {p.name: p for p in _list_sgy()}
+    allowed = {p.name: p for p in _list_seismic_files()}
     if name not in allowed:
         raise HTTPException(404, f"Unknown seismic file: {name}")
     with _cache_lock:
         if name not in _file_cache:
             log.info("Loading and normalizing %s...", name)
-            data, geometry = load_any(allowed[name])
+            try:
+                data, geometry = load_any(allowed[name])
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                raise HTTPException(
+                    422, f"Could not load seismic file {name}: {exc}"
+                ) from exc
             _file_cache[name] = (data, geometry, normalize_to_uint8(data))
         return _file_cache[name]
 
@@ -498,18 +510,30 @@ def set_text_checkpoint(req: SetTextCheckpointRequest) -> dict:
 
 
 @app.get("/api/files")
-def list_files() -> list[dict]:
+def list_files(format: str | None = None) -> list[dict]:
+    """List data metadata; an optional format filter supports fast NPY discovery."""
+    if format is not None and format.lower() not in ("npy", "sgy"):
+        raise HTTPException(422, "format must be 'npy' or 'sgy'")
+    requested_suffix = f".{format.lower()}" if format else None
     entries = []
-    for path in _list_sgy():
-        data, geometry, _ = _get_file(path.name)
+    for path in _list_seismic_files():
+        if requested_suffix is not None and path.suffix.lower() != requested_suffix:
+            continue
+        try:
+            shape, geometry = inspect_any(path)
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            log.warning("Skipping unusable data file %s: %s", path, exc)
+            continue
         entries.append(
             {
                 "name": path.name,
+                "format": path.suffix.lower().lstrip("."),
                 "kind": geometry.kind,
-                "shape": list(data.shape),
+                "shape": list(shape),
                 "axes": {
-                    axis: _axis_count(data, geometry, axis)
-                    for axis in ("inline", "crossline", "time")
+                    "inline": shape[0],
+                    "crossline": shape[1],
+                    "time": shape[2],
                 }
                 if geometry.kind == "3d"
                 else {"inline": 1, "crossline": 1, "time": 1},
@@ -903,7 +927,7 @@ def _slice_masks_to_cube(
 
 @app.post("/api/export")
 def export_volume(req: ExportRequest) -> dict:
-    """Write the tracked volume to a ParaView .vti next to the CLI outputs."""
+    """Write a tracked SEG-Y or NumPy volume to a ParaView .vti."""
     data, geometry, _ = _get_file(req.file)
     if geometry.kind != "3d":
         raise HTTPException(422, "Volume export requires a 3D volume")
@@ -950,7 +974,7 @@ def _export_path(file: str, axis: str) -> Path:
 @app.get("/api/export/file")
 def download_export(file: str, axis: str = "inline") -> FileResponse:
     """Stream the last written .vti so the browser can save it for ParaView."""
-    allowed = {p.name for p in _list_sgy()}
+    allowed = {p.name for p in _list_seismic_files()}
     if file not in allowed:
         raise HTTPException(404, f"Unknown seismic file: {file}")
     if axis not in ("inline", "crossline", "time"):

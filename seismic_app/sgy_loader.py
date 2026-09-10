@@ -1,9 +1,15 @@
-"""Step 1 of the pipeline: read .sgy files with segyio, keeping geometry.
+"""Step 1 of the pipeline: read seismic arrays while keeping geometry.
 
-Files are auto-detected as either 3D volumes (inline/crossline headers
-populated and consistently sorted) or 2D lines (everything else - all the
-current files in data/ are 2D crooked lines with CDP numbering and
-per-trace navigation coordinates).
+SEG-Y files are auto-detected as either 3D volumes (inline/crossline
+headers populated and consistently sorted) or 2D lines. NumPy ``.npy``
+files have no headers, so their dimensions define their geometry:
+
+- 2D: ``(n_samples, n_traces)``
+- 3D: ``(n_inlines, n_crosslines, n_samples)``
+
+Singleton dimensions are removed before this check. NumPy geometry uses
+index-valued inline/crossline coordinates and conservative default
+spacings (25 m bins and a 4 ms sample interval).
 
 Orientation convention: 2D sections are returned as (n_samples, n_traces)
 - time increases down the rows, traces run along the columns - so the
@@ -23,6 +29,10 @@ from .geometry import SectionGeometry, extract_2d_geometry, extract_3d_geometry
 from .logutil import get_logger
 
 log = get_logger("sgy_loader")
+
+SUPPORTED_SEISMIC_SUFFIXES = frozenset({".sgy", ".npy"})
+DEFAULT_NPY_SPACING_M = 25.0
+DEFAULT_NPY_DT_MS = 4.0
 
 # Header byte positions that may carry inline/crossline numbering. The
 # SEG-Y standard says bytes 189/193, but many vendor exports put the grid
@@ -129,14 +139,132 @@ def load_volume(path: str | Path) -> tuple[np.ndarray, SectionGeometry]:
     return cube, geometry
 
 
+def _numpy_shape(path: Path) -> tuple[int, ...]:
+    """Read and validate an NPY shape without materializing its amplitudes."""
+    try:
+        raw = np.load(path, mmap_mode="r", allow_pickle=False)
+    except ValueError as exc:
+        raise ValueError(f"{path.name} is not a numeric .npy array: {exc}") from exc
+    if not np.issubdtype(raw.dtype, np.number) or np.issubdtype(
+        raw.dtype, np.complexfloating
+    ):
+        raise ValueError(
+            f"{path.name} must contain a real numeric array, got dtype {raw.dtype}"
+        )
+    shape = tuple(size for size in raw.shape if size != 1)
+    if len(shape) not in (2, 3):
+        raise ValueError(
+            f"{path.name} must be 2D or 3D after removing singleton dimensions; "
+            f"got shape {raw.shape}"
+        )
+    if any(size == 0 for size in shape):
+        raise ValueError(f"{path.name} contains an empty dimension: {shape}")
+    return shape
+
+
+def _numpy_geometry(shape: tuple[int, ...]) -> SectionGeometry:
+    """Construct index-based physical geometry for a validated NPY shape."""
+    if len(shape) == 2:
+        n_samples, n_traces = shape
+        trace_positions = np.arange(n_traces, dtype=np.float64)
+        return SectionGeometry(
+            kind="2d",
+            n_traces=n_traces,
+            n_samples=n_samples,
+            dt_ms=DEFAULT_NPY_DT_MS,
+            t0_ms=0.0,
+            cdp=np.arange(n_traces, dtype=np.int64),
+            world_x=trace_positions * DEFAULT_NPY_SPACING_M,
+            world_y=np.zeros(n_traces, dtype=np.float64),
+            distance_m=trace_positions * DEFAULT_NPY_SPACING_M,
+            trace_spacing_m=DEFAULT_NPY_SPACING_M,
+        )
+
+    n_ilines, n_xlines, n_samples = shape
+    return SectionGeometry(
+        kind="3d",
+        n_traces=n_ilines * n_xlines,
+        n_samples=n_samples,
+        dt_ms=DEFAULT_NPY_DT_MS,
+        t0_ms=0.0,
+        ilines=np.arange(n_ilines, dtype=np.int64),
+        xlines=np.arange(n_xlines, dtype=np.int64),
+        iline_spacing_m=DEFAULT_NPY_SPACING_M,
+        xline_spacing_m=DEFAULT_NPY_SPACING_M,
+    )
+
+
+def load_numpy(path: str | Path) -> tuple[np.ndarray, SectionGeometry]:
+    """Read a headerless NumPy section or volume using the app conventions."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"NumPy file not found: {path}")
+
+    try:
+        raw = np.load(path, allow_pickle=False)
+    except ValueError as exc:
+        raise ValueError(f"{path.name} is not a numeric .npy array: {exc}") from exc
+
+    shape = _numpy_shape(path)
+    data = np.squeeze(raw)
+    data = np.ascontiguousarray(data, dtype=np.float32)
+    if not np.all(np.isfinite(data)):
+        finite = data[np.isfinite(data)]
+        if finite.size == 0:
+            raise ValueError(f"{path.name} contains no finite amplitude values")
+        log.warning("Replacing non-finite amplitudes in %s with zero", path)
+        data = np.nan_to_num(data, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+    geometry = _numpy_geometry(shape)
+
+    log.info("Loaded NumPy %s array %s using index geometry", geometry.kind, data.shape)
+    return data, geometry
+
+
+def inspect_any(path: str | Path) -> tuple[tuple[int, ...], SectionGeometry]:
+    """Return shape and geometry without loading seismic amplitudes."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        shape = _numpy_shape(path)
+        return shape, _numpy_geometry(shape)
+    if suffix != ".sgy":
+        supported = ", ".join(sorted(SUPPORTED_SEISMIC_SUFFIXES))
+        raise ValueError(f"Unsupported seismic file type {suffix!r}; expected {supported}")
+
+    f = _open_3d(path)
+    if f is not None:
+        try:
+            shape = (len(f.ilines), len(f.xlines), len(f.samples))
+            return shape, extract_3d_geometry(f)
+        finally:
+            f.close()
+    with segyio.open(str(path), ignore_geometry=True) as f:
+        shape = (len(f.samples), f.tracecount)
+        return shape, extract_2d_geometry(f)
+
+
 def load_any(path: str | Path) -> tuple[np.ndarray, SectionGeometry]:
-    """Auto-detect 2D vs 3D and load accordingly.
+    """Load a supported seismic file and return app-oriented data and geometry.
 
     2D lines come back as (n_samples, n_traces) sections; 3D volumes as
     (n_ilines, n_xlines, n_samples) cubes. Check geometry.kind to tell
     them apart.
     """
-    if is_3d_volume(path):
-        return load_volume(path)
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        return load_numpy(path)
+    if suffix != ".sgy":
+        supported = ", ".join(sorted(SUPPORTED_SEISMIC_SUFFIXES))
+        raise ValueError(f"Unsupported seismic file type {suffix!r}; expected {supported}")
+    f = _open_3d(path)
+    if f is not None:
+        try:
+            cube = np.asarray(segyio.tools.cube(f), dtype=np.float32)
+            geometry = extract_3d_geometry(f)
+        finally:
+            f.close()
+        return cube, geometry
     log.info("Loading %s as a 2D line (no 3D grid found in headers)", path)
     return load_section(path)
