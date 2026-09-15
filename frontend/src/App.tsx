@@ -47,6 +47,7 @@ const freshObject = (id: number): SegObject => ({ id, points: [], maskUrl: null 
 
 const FALLBACK_TRACKERS = [
   { id: "sam3" as const, label: "SAM 3", checkpoint: "facebook/sam3", gated: true },
+  { id: "sam31" as const, label: "SAM 3.1", checkpoint: "facebook/sam3.1", gated: true },
   { id: "sam2" as const, label: "SAM 2", checkpoint: "facebook/sam2.1-hiera-large", gated: false },
 ];
 
@@ -437,7 +438,7 @@ export default function App() {
         setAutoCheckpoint(result.checkpoint);
         if (result.unloaded_tracker) {
           setStatus(
-            "Facies detector needed the GPU, so the click tracker was unloaded. Switch SAM 3 / SAM 2 to reload it.",
+            "Facies detector needed the GPU, so the click tracker was unloaded. Re-select a tracker model to reload it.",
           );
         }
       })
@@ -686,8 +687,16 @@ export default function App() {
   const progressPct = propagation
     ? Math.round((100 * propagation.done) / propagation.total)
     : 0;
-  const modelsLoading = !pointReady && !runtime?.text_detector_loaded;
-  const familyLabel = runtime?.family_label ?? (modelFamily === "sam2" ? "SAM 2" : "SAM 3");
+  const detectorCanStayInteractive =
+    modelFamily === "sam3" && Boolean(runtime?.text_detector_loaded);
+  const modelsLoading = !pointReady && !detectorCanStayInteractive;
+  const familyLabel =
+    runtime?.family_label ??
+    (modelFamily === "sam2"
+      ? "SAM 2"
+      : modelFamily === "sam31"
+        ? "SAM 3.1"
+        : "SAM 3");
   const textCheckpointOptions =
     runtime?.available_text_checkpoints?.length
       ? runtime.available_text_checkpoints
@@ -736,8 +745,9 @@ export default function App() {
             ))}
           </select>
           <p className="hint">
-            Official click/volume trackers only. Switch to compare masks on
-            the same clicks; only one stays on the GPU.
+            {modelFamily === "sam31"
+              ? "Object Multiplex tracks objects in shared memory. It requires the latest native SAM 3 code and CUDA."
+              : "Official click/volume trackers only. Switch to compare masks on the same clicks; only one stays on the GPU."}
           </p>
         </label>
 
@@ -1188,7 +1198,7 @@ export default function App() {
           busy={
             propagation?.running ||
             autoDetecting ||
-            (!pointReady && !runtime?.text_detector_loaded) ||
+            (!pointReady && !detectorCanStayInteractive) ||
             (!prepared && trackedIds.length === 0 && !autoMaskUrl)
           }
           onPick={handlePick}

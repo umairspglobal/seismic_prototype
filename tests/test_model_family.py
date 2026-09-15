@@ -19,6 +19,9 @@ def test_resolve_family_defaults_to_sam3():
     [
         ("sam3", "sam3"),
         ("SAM 3", "sam3"),
+        ("sam31", "sam31"),
+        ("SAM 3.1", "sam31"),
+        ("SAM-3.1", "sam31"),
         ("sam2", "sam2"),
         ("SAM 2", "sam2"),
         ("sam2.1", "sam2"),
@@ -38,6 +41,12 @@ def test_sam2_checkpoint_is_the_improved_hiera_large():
     assert config.checkpoint_for("sam2") == "facebook/sam2.1-hiera-large"
     assert config.family_spec("sam2")["gated"] is False
     assert config.family_spec("sam3")["gated"] is True
+
+
+def test_sam31_uses_native_object_multiplex_checkpoint():
+    assert config.checkpoint_for("sam31") == "facebook/sam3.1"
+    assert config.family_spec("sam31")["gated"] is True
+    assert "Object Multiplex" in config.family_spec("sam31")["architecture"]
 
 
 @pytest.fixture(autouse=True)

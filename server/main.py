@@ -9,8 +9,9 @@ mask decoder. Propagation streams one NDJSON event per tracked slice so
 the browser can display and scrub frames while the sweep is still
 running.
 
-SAM 3 is loaded by default. POST /api/model with ``{"family": "sam2"}``
-or ``{"family": "sam3"}`` to switch; only one family stays on the GPU.
+SAM 3 is loaded by default. POST /api/model with ``{"family": "sam2"}``,
+``{"family": "sam3"}``, or ``{"family": "sam31"}`` to switch; only one
+family stays on the GPU.
 """
 
 from __future__ import annotations
@@ -41,9 +42,12 @@ from seismic_app.config import ModelFamily
 from seismic_app.geometry import SectionGeometry
 from seismic_app.inference import (
     LiveTracker,
+    Sam31PointSegmenter,
+    Sam31VolumePropagator,
     Sam3PointSegmenter,
     Sam3SeismicSegmenter,
     Sam3VolumePropagator,
+    build_sam31_predictor,
     transformers_version,
 )
 from seismic_app.logutil import get_logger
@@ -81,9 +85,10 @@ _gpu_lock = threading.Lock()
 _cache_lock = threading.Lock()
 _family_lock = threading.Lock()
 _file_cache: dict[str, tuple[np.ndarray, SectionGeometry, np.ndarray]] = {}
-_point_segmenter: Sam3PointSegmenter | None = None
-_propagator: Sam3VolumePropagator | None = None
+_point_segmenter: Sam3PointSegmenter | Sam31PointSegmenter | None = None
+_propagator: Sam3VolumePropagator | Sam31VolumePropagator | None = None
 _text_segmenter: Sam3SeismicSegmenter | None = None
+_sam31_predictor = None
 _active_family: ModelFamily = config.DEFAULT_MODEL_FAMILY
 _load_id = 0
 _load_state: dict[str, str | bool | None] = {
@@ -135,18 +140,30 @@ def _family_label(family: str | None = None) -> str:
 
 def _unload_models_locked() -> None:
     """Drop resident trackers so a different family can occupy the GPU."""
-    global _point_segmenter, _propagator, _propagation
+    global _point_segmenter, _propagator, _propagation, _sam31_predictor
     _propagation = None
     if _propagator is not None:
-        _propagator.live = None
+        close = getattr(_propagator, "close", None)
+        if close is not None:
+            close()
+        else:
+            _propagator.live = None
         _propagator.model = None
         _propagator.processor = None
         _propagator = None
     if _point_segmenter is not None:
-        _point_segmenter._prepared.clear()
+        close = getattr(_point_segmenter, "close", None)
+        if close is not None:
+            close()
+        else:
+            _point_segmenter._prepared.clear()
         _point_segmenter.model = None
         _point_segmenter.processor = None
         _point_segmenter = None
+    if _sam31_predictor is not None:
+        _sam31_predictor.shutdown()
+        _sam31_predictor.model = None
+        _sam31_predictor = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -154,7 +171,7 @@ def _unload_models_locked() -> None:
 
 def _load_models(family: ModelFamily, load_id: int) -> None:
     """Load one tracker family; ignore the result if a newer switch superseded it."""
-    global _point_segmenter, _propagator
+    global _point_segmenter, _propagator, _sam31_predictor
     label = _family_label(family)
     try:
         with _gpu_lock:
@@ -162,15 +179,29 @@ def _load_models(family: ModelFamily, load_id: int) -> None:
                 return
             _unload_models_locked()
             _load_state["error"] = None
-            _load_state["stage"] = f"Loading {label} point tracker onto the GPU..."
-            _point_segmenter = Sam3PointSegmenter(
-                family=family, embedding_cache_size=4
-            )
+            if family == "sam31":
+                # The SAM 3 text detector is hidden while SAM 3.1 is active;
+                # release it so the larger native multiplex model has VRAM.
+                _unload_text_segmenter_locked()
+                _load_state["stage"] = (
+                    "Loading SAM 3.1 Object Multiplex onto the GPU..."
+                )
+                _sam31_predictor = build_sam31_predictor()
+                _point_segmenter = Sam31PointSegmenter(
+                    _sam31_predictor, embedding_cache_size=4
+                )
+                _propagator = Sam31VolumePropagator(_sam31_predictor)
+            else:
+                _load_state["stage"] = f"Loading {label} point tracker onto the GPU..."
+                _point_segmenter = Sam3PointSegmenter(
+                    family=family, embedding_cache_size=4
+                )
             if load_id != _load_id:
                 _unload_models_locked()
                 return
-            _load_state["stage"] = f"Loading {label} volume tracker onto the GPU..."
-            _propagator = Sam3VolumePropagator(family=family)
+            if family != "sam31":
+                _load_state["stage"] = f"Loading {label} volume tracker onto the GPU..."
+                _propagator = Sam3VolumePropagator(family=family)
             if load_id != _load_id:
                 _unload_models_locked()
                 return
@@ -339,7 +370,7 @@ def _get_file(name: str) -> tuple[np.ndarray, SectionGeometry, np.ndarray]:
         return _file_cache[name]
 
 
-def _require_point_segmenter() -> Sam3PointSegmenter:
+def _require_point_segmenter() -> Sam3PointSegmenter | Sam31PointSegmenter:
     if _load_state["error"] and _point_segmenter is None:
         raise HTTPException(503, f"Model failed to load: {_load_state['error']}")
     if _point_segmenter is None:
@@ -353,7 +384,7 @@ def _require_point_segmenter() -> Sam3PointSegmenter:
     return _point_segmenter
 
 
-def _require_propagator() -> Sam3VolumePropagator:
+def _require_propagator() -> Sam3VolumePropagator | Sam31VolumePropagator:
     if _load_state["error"] and _propagator is None:
         raise HTTPException(503, f"Model failed to load: {_load_state['error']}")
     if _propagator is None:
@@ -477,7 +508,7 @@ class SetTextCheckpointRequest(BaseModel):
 
 @app.post("/api/model")
 def set_model(req: SetModelRequest) -> dict:
-    """Switch the resident tracker between SAM 2 and SAM 3.
+    """Switch the resident tracker between SAM 2, SAM 3, and SAM 3.1.
 
     Only one family is kept on the GPU. The previous models, cached
     embeddings, and any live tracked volume are dropped. Loading runs in

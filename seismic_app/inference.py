@@ -21,6 +21,7 @@ import importlib.util
 import math
 import threading
 import time
+from typing import Any
 
 import numpy as np
 import torch
@@ -51,6 +52,36 @@ def transformers_version() -> str | None:
 
             _tf_version = transformers.__version__
         return _tf_version
+
+
+def build_sam31_predictor(max_num_objects: int = 128) -> Any:
+    """Build the repository-native SAM 3.1 Object Multiplex predictor."""
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "SAM 3.1 Object Multiplex requires a CUDA GPU. Install the latest "
+            "facebookresearch/sam3 package and a CUDA-enabled PyTorch build, or "
+            "select SAM 3 / SAM 2."
+        )
+    try:
+        from sam3.model_builder import build_sam3_multiplex_video_predictor
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise RuntimeError(
+            "SAM 3.1 needs the latest facebookresearch/sam3 model code. "
+            "Reinstall requirements.txt, or run: "
+            "pip install -U git+https://github.com/facebookresearch/sam3.git"
+        ) from exc
+
+    log.info("Loading native SAM 3.1 Object Multiplex predictor...")
+    return build_sam3_multiplex_video_predictor(
+        max_num_objects=max_num_objects,
+        multiplex_count=16,
+        # These optional kernels are not part of the base installation.
+        use_fa3=False,
+        use_rope_real=True,
+        compile=False,
+        warm_up=False,
+        async_loading_frames=False,
+    )
 
 
 def _point_tracker_classes(family: str | None = None) -> tuple[type, type]:
@@ -412,6 +443,365 @@ class LiveTracker:
     def close(self) -> None:
         self.sessions.clear()
         self.slots.clear()
+
+
+def _native_mask_rows(outputs: dict | None) -> dict[int, np.ndarray]:
+    """Normalize repository-native predictor output to object-id mask rows."""
+    if not outputs:
+        return {}
+    object_ids = np.asarray(outputs.get("out_obj_ids", []), dtype=np.int64).reshape(-1)
+    masks = np.asarray(outputs.get("out_binary_masks", []), dtype=bool)
+    if masks.ndim == 2:
+        masks = masks[None, ...]
+    return {
+        int(object_id): np.asarray(mask, dtype=bool)
+        for object_id, mask in zip(object_ids, masks)
+    }
+
+
+def _close_native_session(predictor: Any, session_id: str) -> None:
+    try:
+        predictor.handle_request(
+            {
+                "type": "close_session",
+                "session_id": session_id,
+                "run_gc_collect": False,
+            }
+        )
+    except Exception:
+        log.debug("Could not close native SAM 3.1 session %s", session_id, exc_info=True)
+
+
+class Sam31PointSegmenter:
+    """Single-image point prompting through SAM 3.1's native video predictor."""
+
+    family = "sam31"
+    checkpoint = "facebook/sam3.1"
+    device = "cuda"
+
+    def __init__(self, predictor: Any, embedding_cache_size: int = 2):
+        self.predictor = predictor
+        self.model = predictor.model
+        self.processor = None
+        self.embedding_cache_size = max(1, int(embedding_cache_size))
+        self._prepared: OrderedDict[Hashable, dict] = OrderedDict()
+        self.last_timings: dict[str, float] = {}
+
+    def prepare_image(
+        self,
+        rgb: np.ndarray,
+        image_key: Hashable | None = None,
+    ) -> Hashable:
+        key = image_key if image_key is not None else ("array", id(rgb), rgb.shape)
+        if key in self._prepared:
+            self._prepared.move_to_end(key)
+            self.last_timings["prepare_image"] = 0.0
+            return key
+
+        started = time.perf_counter()
+        response = self.predictor.handle_request(
+            {
+                "type": "start_session",
+                "resource_path": [Image.fromarray(rgb).convert("RGB")],
+                "offload_video_to_cpu": True,
+            }
+        )
+        self._prepared[key] = {
+            "session_id": response["session_id"],
+            "shape": rgb.shape[:2],
+        }
+        self._prepared.move_to_end(key)
+        while len(self._prepared) > self.embedding_cache_size:
+            _, evicted = self._prepared.popitem(last=False)
+            _close_native_session(self.predictor, evicted["session_id"])
+        self.last_timings["prepare_image"] = time.perf_counter() - started
+        return key
+
+    @torch.no_grad()
+    def segment(
+        self,
+        rgb: np.ndarray,
+        points: list[tuple[int, int]],
+        labels: list[int],
+        image_key: Hashable | None = None,
+    ) -> np.ndarray:
+        if len(points) != len(labels) or not points:
+            raise ValueError("points and labels must be equal-length and non-empty")
+
+        started = time.perf_counter()
+        key = self.prepare_image(rgb, image_key=image_key)
+        session_id = self._prepared[key]["session_id"]
+        response = self.predictor.handle_request(
+            {
+                "type": "add_prompt",
+                "session_id": session_id,
+                "frame_index": 0,
+                "points": [[float(x), float(y)] for x, y in points],
+                "point_labels": [int(label) for label in labels],
+                "obj_id": 1,
+                "clear_old_points": True,
+                "rel_coordinates": False,
+            }
+        )
+        rows = _native_mask_rows(response.get("outputs"))
+        mask = rows.get(1)
+        if mask is None:
+            mask = np.zeros(rgb.shape[:2], dtype=bool)
+        self.last_timings["total"] = time.perf_counter() - started
+        return mask
+
+    def close(self) -> None:
+        for prepared in self._prepared.values():
+            _close_native_session(self.predictor, prepared["session_id"])
+        self._prepared.clear()
+
+
+class Sam31LiveTracker(LiveTracker):
+    """Live SAM 3.1 session plus the app's persistent mask volume."""
+
+    def __init__(
+        self,
+        predictor: Any,
+        session_id: str,
+        n_objects: int,
+        n_frames: int,
+        height: int,
+        width: int,
+    ):
+        super().__init__(n_objects, n_frames, height, width)
+        self.predictor = predictor
+        self.session_id = session_id
+
+    def close(self) -> None:
+        _close_native_session(self.predictor, self.session_id)
+        super().close()
+
+
+class Sam31VolumePropagator:
+    """SAM 3.1 Object Multiplex adapter for seismic-slice video tracking."""
+
+    family = "sam31"
+    checkpoint = "facebook/sam3.1"
+    device = "cuda"
+    session_dtype = torch.bfloat16
+
+    def __init__(self, predictor: Any):
+        self.predictor = predictor
+        self.model = predictor.model
+        self.processor = None
+        self.live: Sam31LiveTracker | None = None
+        self.last_timings: dict[str, float] = {}
+
+    @staticmethod
+    def _apply_outputs(
+        live: Sam31LiveTracker,
+        frame_idx: int,
+        outputs: dict | None,
+    ) -> None:
+        for native_id, mask in _native_mask_rows(outputs).items():
+            object_index = native_id - 1
+            if 0 <= object_index < live.n_objects:
+                live.masks[object_index, frame_idx] = mask
+
+    @torch.no_grad()
+    def propagate(
+        self,
+        frames: Sequence[np.ndarray] | np.ndarray,
+        anchor_idx: int,
+        points_per_object: Sequence[Sequence[tuple[int, int]]],
+        labels_per_object: Sequence[Sequence[int]],
+        frame_indices_per_object: Sequence[Sequence[int]] | None = None,
+        progress: Callable[[int, int, int, np.ndarray], None] | None = None,
+        keep_live: bool = False,
+    ) -> np.ndarray:
+        if not points_per_object or len(points_per_object) != len(labels_per_object):
+            raise ValueError("need at least one object with matching points/labels")
+        if frame_indices_per_object is None:
+            frame_indices_per_object = [
+                [anchor_idx] * len(points) for points in points_per_object
+            ]
+        if len(frame_indices_per_object) != len(points_per_object):
+            raise ValueError("frame_indices_per_object must match points_per_object")
+
+        n_frames = len(frames)
+        for points, labels, frame_indices in zip(
+            points_per_object, labels_per_object, frame_indices_per_object
+        ):
+            if (
+                len(points) != len(labels)
+                or len(points) != len(frame_indices)
+                or not points
+            ):
+                raise ValueError(
+                    "each object needs equal-length, non-empty points/labels/slices"
+                )
+            if any(not 0 <= int(frame) < n_frames for frame in frame_indices):
+                raise ValueError("point slice index out of range")
+            if 1 not in labels:
+                raise ValueError("each object needs at least one positive (+) point")
+
+        if self.live is not None:
+            self.live.close()
+            self.live = None
+
+        started = time.perf_counter()
+        height, width = frames[0].shape[:2]
+        pil_frames = [Image.fromarray(frame).convert("RGB") for frame in frames]
+        response = self.predictor.handle_request(
+            {
+                "type": "start_session",
+                "resource_path": pil_frames,
+                "offload_video_to_cpu": True,
+            }
+        )
+        live = Sam31LiveTracker(
+            self.predictor,
+            response["session_id"],
+            len(points_per_object),
+            n_frames,
+            height,
+            width,
+        )
+        self.last_timings["session_init"] = time.perf_counter() - started
+
+        try:
+            for object_index, (points, labels, frame_indices) in enumerate(
+                zip(points_per_object, labels_per_object, frame_indices_per_object)
+            ):
+                grouped: dict[int, tuple[list[list[float]], list[int]]] = {}
+                for (x, y), label, frame_idx in zip(points, labels, frame_indices):
+                    frame_points, frame_labels = grouped.setdefault(
+                        int(frame_idx), ([], [])
+                    )
+                    frame_points.append([float(x), float(y)])
+                    frame_labels.append(int(label))
+                for frame_idx, (frame_points, frame_labels) in sorted(grouped.items()):
+                    prompt_response = self.predictor.handle_request(
+                        {
+                            "type": "add_prompt",
+                            "session_id": live.session_id,
+                            "frame_index": frame_idx,
+                            "points": frame_points,
+                            "point_labels": frame_labels,
+                            "obj_id": object_index + 1,
+                            "clear_old_points": True,
+                            "rel_coordinates": False,
+                        }
+                    )
+                    self._apply_outputs(
+                        live, frame_idx, prompt_response.get("outputs")
+                    )
+
+            visited: set[int] = set()
+            for event in self.predictor.handle_stream_request(
+                {
+                    "type": "propagate_in_video",
+                    "session_id": live.session_id,
+                }
+            ):
+                frame_idx = int(event["frame_index"])
+                self._apply_outputs(live, frame_idx, event.get("outputs"))
+                visited.add(frame_idx)
+                if progress is not None:
+                    progress(
+                        len(visited),
+                        n_frames,
+                        frame_idx,
+                        live.masks[:, frame_idx],
+                    )
+        except Exception:
+            live.close()
+            raise
+
+        elapsed = time.perf_counter() - started
+        self.last_timings.update(
+            inference=elapsed - self.last_timings["session_init"],
+            total=elapsed,
+            fps=n_frames / elapsed if elapsed else float("inf"),
+            object_waves=1.0,
+            objects_per_wave=float(len(points_per_object)),
+        )
+        if keep_live:
+            self.live = live
+        else:
+            live.close()
+        return live.masks
+
+    @torch.no_grad()
+    def refine_frame(
+        self,
+        live: Sam31LiveTracker,
+        object_index: int,
+        frame_idx: int,
+        points: Sequence[tuple[int, int]],
+        labels: Sequence[int],
+    ) -> np.ndarray:
+        if not points or len(points) != len(labels):
+            raise ValueError("refinement needs equal-length, non-empty points/labels")
+        started = time.perf_counter()
+        response = self.predictor.handle_request(
+            {
+                "type": "add_prompt",
+                "session_id": live.session_id,
+                "frame_index": int(frame_idx),
+                "points": [[float(x), float(y)] for x, y in points],
+                "point_labels": [int(label) for label in labels],
+                "obj_id": int(object_index) + 1,
+                "clear_old_points": True,
+                "rel_coordinates": False,
+            }
+        )
+        self._apply_outputs(live, int(frame_idx), response.get("outputs"))
+        live.dirty_frames.add(int(frame_idx))
+        self.last_timings["refine_frame"] = time.perf_counter() - started
+        return live.masks[:, int(frame_idx)]
+
+    @torch.no_grad()
+    def resweep(
+        self,
+        live: Sam31LiveTracker,
+        progress: Callable[[int, int, int, np.ndarray], None] | None = None,
+    ) -> np.ndarray:
+        edited = sorted(live.dirty_frames)
+        if not edited:
+            raise ValueError("nothing was edited since the last propagation")
+
+        started = time.perf_counter()
+        visited: set[int] = set()
+        for direction, start_frame in (
+            ("forward", edited[0]),
+            ("backward", edited[-1]),
+        ):
+            for event in self.predictor.handle_stream_request(
+                {
+                    "type": "propagate_in_video",
+                    "session_id": live.session_id,
+                    "propagation_direction": direction,
+                    "start_frame_index": start_frame,
+                }
+            ):
+                frame_idx = int(event["frame_index"])
+                self._apply_outputs(live, frame_idx, event.get("outputs"))
+                visited.add(frame_idx)
+                if progress is not None:
+                    progress(
+                        len(visited),
+                        live.n_frames,
+                        frame_idx,
+                        live.masks[:, frame_idx],
+                    )
+        live.dirty_frames.clear()
+        elapsed = time.perf_counter() - started
+        self.last_timings.update(
+            total=elapsed,
+            fps=live.n_frames / elapsed if elapsed else float("inf"),
+        )
+        return live.masks
+
+    def close(self) -> None:
+        if self.live is not None:
+            self.live.close()
+            self.live = None
 
 
 class Sam3VolumePropagator:

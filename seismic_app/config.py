@@ -13,16 +13,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-# --- Tracker models (SAM 3 default, SAM 2 optional) --------------------
+# --- Tracker models (SAM 3 default, SAM 3.1 / SAM 2 optional) ----------
 
 # Interactive point/volume tracking can run either SAM 3's tracker head
-# or SAM 2.1. Text-prompt automatic detection remains SAM 3 only.
+# through transformers, SAM 3.1 Object Multiplex through Meta's native
+# repository, or SAM 2.1. Text-prompt automatic detection remains SAM 3 only.
 # SAM 3 is gated on the Hub: accept the license at
 # https://huggingface.co/facebook/sam3 and authenticate locally
 # (`hf auth login`, or set the HF_TOKEN env var) before that checkpoint
 # can be downloaded. SAM 2.1 is Apache 2.0 and is not gated.
 
-ModelFamily = Literal["sam2", "sam3"]
+ModelFamily = Literal["sam2", "sam3", "sam31"]
 
 DEFAULT_MODEL_FAMILY: ModelFamily = "sam3"
 
@@ -34,6 +35,15 @@ SAM_FAMILIES: dict[str, dict[str, str | bool]] = {
         "architecture": "SAM 3 (Hugging Face transformers)",
         "point_model": "Sam3TrackerModel",
         "video_model": "Sam3TrackerVideoModel",
+        "gated": True,
+    },
+    "sam31": {
+        "id": "sam31",
+        "label": "SAM 3.1",
+        "checkpoint": "facebook/sam3.1",
+        "architecture": "SAM 3.1 Object Multiplex (facebookresearch/sam3)",
+        "point_model": "Sam3MultiplexVideoPredictor",
+        "video_model": "Sam3MultiplexVideoPredictor",
         "gated": True,
     },
     "sam2": {
@@ -51,14 +61,18 @@ DEFAULT_CHECKPOINT = str(SAM_FAMILIES[DEFAULT_MODEL_FAMILY]["checkpoint"])
 
 
 def resolve_family(family: str | None = None) -> ModelFamily:
-    """Normalize a UI/API family name to ``sam2`` or ``sam3``."""
+    """Normalize a UI/API family name to a supported tracker family."""
     raw = (family or DEFAULT_MODEL_FAMILY).strip().lower()
     key = raw.replace(" ", "").replace("-", "").replace("_", "")
     if key in ("sam2", "sam21", "sam2.1"):
         return "sam2"
     if key in ("sam3",):
         return "sam3"
-    raise ValueError(f"Unknown model family {family!r}; expected 'sam2' or 'sam3'")
+    if key in ("sam31", "sam3.1"):
+        return "sam31"
+    raise ValueError(
+        f"Unknown model family {family!r}; expected 'sam2', 'sam3', or 'sam31'"
+    )
 
 
 def family_spec(family: str | None = None) -> dict[str, str | bool]:

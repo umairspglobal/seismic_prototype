@@ -8,7 +8,7 @@ export interface FileInfo {
 
 export type Axis = "inline" | "crossline" | "time";
 
-export type ModelFamily = "sam2" | "sam3";
+export type ModelFamily = "sam2" | "sam3" | "sam31";
 
 export interface ModelInfo {
   id: ModelFamily;

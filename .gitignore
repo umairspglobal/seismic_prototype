@@ -5,7 +5,7 @@ outputs/
 data/
 
 # Fine-tuning working files (regenerated on each machine / run)
-finetune_data/
+finetune_data*/
 finetuned_checkpoints/
 finetune_logs/
 sam3-finetune-env/
