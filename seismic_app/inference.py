@@ -19,6 +19,8 @@ from contextlib import nullcontext
 import gc
 import importlib.util
 import math
+from pathlib import Path
+import sys
 import threading
 import time
 from typing import Any
@@ -62,13 +64,38 @@ def build_sam31_predictor(max_num_objects: int = 128) -> Any:
             "facebookresearch/sam3 package and a CUDA-enabled PyTorch build, or "
             "select SAM 3 / SAM 2."
         )
+    # This project keeps a Windows-compatible SAM checkout beside the app.
+    # Prefer it to site-packages: upstream imports Triton unconditionally,
+    # while the local checkout contains the required no-Triton fallbacks.
+    local_checkout = Path(__file__).resolve().parents[1] / "sam3"
+    if (local_checkout / "sam3" / "model_builder.py").is_file():
+        checkout_path = str(local_checkout)
+        if checkout_path not in sys.path:
+            sys.path.insert(0, checkout_path)
+            log.info("Using repository-local SAM 3 code from %s", local_checkout)
     try:
         from sam3.model_builder import build_sam3_multiplex_video_predictor
-    except (ImportError, ModuleNotFoundError) as exc:
+    except ModuleNotFoundError as exc:
+        if exc.name == "triton" and sys.platform == "win32":
+            raise RuntimeError(
+                "The installed SAM 3 package requires Triton, which is not bundled "
+                "with Windows PyTorch. Keep the Windows-compatible sam3 checkout "
+                "in this project, or install a compatible triton-windows build."
+            ) from exc
+        if exc.name and not exc.name.startswith("sam3"):
+            raise RuntimeError(
+                f"SAM 3.1 dependency {exc.name!r} is missing. "
+                "Reinstall requirements.txt and restart the inference server."
+            ) from exc
         raise RuntimeError(
             "SAM 3.1 needs the latest facebookresearch/sam3 model code. "
             "Reinstall requirements.txt, or run: "
             "pip install -U git+https://github.com/facebookresearch/sam3.git"
+        ) from exc
+    except ImportError as exc:
+        raise RuntimeError(
+            "The installed facebookresearch/sam3 package is incompatible with "
+            f"SAM 3.1 ({exc}). Reinstall requirements.txt and restart the server."
         ) from exc
 
     log.info("Loading native SAM 3.1 Object Multiplex predictor...")

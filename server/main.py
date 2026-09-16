@@ -373,7 +373,10 @@ def _get_file(name: str) -> tuple[np.ndarray, SectionGeometry, np.ndarray]:
 def _require_point_segmenter() -> Sam3PointSegmenter | Sam31PointSegmenter:
     if _load_state["error"] and _point_segmenter is None:
         raise HTTPException(503, f"Model failed to load: {_load_state['error']}")
-    if _point_segmenter is None:
+    if (
+        _point_segmenter is None
+        or getattr(_point_segmenter, "family", None) != _active_family
+    ):
         raise HTTPException(
             503,
             str(
@@ -387,7 +390,10 @@ def _require_point_segmenter() -> Sam3PointSegmenter | Sam31PointSegmenter:
 def _require_propagator() -> Sam3VolumePropagator | Sam31VolumePropagator:
     if _load_state["error"] and _propagator is None:
         raise HTTPException(503, f"Model failed to load: {_load_state['error']}")
-    if _propagator is None:
+    if (
+        _propagator is None
+        or getattr(_propagator, "family", None) != _active_family
+    ):
         raise HTTPException(
             503,
             str(
@@ -702,10 +708,11 @@ def prepare_slice(req: SliceRef) -> dict:
     data, geometry, data_u8 = _get_file(req.file)
     _validate_slice(data, geometry, req.axis, req.index)
     rgb = _slice_rgb(data_u8, geometry, req.axis, req.index)
-    segmenter = _require_point_segmenter()
     with _gpu_lock:
+        segmenter = _require_point_segmenter()
         segmenter.prepare_image(rgb, image_key=(req.file, req.axis, req.index))
-    return {"prepare_seconds": segmenter.last_timings.get("prepare_image", 0.0)}
+        prepare_seconds = segmenter.last_timings.get("prepare_image", 0.0)
+    return {"prepare_seconds": prepare_seconds}
 
 
 @app.post("/api/segment")
@@ -715,20 +722,21 @@ def segment(req: SegmentRequest) -> dict:
     data, geometry, data_u8 = _get_file(req.file)
     _validate_slice(data, geometry, req.axis, req.index)
     rgb = _slice_rgb(data_u8, geometry, req.axis, req.index)
-    segmenter = _require_point_segmenter()
     started = time.perf_counter()
     with _gpu_lock:
+        segmenter = _require_point_segmenter()
         mask = segmenter.segment(
             rgb,
             [(int(c), int(r)) for c, r in req.points],
             [int(l) for l in req.labels],
             image_key=(req.file, req.axis, req.index),
         )
+        timings = {k: float(v) for k, v in segmenter.last_timings.items()}
     return {
         "mask": _mask_png_base64(mask, req.object_id),
         "coverage": float(mask.mean()),
         "timings": {
-            **{k: float(v) for k, v in segmenter.last_timings.items()},
+            **timings,
             "server_total": time.perf_counter() - started,
         },
     }
@@ -837,15 +845,15 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
             if any(not 0 <= s < n_frames for s in obj.slices):
                 raise HTTPException(422, "point slice index out of range")
     frames = [_slice_rgb(data_u8, geometry, req.axis, i) for i in range(n_frames)]
-    propagator = _require_propagator()
     object_ids = [obj.id for obj in req.objects]
 
     def work(on_progress) -> dict:
         global _propagation
-        # Drop the previous volume before tracking so its sessions and mask
-        # stack are freed rather than held alongside the new ones.
-        _propagation = None
         with _gpu_lock:
+            propagator = _require_propagator()
+            # Drop the previous volume while model switching is excluded, so
+            # a completed stale job cannot restore an already-closed session.
+            _propagation = None
             propagator.propagate(
                 frames,
                 anchor_idx=req.index,
@@ -865,10 +873,13 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
                 keep_live=True,
             )
             live = propagator.live
-        if live is not None:
-            _propagation = Propagation(req.file, req.axis, object_ids, live)
+            if live is not None:
+                _propagation = Propagation(req.file, req.axis, object_ids, live)
+            timings = {
+                k: float(v) for k, v in propagator.last_timings.items()
+            }
         return {
-            "timings": {k: float(v) for k, v in propagator.last_timings.items()},
+            "timings": timings,
             "editable": live is not None,
         }
 
@@ -887,17 +898,17 @@ def refine(req: RefineRequest) -> dict:
         raise HTTPException(422, "points and labels must be equal length")
     data, geometry, _ = _get_file(req.file)
     _validate_slice(data, geometry, req.axis, req.index)
-    state = _require_propagation(req.file, req.axis)
-    position = state.position_of(req.object_id)
-    if position is None:
-        raise HTTPException(
-            409,
-            f"Object {req.object_id + 1} is not part of the tracked volume - "
-            "propagate again to include it.",
-        )
-    propagator = _require_propagator()
     started = time.perf_counter()
     with _gpu_lock:
+        state = _require_propagation(req.file, req.axis)
+        position = state.position_of(req.object_id)
+        if position is None:
+            raise HTTPException(
+                409,
+                f"Object {req.object_id + 1} is not part of the tracked volume - "
+                "propagate again to include it.",
+            )
+        propagator = _require_propagator()
         frame_masks = propagator.refine_frame(
             state.live,
             position,
@@ -918,20 +929,34 @@ def resweep(req: VolumeRef) -> StreamingResponse:
     data, geometry, _ = _get_file(req.file)
     if geometry.kind != "3d":
         raise HTTPException(422, "Propagation requires a 3D volume")
-    state = _require_propagation(req.file, req.axis)
-    if not state.live.dirty_frames:
-        raise HTTPException(409, "Nothing was edited since the last propagation.")
-    propagator = _require_propagator()
+    with _gpu_lock:
+        state = _require_propagation(req.file, req.axis)
+        if not state.live.dirty_frames:
+            raise HTTPException(
+                409, "Nothing was edited since the last propagation."
+            )
+        object_ids = list(state.object_ids)
 
     def work(on_progress) -> dict:
         with _gpu_lock:
-            propagator.resweep(state.live, progress=on_progress)
+            current_state = _require_propagation(req.file, req.axis)
+            if not current_state.live.dirty_frames:
+                raise HTTPException(
+                    409, "Nothing was edited since the last propagation."
+                )
+            current_propagator = _require_propagator()
+            current_propagator.resweep(
+                current_state.live, progress=on_progress
+            )
+            timings = {
+                k: float(v) for k, v in current_propagator.last_timings.items()
+            }
         return {
-            "timings": {k: float(v) for k, v in propagator.last_timings.items()},
+            "timings": timings,
             "editable": True,
         }
 
-    return _stream_tracking(state.object_ids, work)
+    return _stream_tracking(object_ids, work)
 
 
 def _slice_masks_to_cube(

@@ -3,6 +3,10 @@ torchvision
 transformers>=5.0,<6
 # SAM 3.1 checkpoints require Meta's repository-native Object Multiplex code.
 sam3 @ git+https://github.com/facebookresearch/sam3.git
+# Imported by SAM 3.1's RoPE implementation but omitted from its base metadata.
+einops
+# Imported transitively by SAM 3.1's tracker data structures.
+pycocotools
 accelerate
 huggingface_hub
 segyio
