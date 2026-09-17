@@ -221,6 +221,34 @@ def load_numpy(path: str | Path) -> tuple[np.ndarray, SectionGeometry]:
     return data, geometry
 
 
+def _inspect_sgy_listing(path: Path) -> tuple[tuple[int, ...], SectionGeometry]:
+    """Dropdown metadata only: sample/trace counts, no 3D index or per-trace scan.
+
+    Building an inline/crossline index or reading every CDP header on a
+    multi-GB volume can stall the API for minutes and freeze every other
+    request, including opening a different .sgy file. Full geometry is
+    recovered when the file is actually loaded.
+    """
+    with segyio.open(str(path), ignore_geometry=True) as f:
+        n_samples = len(f.samples)
+        n_traces = f.tracecount
+        dt_us = float(f.bin[segyio.BinField.Interval])
+        dt_ms = dt_us / 1000.0 if 100.0 <= dt_us <= 32000.0 else DEFAULT_NPY_DT_MS
+        return (n_samples, n_traces), SectionGeometry(
+            kind="2d",
+            n_traces=n_traces,
+            n_samples=n_samples,
+            dt_ms=dt_ms,
+            t0_ms=0.0,
+        )
+
+
+def _inspect_sgy_2d(path: Path) -> tuple[tuple[int, ...], SectionGeometry]:
+    with segyio.open(str(path), ignore_geometry=True) as f:
+        shape = (len(f.samples), f.tracecount)
+        return shape, extract_2d_geometry(f)
+
+
 def inspect_any(path: str | Path) -> tuple[tuple[int, ...], SectionGeometry]:
     """Return shape and geometry without loading seismic amplitudes."""
     path = Path(path)
@@ -239,9 +267,17 @@ def inspect_any(path: str | Path) -> tuple[tuple[int, ...], SectionGeometry]:
             return shape, extract_3d_geometry(f)
         finally:
             f.close()
-    with segyio.open(str(path), ignore_geometry=True) as f:
-        shape = (len(f.samples), f.tracecount)
-        return shape, extract_2d_geometry(f)
+    return _inspect_sgy_2d(path)
+
+
+def inspect_any_for_listing(
+    path: str | Path,
+) -> tuple[tuple[int, ...], SectionGeometry]:
+    """Inspect a file for the dropdown without stalling the rest of the API."""
+    path = Path(path)
+    if path.suffix.lower() == ".sgy":
+        return _inspect_sgy_listing(path)
+    return inspect_any(path)
 
 
 def load_any(path: str | Path) -> tuple[np.ndarray, SectionGeometry]:

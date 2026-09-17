@@ -22,6 +22,8 @@ interface ViewerProps {
   busy: boolean;
   autoMaskUrl?: string | null;
   onPick: (col: number, row: number, label: 0 | 1) => void;
+  onImageLoad?: () => void;
+  onImageError?: () => void;
 }
 
 function pickFromEvent(
@@ -57,6 +59,8 @@ export function Viewer({
   busy,
   autoMaskUrl = null,
   onPick,
+  onImageLoad,
+  onImageError,
 }: ViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -91,7 +95,15 @@ export function Viewer({
       onClick={handleClick}
       onContextMenu={handleContextMenu}
     >
-      <img className="viewer-layer" src={imageUrl} alt="Seismic section" draggable={false} />
+      <img
+        className="viewer-layer"
+        src={imageUrl}
+        alt="Seismic section"
+        draggable={false}
+        key={imageUrl}
+        onLoad={onImageLoad}
+        onError={onImageError}
+      />
       {autoMaskUrl && (
         <img
           className="viewer-layer viewer-mask"

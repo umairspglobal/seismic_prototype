@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from seismic_app.inference import Sam3PointSegmenter, Sam3VolumePropagator
+from seismic_app.inference import (
+    Sam3PointSegmenter,
+    Sam3VolumePropagator,
+    _select_prompt_mask,
+)
 
 
 class _Encoding(dict):
@@ -66,6 +70,29 @@ def test_point_embeddings_are_keyed_and_lru_bounded():
         ("file", "inline", 2),
         ("file", "inline", 3),
     ]
+
+
+def test_point_mask_selection_rejects_full_frame_and_empty_candidates():
+    masks = np.zeros((3, 8, 8), dtype=bool)
+    masks[0] = True  # Natural-image IoU heads often over-rank this on seismic.
+    masks[1, 3:6, 3:6] = True
+    iou = np.array([0.99, 0.65, 0.98], dtype=np.float32)
+
+    best = _select_prompt_mask(masks, iou, [(4, 4)], [1])
+
+    assert best == 1
+
+
+def test_point_mask_selection_honors_positive_and_negative_clicks_first():
+    masks = np.zeros((3, 8, 8), dtype=bool)
+    masks[0, 2:7, 2:7] = True
+    masks[1, 3:5, 3:5] = True
+    masks[2, 0:2, 0:2] = True
+    iou = np.array([0.99, 0.5, 0.95], dtype=np.float32)
+
+    best = _select_prompt_mask(masks, iou, [(3, 3), (6, 6)], [1, 0])
+
+    assert best == 1
 
 
 class _VideoProcessor:

@@ -18,6 +18,7 @@ from collections.abc import Callable, Hashable, Sequence
 from contextlib import nullcontext
 import gc
 import importlib.util
+import inspect
 import math
 from pathlib import Path
 import sys
@@ -43,6 +44,26 @@ _tf_point_classes: dict[str, tuple[type, type]] = {}
 _tf_video_classes: dict[str, tuple[type, type]] = {}
 _tf_session_classes: dict[str, type] = {}
 _tf_version: str | None = None
+
+
+def _adapt_sam31_init_state(model: Any) -> None:
+    """Allow SAM 3.1 models without SAM 3's state-offload option."""
+    try:
+        parameters = inspect.signature(model.init_state).parameters
+    except (TypeError, ValueError):
+        log.warning("Could not inspect SAM 3.1 init_state signature")
+        return
+    if "offload_state_to_cpu" in parameters:
+        return
+
+    native_init_state = model.init_state
+
+    def compatible_init_state(*args: Any, **kwargs: Any) -> Any:
+        kwargs.pop("offload_state_to_cpu", None)
+        return native_init_state(*args, **kwargs)
+
+    model.init_state = compatible_init_state
+    log.info("Adapted SAM 3.1 init_state for the shared predictor API")
 
 
 def transformers_version() -> str | None:
@@ -99,7 +120,7 @@ def build_sam31_predictor(max_num_objects: int = 128) -> Any:
         ) from exc
 
     log.info("Loading native SAM 3.1 Object Multiplex predictor...")
-    return build_sam3_multiplex_video_predictor(
+    predictor = build_sam3_multiplex_video_predictor(
         max_num_objects=max_num_objects,
         multiplex_count=16,
         # These optional kernels are not part of the base installation.
@@ -109,6 +130,9 @@ def build_sam31_predictor(max_num_objects: int = 128) -> Any:
         warm_up=False,
         async_loading_frames=False,
     )
+    _adapt_sam31_init_state(predictor.model)
+    _install_sam31_point_mask_ranking(predictor)
+    return predictor
 
 
 def _point_tracker_classes(family: str | None = None) -> tuple[type, type]:
@@ -177,15 +201,6 @@ class Sam3SeismicSegmenter:
                 "CUDA was requested, but this Python environment has no CUDA-enabled "
                 "PyTorch build. Install a CUDA PyTorch wheel in the active environment "
                 "or select CPU."
-            )
-        if (
-            compile_model
-            and hasattr(torch, "compile")
-            and importlib.util.find_spec("triton") is None
-        ):
-            raise RuntimeError(
-                "torch.compile requires Triton, which is unavailable in this "
-                "environment; run without compile_model."
             )
         self.prompts = prompts or config.SEISMIC_PROMPTS
         self.checkpoint = checkpoint
@@ -341,6 +356,7 @@ class Sam3PointSegmenter:
         points: list[tuple[int, int]],
         labels: list[int],
         image_key: Hashable | None = None,
+        object_id: int = 0,
     ) -> np.ndarray:
         """Segment one object indicated by clicked points.
 
@@ -398,11 +414,15 @@ class Sam3PointSegmenter:
         # post_process_masks -> list per image of (n_objects, n_masks, H, W).
         post_started = time.perf_counter()
         masks = self.processor.post_process_masks(
-            outputs.pred_masks.cpu(), inputs["original_sizes"]
+            outputs.pred_masks.cpu(),
+            inputs["original_sizes"],
+            mask_threshold=0.0,
+            binarize=True,
         )[0]
+        candidates = np.asarray(masks[0].cpu().numpy(), dtype=bool)
         iou = outputs.iou_scores.float().cpu().numpy().reshape(-1)
-        best = int(iou.argmax())
-        mask = np.asarray(masks[0, best], dtype=bool)
+        best = _select_prompt_mask(candidates, iou, points, labels)
+        mask = candidates[best]
         post_elapsed = time.perf_counter() - post_started
         self.last_timings.update(
             prompt_decode=decoder_elapsed,
@@ -417,6 +437,222 @@ class Sam3PointSegmenter:
             coverage,
         )
         return mask
+
+
+def _select_prompt_mask(
+    masks: np.ndarray,
+    iou_scores: np.ndarray,
+    points: Sequence[tuple[int, int]],
+    labels: Sequence[int],
+) -> int:
+    """Choose the most specific candidate that actually obeys the clicks.
+
+    SAM emits several valid semantic levels for one point (part, object,
+    surrounding region). Its natural-image IoU head can rank the whole seismic
+    section above the local event, or rank an empty mask after negative clicks.
+    Click consistency is therefore authoritative; predicted IoU only breaks
+    ties between equally specific, click-consistent candidates.
+    """
+    candidates = np.asarray(masks, dtype=bool)
+    scores = np.asarray(iou_scores, dtype=np.float32).reshape(-1)
+    if candidates.ndim == 2:
+        candidates = candidates[None, ...]
+    if candidates.ndim != 3 or not len(candidates):
+        raise ValueError("point decoder returned no mask candidates")
+    if len(scores) != len(candidates):
+        raise ValueError("mask candidates and IoU scores must have equal length")
+
+    height, width = candidates.shape[-2:]
+    samples = [
+        (min(width - 1, max(0, int(x))), min(height - 1, max(0, int(y))), int(label))
+        for (x, y), label in zip(points, labels)
+    ]
+
+    rankings: list[tuple[tuple[float, ...], int]] = []
+    for index, (candidate, iou) in enumerate(zip(candidates, scores)):
+        positive_hits = sum(candidate[y, x] for x, y, label in samples if label == 1)
+        negative_hits = sum(candidate[y, x] for x, y, label in samples if label == 0)
+        positive_count = sum(label == 1 for _, _, label in samples)
+        negative_count = len(samples) - positive_count
+        prompt_errors = (positive_count - positive_hits) + negative_hits
+        coverage = float(candidate.mean())
+        # Among masks with the same click agreement, prefer the most local
+        # interpretation. IoU remains a final tie-breaker for equal areas.
+        rank = (
+            -float(prompt_errors),
+            float(positive_hits),
+            float(negative_count - negative_hits),
+            -coverage,
+            float(iou),
+        )
+        rankings.append((rank, index))
+
+    return max(rankings)[1]
+
+
+def _rerank_sam31_multimask_ious(
+    mask_logits: torch.Tensor,
+    iou_scores: torch.Tensor,
+    point_coords: torch.Tensor,
+    point_labels: torch.Tensor,
+    image_size: int,
+) -> torch.Tensor:
+    """Make SAM 3.1 choose the smallest candidate that obeys the clicks.
+
+    The native Object Multiplex decoder emits three masks for a one-point
+    prompt, then immediately collapses them using its natural-image IoU head.
+    On seismic sections that head can rank a nearly full-frame candidate first.
+    Re-ranking the IoUs here lets the native decoder select the local,
+    click-consistent candidate while keeping its matching object token.
+
+    Ranking is done on logits upsampled to the tracker image size. The decoder
+    itself is low-resolution (~1/3.5), which is too coarse to score a one-pixel
+    seismic event, so sampling the raw decoder grid can make the full-frame
+    candidate look like the only click-consistent mask.
+    """
+    if (
+        mask_logits.ndim != 4
+        or iou_scores.ndim != 2
+        or point_coords.ndim != 3
+        or point_labels.ndim != 2
+        or mask_logits.shape[:2] != iou_scores.shape
+        or mask_logits.shape[0] != point_coords.shape[0]
+        or point_coords.shape[:2] != point_labels.shape
+        or mask_logits.shape[1] <= 1
+    ):
+        return iou_scores
+
+    size = max(int(image_size), 1)
+    logits = mask_logits.float()
+    if logits.shape[-2:] != (size, size):
+        logits = F.interpolate(
+            logits,
+            size=(size, size),
+            mode="bilinear",
+            align_corners=False,
+        )
+    coords = point_coords.to(logits.device, dtype=torch.float32)
+    labels = point_labels.to(logits.device)
+    x = torch.clamp(torch.round(coords[..., 0]), 0, size - 1).long()
+    y = torch.clamp(torch.round(coords[..., 1]), 0, size - 1).long()
+
+    binary = logits > 0
+    reranked = iou_scores.clone()
+    floor = torch.finfo(reranked.dtype).min
+    for batch_index in range(mask_logits.shape[0]):
+        samples = binary[batch_index, :, y[batch_index], x[batch_index]]
+        positive = labels[batch_index] == 1
+        negative = labels[batch_index] == 0
+        errors = (
+            ((~samples) & positive.unsqueeze(0))
+            | (samples & negative.unsqueeze(0))
+        ).sum(dim=1)
+        areas = binary[batch_index].flatten(1).sum(dim=1)
+
+        eligible = errors == errors.min()
+        if positive.any():
+            nonempty = areas > 0
+            if (eligible & nonempty).any():
+                eligible &= nonempty
+        eligible_areas = torch.where(
+            eligible,
+            areas,
+            torch.full_like(areas, areas.max() + 1),
+        )
+        eligible &= areas == eligible_areas.min()
+
+        native_scores = torch.nan_to_num(
+            iou_scores[batch_index],
+            nan=floor,
+            neginf=floor,
+        )
+        best = torch.argmax(
+            torch.where(
+                eligible,
+                native_scores,
+                torch.full_like(native_scores, floor),
+            )
+        )
+        reranked[batch_index].fill_(floor)
+        reranked[batch_index, best] = native_scores[best]
+    return reranked
+
+
+def _sam31_interactive_modules(predictor: Any) -> tuple[Any, Any, int] | None:
+    """Find SAM 3.1's interactive prompt encoder / mask decoder pair."""
+    model = getattr(predictor, "model", None)
+    if model is None:
+        return None
+    tracker = getattr(model, "tracker", model)
+    inner = getattr(tracker, "model", tracker)
+    seen: list[Any] = []
+    for candidate in (inner, tracker, model):
+        if candidate is None or any(candidate is item for item in seen):
+            continue
+        seen.append(candidate)
+        encoder = getattr(candidate, "interactive_sam_prompt_encoder", None)
+        decoder = getattr(candidate, "interactive_sam_mask_decoder", None)
+        image_size = getattr(candidate, "image_size", None)
+        if encoder is not None and decoder is not None and image_size is not None:
+            return encoder, decoder, int(image_size)
+    return None
+
+
+def _install_sam31_point_mask_ranking(predictor: Any) -> None:
+    """Intercept native one-click multimasks before SAM 3.1 collapses them."""
+    located = _sam31_interactive_modules(predictor)
+    if located is None:
+        log.error("Could not locate SAM 3.1's interactive mask decoder")
+        return
+    prompt_encoder, mask_decoder, image_size = located
+    if getattr(mask_decoder, "_seismic_point_rank_wrapped", False):
+        return
+
+    prompt_context: dict[str, tuple[torch.Tensor, torch.Tensor] | None] = {
+        "points": None
+    }
+    original_encoder_forward = prompt_encoder.forward
+    original_decoder_forward = mask_decoder.forward
+
+    def _as_point_pair(points: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if (
+            isinstance(points, tuple)
+            and len(points) == 2
+            and all(isinstance(value, torch.Tensor) for value in points)
+        ):
+            return points
+        return None
+
+    def capture_and_encode(*args: Any, **kwargs: Any) -> Any:
+        points = kwargs.get("points")
+        if points is None and args:
+            points = args[0]
+        prompt_context["points"] = _as_point_pair(points)
+        return original_encoder_forward(*args, **kwargs)
+
+    def rank_and_decode(*args: Any, **kwargs: Any) -> Any:
+        output = original_decoder_forward(*args, **kwargs)
+        multimask_output = kwargs.get("multimask_output")
+        if multimask_output is None and len(args) >= 5:
+            multimask_output = args[4]
+        points = prompt_context.pop("points", None)
+        if not multimask_output or points is None or not isinstance(output, tuple):
+            return output
+        masks, ious, *rest = output
+        coords, labels = points
+        ranked = _rerank_sam31_multimask_ious(
+            masks,
+            ious,
+            coords,
+            labels,
+            image_size,
+        )
+        return (masks, ranked, *rest)
+
+    prompt_encoder.forward = capture_and_encode
+    mask_decoder.forward = rank_and_decode
+    mask_decoder._seismic_point_rank_wrapped = True
+    log.info("Enabled seismic-specific SAM 3.1 point-mask candidate ranking")
 
 
 class LiveTracker:
@@ -486,6 +722,15 @@ def _native_mask_rows(outputs: dict | None) -> dict[int, np.ndarray]:
     }
 
 
+def _mask_for_native_id(outputs: dict | None, native_id: int) -> np.ndarray | None:
+    """Return the mask for ``native_id``, or the only native mask if ids disagree."""
+    rows = _native_mask_rows(outputs)
+    mask = rows.get(int(native_id))
+    if mask is None and len(rows) == 1:
+        mask = next(iter(rows.values()))
+    return mask
+
+
 def _close_native_session(predictor: Any, session_id: str) -> None:
     try:
         predictor.handle_request(
@@ -497,6 +742,97 @@ def _close_native_session(predictor: Any, session_id: str) -> None:
         )
     except Exception:
         log.debug("Could not close native SAM 3.1 session %s", session_id, exc_info=True)
+
+
+def _relative_points(
+    points: Sequence[tuple[int, int]],
+    shape: tuple[int, int] | Sequence[int],
+) -> list[list[float]]:
+    """Map original-image pixels to the native predictor's [0, 1] coordinates."""
+    height, width = int(shape[0]), int(shape[1])
+    if height < 1 or width < 1:
+        raise ValueError("image dimensions must be positive")
+    return [
+        [
+            min(1.0, max(0.0, float(x) / width)),
+            min(1.0, max(0.0, float(y) / height)),
+        ]
+        for x, y in points
+    ]
+
+
+def _pad_to_square(rgb: np.ndarray) -> tuple[np.ndarray, dict[str, int]]:
+    """Letterbox a section so SAM 3.1's square resize cannot stretch it.
+
+    The native Object Multiplex loader always does ``PIL.Image.resize((S, S))``.
+    A 1750x231 seismic line stretched ~7x vertically turns thin horizons into
+    full-frame texture, so one click segments the whole section. Padding to a
+    square first keeps the original aspect ratio through that resize.
+    """
+    if rgb.ndim != 3 or rgb.shape[2] < 1:
+        raise ValueError("expected an HxWxC image array")
+    height, width = int(rgb.shape[0]), int(rgb.shape[1])
+    if height < 1 or width < 1:
+        raise ValueError("image dimensions must be positive")
+    side = max(height, width)
+    top = (side - height) // 2
+    left = (side - width) // 2
+    letterbox = {
+        "top": top,
+        "left": left,
+        "height": height,
+        "width": width,
+        "side": side,
+    }
+    if top == 0 and left == 0 and side == height and side == width:
+        return rgb, letterbox
+    fill = int(np.median(rgb.reshape(-1, rgb.shape[-1]).mean(axis=-1)))
+    padded = np.full((side, side, rgb.shape[2]), fill, dtype=rgb.dtype)
+    padded[top : top + height, left : left + width] = rgb
+    return padded, letterbox
+
+
+def _letterbox_relative_points(
+    points: Sequence[tuple[int, int]],
+    letterbox: dict[str, int],
+) -> list[list[float]]:
+    """Map original-image pixels into the letterboxed square's [0, 1] range."""
+    shifted = [
+        (int(x) + int(letterbox["left"]), int(y) + int(letterbox["top"]))
+        for x, y in points
+    ]
+    return _relative_points(shifted, (int(letterbox["side"]), int(letterbox["side"])))
+
+
+def _crop_letterbox_mask(mask: np.ndarray, letterbox: dict[str, int]) -> np.ndarray:
+    """Crop a native square mask back to the original section shape."""
+    height, width = int(letterbox["height"]), int(letterbox["width"])
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape[-2:] == (height, width):
+        return mask
+    top, left, side = (
+        int(letterbox["top"]),
+        int(letterbox["left"]),
+        int(letterbox["side"]),
+    )
+    if mask.shape[-2:] == (side, side):
+        cropped = mask[..., top : top + height, left : left + width]
+        if cropped.shape[-2:] == (height, width):
+            return cropped
+    log.warning(
+        "SAM 3.1 mask shape %s did not match letterbox %s; resizing",
+        mask.shape[-2:],
+        (height, width),
+    )
+    plane = mask
+    while plane.ndim > 2:
+        plane = plane[0]
+    resized = np.array(
+        Image.fromarray(plane.astype(np.uint8) * 255).resize(
+            (width, height), Image.NEAREST
+        )
+    )
+    return resized > 0
 
 
 class Sam31PointSegmenter:
@@ -526,16 +862,29 @@ class Sam31PointSegmenter:
             return key
 
         started = time.perf_counter()
+        if isinstance(key, tuple) and key:
+            current_file = key[0]
+            stale_keys = [
+                stale
+                for stale in list(self._prepared)
+                if isinstance(stale, tuple) and stale and stale[0] != current_file
+            ]
+            for stale in stale_keys:
+                evicted = self._prepared.pop(stale)
+                _close_native_session(self.predictor, evicted["session_id"])
+        padded, letterbox = _pad_to_square(rgb)
         response = self.predictor.handle_request(
             {
                 "type": "start_session",
-                "resource_path": [Image.fromarray(rgb).convert("RGB")],
+                "resource_path": [Image.fromarray(padded).convert("RGB")],
                 "offload_video_to_cpu": True,
             }
         )
         self._prepared[key] = {
             "session_id": response["session_id"],
             "shape": rgb.shape[:2],
+            "letterbox": letterbox,
+            "objects": {},
         }
         self._prepared.move_to_end(key)
         while len(self._prepared) > self.embedding_cache_size:
@@ -551,29 +900,54 @@ class Sam31PointSegmenter:
         points: list[tuple[int, int]],
         labels: list[int],
         image_key: Hashable | None = None,
+        object_id: int = 0,
     ) -> np.ndarray:
         if len(points) != len(labels) or not points:
             raise ValueError("points and labels must be equal-length and non-empty")
 
         started = time.perf_counter()
         key = self.prepare_image(rgb, image_key=image_key)
-        session_id = self._prepared[key]["session_id"]
+        prepared = self._prepared[key]
+        session_id = prepared["session_id"]
+        native_id = int(object_id) + 1
+        signature = (
+            tuple((int(x), int(y)) for x, y in points),
+            tuple(int(label) for label in labels),
+        )
+        previous = prepared["objects"].get(native_id)
+        if previous is not None and previous["signature"] == signature:
+            self.last_timings["total"] = time.perf_counter() - started
+            return previous["mask"].copy()
+        if previous is not None:
+            self.predictor.handle_request(
+                {
+                    "type": "remove_object",
+                    "session_id": session_id,
+                    "frame_index": 0,
+                    "obj_id": native_id,
+                }
+            )
         response = self.predictor.handle_request(
             {
                 "type": "add_prompt",
                 "session_id": session_id,
                 "frame_index": 0,
-                "points": [[float(x), float(y)] for x, y in points],
+                "points": _letterbox_relative_points(points, prepared["letterbox"]),
                 "point_labels": [int(label) for label in labels],
-                "obj_id": 1,
+                "obj_id": native_id,
                 "clear_old_points": True,
-                "rel_coordinates": False,
+                "rel_coordinates": True,
             }
         )
-        rows = _native_mask_rows(response.get("outputs"))
-        mask = rows.get(1)
+        mask = _mask_for_native_id(response.get("outputs"), native_id)
         if mask is None:
             mask = np.zeros(rgb.shape[:2], dtype=bool)
+        else:
+            mask = _crop_letterbox_mask(mask, prepared["letterbox"])
+        prepared["objects"][native_id] = {
+            "signature": signature,
+            "mask": mask.copy(),
+        }
         self.last_timings["total"] = time.perf_counter() - started
         return mask
 
@@ -594,10 +968,12 @@ class Sam31LiveTracker(LiveTracker):
         n_frames: int,
         height: int,
         width: int,
+        letterbox: dict[str, int],
     ):
         super().__init__(n_objects, n_frames, height, width)
         self.predictor = predictor
         self.session_id = session_id
+        self.letterbox = letterbox
 
     def close(self) -> None:
         _close_native_session(self.predictor, self.session_id)
@@ -625,10 +1001,16 @@ class Sam31VolumePropagator:
         frame_idx: int,
         outputs: dict | None,
     ) -> None:
-        for native_id, mask in _native_mask_rows(outputs).items():
+        rows = _native_mask_rows(outputs)
+        for native_id, mask in rows.items():
             object_index = native_id - 1
-            if 0 <= object_index < live.n_objects:
-                live.masks[object_index, frame_idx] = mask
+            if not (0 <= object_index < live.n_objects):
+                if len(rows) != 1 or live.n_objects != 1:
+                    continue
+                object_index = 0
+            live.masks[object_index, frame_idx] = _crop_letterbox_mask(
+                mask, live.letterbox
+            )
 
     @torch.no_grad()
     def propagate(
@@ -673,11 +1055,16 @@ class Sam31VolumePropagator:
 
         started = time.perf_counter()
         height, width = frames[0].shape[:2]
-        pil_frames = [Image.fromarray(frame).convert("RGB") for frame in frames]
+        padded_frames = []
+        letterbox: dict[str, int] | None = None
+        for frame in frames:
+            padded, letterbox = _pad_to_square(frame)
+            padded_frames.append(Image.fromarray(padded).convert("RGB"))
+        assert letterbox is not None
         response = self.predictor.handle_request(
             {
                 "type": "start_session",
-                "resource_path": pil_frames,
+                "resource_path": padded_frames,
                 "offload_video_to_cpu": True,
             }
         )
@@ -688,6 +1075,7 @@ class Sam31VolumePropagator:
             n_frames,
             height,
             width,
+            letterbox,
         )
         self.last_timings["session_init"] = time.perf_counter() - started
 
@@ -700,7 +1088,9 @@ class Sam31VolumePropagator:
                     frame_points, frame_labels = grouped.setdefault(
                         int(frame_idx), ([], [])
                     )
-                    frame_points.append([float(x), float(y)])
+                    frame_points.extend(
+                        _letterbox_relative_points([(x, y)], letterbox)
+                    )
                     frame_labels.append(int(label))
                 for frame_idx, (frame_points, frame_labels) in sorted(grouped.items()):
                     prompt_response = self.predictor.handle_request(
@@ -712,7 +1102,7 @@ class Sam31VolumePropagator:
                             "point_labels": frame_labels,
                             "obj_id": object_index + 1,
                             "clear_old_points": True,
-                            "rel_coordinates": False,
+                            "rel_coordinates": True,
                         }
                     )
                     self._apply_outputs(
@@ -771,11 +1161,11 @@ class Sam31VolumePropagator:
                 "type": "add_prompt",
                 "session_id": live.session_id,
                 "frame_index": int(frame_idx),
-                "points": [[float(x), float(y)] for x, y in points],
+                "points": _letterbox_relative_points(points, live.letterbox),
                 "point_labels": [int(label) for label in labels],
                 "obj_id": int(object_index) + 1,
                 "clear_old_points": True,
-                "rel_coordinates": False,
+                "rel_coordinates": True,
             }
         )
         self._apply_outputs(live, int(frame_idx), response.get("outputs"))

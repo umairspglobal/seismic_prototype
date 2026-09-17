@@ -20,6 +20,7 @@ import {
   resweep,
   segment,
   autoSegment,
+  getFileMeta,
   setModel,
   setTextCheckpoint,
   sliceUrl,
@@ -115,6 +116,7 @@ export default function App() {
   const [autoError, setAutoError] = useState<string | null>(null);
   const [autoCheckpoint, setAutoCheckpoint] = useState<string | null>(null);
   const [textCheckpoint, setTextCheckpointPath] = useState<string | null>(null);
+  const [sliceError, setSliceError] = useState<string | null>(null);
   const userPickedTextCheckpoint = useRef(false);
   const pointReady = Boolean(runtime?.point_loaded) && runtime?.family === modelFamily;
   const videoReady = Boolean(runtime?.video_loaded) && runtime?.family === modelFamily;
@@ -132,39 +134,58 @@ export default function App() {
   const trackedReadyRef = useRef(false);
   const userPickedFamily = useRef<ModelFamily | null>(null);
 
+  const applyFiles = useCallback((incoming: FileInfo[]) => {
+    if (!incoming.length) return;
+    setFiles((prev) => {
+      const byName = new Map(prev.map((item) => [item.name, item]));
+      for (const item of incoming) byName.set(item.name, item);
+      return Array.from(byName.values()).sort((a, b) =>
+        a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+      );
+    });
+    setFile((current) => {
+      const updated = incoming.find((item) => item.name === current?.name);
+      if (updated) return updated;
+      if (current) return current;
+      return incoming.find((item) => item.kind === "3d") ?? incoming[0] ?? null;
+    });
+    setStatus("");
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
+    let sawAny = false;
+    let sawError = false;
 
-    // NPY metadata is effectively instant. Show those files immediately
-    // instead of waiting for SEG-Y geometry scans over every trace header.
-    listFiles("npy")
-      .then((npyFiles) => {
-        if (cancelled || !npyFiles.length) return;
-        setFiles(npyFiles);
-        setFile((current) => current ?? npyFiles.find((x) => x.kind === "3d") ?? npyFiles[0]);
-        setStatus("");
-      })
-      .catch(() => undefined);
-
-    listFiles()
-      .then((f) => {
-        if (cancelled) return;
-        setFiles(f);
-        setFile((current) => {
-          if (current) return f.find((item) => item.name === current.name) ?? current;
-          return f.find((x) => x.kind === "3d") ?? f[0] ?? null;
+    // NPY metadata is instant. SEG-Y listing is separate so a huge volume
+    // cannot hide the rest of the dropdown while its 3D headers are indexed.
+    const load = (format: "npy" | "sgy") =>
+      listFiles(format)
+        .then((incoming) => {
+          if (cancelled) return;
+          if (incoming.length) {
+            sawAny = true;
+            applyFiles(incoming);
+          }
+        })
+        .catch(() => {
+          sawError = true;
         });
-        setStatus(f.length ? "" : "No .sgy or .npy files found in data/");
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setStatus("Cannot reach the inference server. Start it with: uvicorn server.main:app");
-        }
-      });
+
+    Promise.all([load("npy"), load("sgy")]).then(() => {
+      if (cancelled) return;
+      if (!sawAny && sawError) {
+        setStatus(
+          "Cannot reach the inference server. Start it with: uvicorn server.main:app",
+        );
+      } else if (!sawAny) {
+        setStatus("No .sgy or .npy files found in data/");
+      }
+    });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [applyFiles]);
 
   useEffect(() => {
     let cancelled = false;
@@ -272,6 +293,7 @@ export default function App() {
       if (family === modelFamily || propagation?.running) return;
       userPickedFamily.current = family;
       setModelFamily(family);
+      setStatus("");
       abortAll();
       setPropMaskUrl(null);
       setCoverage(null);
@@ -326,7 +348,44 @@ export default function App() {
   useEffect(() => {
     resetPicks();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file, axis]);
+  }, [file?.name, axis]);
+
+  // Opening a survey is independent of the tracker. Refresh kind/shape
+  // after the server actually loads the file (listing may have used a
+  // fast 2D header fallback for a slow 3D volume).
+  useEffect(() => {
+    if (!file) return;
+    let cancelled = false;
+    setSliceError(null);
+    getFileMeta(file.name)
+      .then((info) => {
+        if (cancelled) return;
+        setFile((current) => {
+          if (!current || current.name !== info.name) return current;
+          if (
+            current.kind === info.kind &&
+            current.shape.length === info.shape.length &&
+            current.shape.every((size, i) => size === info.shape[i])
+          ) {
+            return current;
+          }
+          return { ...current, ...info };
+        });
+      })
+      .catch((err: Error) => {
+        if (cancelled) return;
+        const message = err.message || "";
+        if (
+          /Could not load seismic file|Unknown seismic file/i.test(message)
+        ) {
+          setSliceError(message);
+          setStatus(`Could not open ${file.name}: ${message}`);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [file?.name]);
 
   const setObjectMask = useCallback((objectId: number, url: string | null) => {
     setObjects((prev) =>
@@ -460,6 +519,7 @@ export default function App() {
       setPropMaskUrl(maskDataUrl(propagated));
     }
     setPrepared(false);
+    setSliceError(null);
     const timer = setTimeout(() => {
       prepareSlice(file.name, axis, index)
         .then(() => {
@@ -477,11 +537,14 @@ export default function App() {
             if (pts.length) runSegment(obj.id, pts);
           }
         })
-        .catch(() => setPrepared(false));
+        .catch((err: Error) => {
+          setPrepared(false);
+          setSliceError(`Could not prepare this slice: ${err.message}`);
+        });
     }, 250);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file, axis, index, pointReady]);
+  }, [file?.name, axis, index, pointReady]);
 
   const handlePick = useCallback(
     (col: number, row: number, label: 0 | 1) => {
@@ -708,24 +771,10 @@ export default function App() {
   const loadMessage = runtime?.load_error && !pointReady
     ? runtime.load_error
     : (runtime?.load_stage as string | undefined) ?? "Connecting to inference server...";
+  const trackerBlocked = Boolean(modelsLoading || (runtime?.load_error && !pointReady));
 
   return (
     <div className="app">
-      {(modelsLoading || (runtime?.load_error && !pointReady)) && (
-        <div className="loading-overlay" role="status">
-          <div className="loading-card">
-            {!(runtime?.load_error && !pointReady) && <div className="loading-spinner" />}
-            <h2>{runtime?.load_error && !pointReady ? "Model failed to load" : `Loading ${familyLabel}`}</h2>
-            <p>{loadMessage}</p>
-            {!(runtime?.load_error && !pointReady) && (
-              <p className="loading-hint">
-                Only one tracker stays on the GPU. The first load of a
-                model can take a minute (and may download weights).
-              </p>
-            )}
-          </div>
-        </div>
-      )}
       <aside className="sidebar">
         <h1>Seismic SAM</h1>
         <p className="subtitle">Interactive point segmentation</p>
@@ -746,8 +795,8 @@ export default function App() {
           </select>
           <p className="hint">
             {modelFamily === "sam31"
-              ? "Object Multiplex tracks objects in shared memory. It requires the latest native SAM 3 code and CUDA."
-              : "Official click/volume trackers only. Switch to compare masks on the same clicks; only one stays on the GPU."}
+              ? "Object Multiplex tracks objects in shared memory. It requires the latest native SAM 3 code and CUDA. You can still open another seismic file while it loads."
+              : "Official click/volume trackers only. Switch to compare masks on the same clicks; only one stays on the GPU. Seismic files stay available while a tracker loads."}
           </p>
         </label>
 
@@ -810,6 +859,8 @@ export default function App() {
                 setIndex(0);
                 propMasksRef.current = new Map();
                 setPropagation(null);
+                setSliceError(null);
+                setStatus("");
               }
             }}
           >
@@ -819,6 +870,13 @@ export default function App() {
               </option>
             ))}
           </select>
+          {trackerBlocked && (
+            <p className="hint hint-notice">
+              {runtime?.load_error && !pointReady
+                ? "Tracker failed to load — switch models above. You can still open another seismic file."
+                : `Loading ${familyLabel} — you can still open another .sgy or .npy file. Clicks start when it is ready.`}
+            </p>
+          )}
           {file.format === "npy" && (
             <p className="hint">
               NumPy axes: samples × traces for 2D, or inline × crossline ×
@@ -1184,6 +1242,29 @@ export default function App() {
       </aside>
 
       <main className="stage">
+        {trackerBlocked && (
+          <div
+            className={`stage-status ${
+              runtime?.load_error && !pointReady ? "stage-status-error" : ""
+            }`}
+            role="status"
+          >
+            {!(runtime?.load_error && !pointReady) && (
+              <div className="loading-spinner" />
+            )}
+            <h2>
+              {runtime?.load_error && !pointReady
+                ? "Tracker failed to load"
+                : `Loading ${familyLabel}`}
+            </h2>
+            <p>{loadMessage}</p>
+            <p className="loading-hint">
+              Seismic files stay available in the sidebar. Clicks wait until
+              the tracker is ready. Only one tracker stays on the GPU.
+            </p>
+          </div>
+        )}
+        {sliceError && <p className="stage-error">{sliceError}</p>}
         <Viewer
           imageUrl={imageUrl}
           propagatedMaskUrl={propMaskUrl}
@@ -1199,9 +1280,13 @@ export default function App() {
             propagation?.running ||
             autoDetecting ||
             (!pointReady && !detectorCanStayInteractive) ||
-            (!prepared && trackedIds.length === 0 && !autoMaskUrl)
+            (!prepared && trackedIds.length === 0 && !autoMaskUrl && !sliceError)
           }
           onPick={handlePick}
+          onImageLoad={() => setSliceError(null)}
+          onImageError={() =>
+            setSliceError("Could not load this slice from the inference server.")
+          }
         />
       </main>
     </div>

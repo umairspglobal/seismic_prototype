@@ -25,6 +25,7 @@ import queue
 import sys
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -53,7 +54,11 @@ from seismic_app.inference import (
 from seismic_app.logutil import get_logger
 from seismic_app.preprocessing import inline_to_rgb_25d, normalize_to_uint8, to_rgb
 from seismic_app.pipeline import _segment_section_rgb
-from seismic_app.sgy_loader import SUPPORTED_SEISMIC_SUFFIXES, inspect_any, load_any
+from seismic_app.sgy_loader import (
+    SUPPORTED_SEISMIC_SUFFIXES,
+    inspect_any_for_listing,
+    load_any,
+)
 from seismic_app.stitching import binarize
 from seismic_app.vtk_export import FIRST_INTERACTIVE_LABEL_ID, export_volume_vti
 
@@ -80,11 +85,17 @@ def _object_color(object_id: int) -> tuple[int, int, int]:
     return OBJECT_COLORS[object_id % len(OBJECT_COLORS)]
 
 
-# One lock serializes GPU work; a second protects the file cache.
+# One lock serializes GPU work; file loads use a separate cache lock so a
+# tracker switch cannot freeze opening another .sgy / .npy survey.
 _gpu_lock = threading.Lock()
 _cache_lock = threading.Lock()
 _family_lock = threading.Lock()
-_file_cache: dict[str, tuple[np.ndarray, SectionGeometry, np.ndarray]] = {}
+_FILE_CACHE_LIMIT = 2
+_file_cache: OrderedDict[str, tuple[np.ndarray, SectionGeometry, np.ndarray]] = (
+    OrderedDict()
+)
+_file_load_locks_guard = threading.Lock()
+_file_load_locks: dict[str, threading.Lock] = {}
 _point_segmenter: Sam3PointSegmenter | Sam31PointSegmenter | None = None
 _propagator: Sam3VolumePropagator | Sam31VolumePropagator | None = None
 _text_segmenter: Sam3SeismicSegmenter | None = None
@@ -188,7 +199,7 @@ def _load_models(family: ModelFamily, load_id: int) -> None:
                 )
                 _sam31_predictor = build_sam31_predictor()
                 _point_segmenter = Sam31PointSegmenter(
-                    _sam31_predictor, embedding_cache_size=4
+                    _sam31_predictor, embedding_cache_size=1
                 )
                 _propagator = Sam31VolumePropagator(_sam31_predictor)
             else:
@@ -353,21 +364,75 @@ def _list_seismic_files() -> list[Path]:
     )
 
 
+def _lock_for_file(name: str) -> threading.Lock:
+    with _file_load_locks_guard:
+        return _file_load_locks.setdefault(name, threading.Lock())
+
+
+def _file_info_payload(
+    name: str, data: np.ndarray, geometry: SectionGeometry
+) -> dict:
+    shape = [int(size) for size in data.shape]
+    return {
+        "name": name,
+        "format": Path(name).suffix.lower().lstrip("."),
+        "kind": geometry.kind,
+        "shape": shape,
+        "axes": {
+            "inline": shape[0],
+            "crossline": shape[1],
+            "time": shape[2],
+        }
+        if geometry.kind == "3d"
+        else {"inline": 1, "crossline": 1, "time": 1},
+    }
+
+
+def _drop_tracked_volume_if_other_file_locked(file: str) -> None:
+    """Close a live tracker session that belongs to a different survey."""
+    global _propagation
+    if _propagation is None or _propagation.file == file:
+        return
+    live = _propagation.live
+    _propagation = None
+    if _propagator is not None:
+        _propagator.live = None
+    closer = getattr(live, "close", None)
+    if closer is not None:
+        closer()
+
+
 def _get_file(name: str) -> tuple[np.ndarray, SectionGeometry, np.ndarray]:
     allowed = {p.name: p for p in _list_seismic_files()}
     if name not in allowed:
         raise HTTPException(404, f"Unknown seismic file: {name}")
     with _cache_lock:
-        if name not in _file_cache:
-            log.info("Loading and normalizing %s...", name)
-            try:
-                data, geometry = load_any(allowed[name])
-            except (OSError, TypeError, ValueError, RuntimeError) as exc:
-                raise HTTPException(
-                    422, f"Could not load seismic file {name}: {exc}"
-                ) from exc
-            _file_cache[name] = (data, geometry, normalize_to_uint8(data))
-        return _file_cache[name]
+        cached = _file_cache.get(name)
+        if cached is not None:
+            _file_cache.move_to_end(name)
+            return cached
+    # Load outside the cache lock so one huge volume cannot block another file.
+    with _lock_for_file(name):
+        with _cache_lock:
+            cached = _file_cache.get(name)
+            if cached is not None:
+                _file_cache.move_to_end(name)
+                return cached
+        log.info("Loading and normalizing %s...", name)
+        try:
+            data, geometry = load_any(allowed[name])
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            raise HTTPException(
+                422, f"Could not load seismic file {name}: {exc}"
+            ) from exc
+        packed = (data, geometry, normalize_to_uint8(data))
+        with _cache_lock:
+            _file_cache[name] = packed
+            _file_cache.move_to_end(name)
+            while len(_file_cache) > _FILE_CACHE_LIMIT:
+                evicted_name, _evicted = _file_cache.popitem(last=False)
+                log.info("Evicted %s from the seismic file cache", evicted_name)
+            return _file_cache.get(name, packed)
 
 
 def _require_point_segmenter() -> Sam3PointSegmenter | Sam31PointSegmenter:
@@ -557,7 +622,7 @@ def list_files(format: str | None = None) -> list[dict]:
         if requested_suffix is not None and path.suffix.lower() != requested_suffix:
             continue
         try:
-            shape, geometry = inspect_any(path)
+            shape, geometry = inspect_any_for_listing(path)
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
             log.warning("Skipping unusable data file %s: %s", path, exc)
             continue
@@ -577,6 +642,13 @@ def list_files(format: str | None = None) -> list[dict]:
             }
         )
     return entries
+
+
+@app.get("/api/meta")
+def file_meta(file: str) -> dict:
+    """Return kind/shape for a survey. Does not require a loaded tracker."""
+    data, geometry, _ = _get_file(file)
+    return _file_info_payload(file, data, geometry)
 
 
 def _bytes_to_gb(n: int | None) -> float | None:
@@ -709,10 +781,14 @@ def prepare_slice(req: SliceRef) -> dict:
     _validate_slice(data, geometry, req.axis, req.index)
     rgb = _slice_rgb(data_u8, geometry, req.axis, req.index)
     with _gpu_lock:
+        _drop_tracked_volume_if_other_file_locked(req.file)
         segmenter = _require_point_segmenter()
         segmenter.prepare_image(rgb, image_key=(req.file, req.axis, req.index))
         prepare_seconds = segmenter.last_timings.get("prepare_image", 0.0)
-    return {"prepare_seconds": prepare_seconds}
+    return {
+        "prepare_seconds": prepare_seconds,
+        **_file_info_payload(req.file, data, geometry),
+    }
 
 
 @app.post("/api/segment")
@@ -730,6 +806,7 @@ def segment(req: SegmentRequest) -> dict:
             [(int(c), int(r)) for c, r in req.points],
             [int(l) for l in req.labels],
             image_key=(req.file, req.axis, req.index),
+            object_id=req.object_id,
         )
         timings = {k: float(v) for k, v in segmenter.last_timings.items()}
     return {

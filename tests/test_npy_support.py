@@ -79,3 +79,80 @@ def test_npy_geometry_exports_to_vti(tmp_path):
 
     assert written.is_file()
     assert written.suffix == ".vti"
+
+
+def test_loading_one_volume_does_not_block_another(monkeypatch, tmp_path):
+    import threading
+    from pathlib import Path
+
+    started = threading.Event()
+    release = threading.Event()
+    np.save(tmp_path / "slow.npy", np.zeros((2, 2), dtype=np.float32))
+    np.save(tmp_path / "fast.npy", np.ones((3, 2), dtype=np.float32))
+    monkeypatch.setattr(api, "DATA_DIR", tmp_path)
+    api._file_cache.clear()
+
+    original_load = api.load_any
+
+    def fake_load(path):
+        path = Path(path)
+        if path.name == "slow.npy":
+            started.set()
+            assert release.wait(timeout=2)
+        return original_load(path)
+
+    monkeypatch.setattr(api, "load_any", fake_load)
+    results = {}
+
+    def load_slow():
+        results["slow"] = api._get_file("slow.npy")[0].shape
+
+    def load_fast():
+        assert started.wait(timeout=2)
+        results["fast"] = api._get_file("fast.npy")[0].shape
+        release.set()
+
+    slow_thread = threading.Thread(target=load_slow)
+    fast_thread = threading.Thread(target=load_fast)
+    slow_thread.start()
+    fast_thread.start()
+    slow_thread.join(timeout=3)
+    fast_thread.join(timeout=3)
+
+    assert results["fast"] == (3, 2)
+    assert results["slow"] == (2, 2)
+
+
+def test_file_cache_evicts_oldest_survey(monkeypatch, tmp_path):
+    for name, shape in (("a.npy", (2, 2)), ("b.npy", (3, 2)), ("c.npy", (4, 2))):
+        np.save(tmp_path / name, np.zeros(shape, dtype=np.float32))
+    monkeypatch.setattr(api, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(api, "_FILE_CACHE_LIMIT", 2)
+    api._file_cache.clear()
+
+    api._get_file("a.npy")
+    api._get_file("b.npy")
+    api._get_file("c.npy")
+
+    assert "a.npy" not in api._file_cache
+    assert "b.npy" in api._file_cache
+    assert "c.npy" in api._file_cache
+
+
+def test_listing_timeout_falls_back_to_2d_headers(monkeypatch):
+    from pathlib import Path
+
+    from seismic_app.sgy_loader import inspect_any_for_listing
+
+    path = Path(__file__).resolve().parents[1] / "data" / "1.sgy"
+    if not path.is_file():
+        pytest.skip("sample SEG-Y is not present")
+
+    def boom(_path):
+        raise AssertionError("listing must not build a 3D SEG-Y index")
+
+    monkeypatch.setattr("seismic_app.sgy_loader._open_3d", boom)
+    shape, geometry = inspect_any_for_listing(path)
+
+    assert geometry.kind == "2d"
+    assert len(shape) == 2

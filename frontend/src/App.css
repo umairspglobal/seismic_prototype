@@ -19,34 +19,34 @@ body {
   position: relative;
 }
 
-.loading-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 20;
-  display: grid;
-  place-items: center;
-  background: rgba(10, 13, 16, 0.78);
-  backdrop-filter: blur(6px);
-}
-
-.loading-card {
-  width: min(420px, calc(100vw - 48px));
-  padding: 28px 24px;
-  border-radius: 12px;
+.stage-status {
+  width: min(520px, 100%);
+  padding: 16px 18px;
+  border-radius: 10px;
   background: #171c22;
   border: 1px solid #2c343d;
   text-align: center;
 }
 
-.loading-card h2 {
-  margin: 16px 0 8px;
-  font-size: 1.2rem;
+.stage-status-error {
+  border-color: #ef5350;
 }
 
-.loading-card p {
+.stage-status h2 {
+  margin: 10px 0 6px;
+  font-size: 1.05rem;
+}
+
+.stage-status p {
   margin: 0;
   color: #b8c0c8;
-  font-size: 0.9rem;
+  font-size: 0.88rem;
+}
+
+.stage-error {
+  color: #ef5350;
+  font-size: 0.85rem;
+  margin: 0;
 }
 
 .loading-hint {
@@ -89,7 +89,7 @@ body {
   flex-direction: column;
   gap: 14px;
   position: relative;
-  z-index: 21;
+  z-index: 1;
 }
 
 .sidebar h1 {
@@ -361,7 +361,9 @@ body {
   padding: 24px;
   overflow: auto;
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
 }
 
 .viewer {

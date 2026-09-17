@@ -202,6 +202,13 @@ export async function listFiles(format?: "npy" | "sgy"): Promise<FileInfo[]> {
   return res.json();
 }
 
+export async function getFileMeta(file: string): Promise<FileInfo> {
+  const params = new URLSearchParams({ file });
+  const res = await fetch(apiUrl(`/api/meta?${params}`));
+  if (!res.ok) throw new Error(await errorMessage(res, "Failed to open seismic file"));
+  return res.json();
+}
+
 export async function getRuntime(): Promise<RuntimeInfo> {
   const res = await fetch(apiUrl("/api/runtime"));
   if (!res.ok) throw new Error(`Failed to load runtime info: ${res.status}`);
