@@ -10,6 +10,7 @@ import {
   TextCheckpointInfo,
   downloadExportedVolume,
   exportVolume,
+  getFileStatus,
   getRuntime,
   listFiles,
   maskDataUrl,
@@ -45,6 +46,14 @@ interface SegObject extends ViewerObject {
 }
 
 const freshObject = (id: number): SegObject => ({ id, points: [], maskUrl: null });
+
+const ALL_AXES_READY: Record<Axis, boolean> = { inline: true, crossline: true, time: true };
+
+function formatSeconds(seconds: number | null | undefined): string {
+  if (seconds == null) return "?";
+  if (seconds < 60) return `${Math.round(seconds)} s`;
+  return `${Math.floor(seconds / 60)} min ${Math.round(seconds % 60)} s`;
+}
 
 const FALLBACK_TRACKERS = [
   { id: "sam3" as const, label: "SAM 3", checkpoint: "facebook/sam3", gated: true },
@@ -117,6 +126,15 @@ export default function App() {
   const [autoCheckpoint, setAutoCheckpoint] = useState<string | null>(null);
   const [textCheckpoint, setTextCheckpointPath] = useState<string | null>(null);
   const [sliceError, setSliceError] = useState<string | null>(null);
+  const [sliceLoading, setSliceLoading] = useState(false);
+  const sliceRequestedAt = useRef(0);
+  // Propagation half-width as typed; empty means the server picks (the
+  // whole axis for small files, a RAM-sized window for large ones).
+  const [propWindow, setPropWindow] = useState("");
+  const [trackedRange, setTrackedRange] = useState<{ start: number; stop: number } | null>(
+    null,
+  );
+  const lastStageRef = useRef<string | null>(null);
   const userPickedTextCheckpoint = useRef(false);
   const pointReady = Boolean(runtime?.point_loaded) && runtime?.family === modelFamily;
   const videoReady = Boolean(runtime?.video_loaded) && runtime?.family === modelFamily;
@@ -234,12 +252,17 @@ export default function App() {
     setTextCheckpointPath(runtime.text_checkpoint);
   }, [runtime?.text_checkpoint]);
 
-  const axisCount = file ? file.axes[axis] : 1;
+  // Wide 2D lines are served as pages of traces; the page is the "slice".
+  const pageCount = file?.kind === "2d" ? (file.pages?.count ?? 1) : 1;
+  const axisCount = file ? (file.kind === "2d" ? pageCount : file.axes[axis]) : 1;
+  const axesReady = file?.large ? (file.axes_ready ?? { inline: false, crossline: false, time: false }) : ALL_AXES_READY;
+  const axisReady = file?.kind === "2d" ? axesReady.inline : axesReady[axis];
+  const cacheStatus = file?.large ? (file.status ?? null) : null;
   const sliceSize = useMemo(() => {
     if (!file) return { w: 1, h: 1 };
     const [nIl, nXl, nS] = file.shape;
     // 2D lines are stored (n_samples, n_traces): time down, traces across.
-    if (file.kind === "2d") return { w: file.shape[1], h: file.shape[0] };
+    if (file.kind === "2d") return { w: file.pages?.width ?? file.shape[1], h: file.shape[0] };
     if (axis === "inline") return { w: nXl, h: nS };
     if (axis === "crossline") return { w: nIl, h: nS };
     return { w: nXl, h: nIl };
@@ -281,6 +304,7 @@ export default function App() {
     setPendingEdits(0);
     setPromptsDropped(true);
     setTrackedObjectIds([]);
+    setTrackedRange(null);
     setExportInfo(null);
     setExportError(null);
     setAutoMaskUrl(null);
@@ -357,19 +381,28 @@ export default function App() {
     if (!file) return;
     let cancelled = false;
     setSliceError(null);
+    const openedAt = performance.now();
+    console.info(`[seismic] opening ${file.name}...`);
     getFileMeta(file.name)
       .then((info) => {
         if (cancelled) return;
+        console.info(
+          `[seismic] opened ${info.name}: ${info.kind.toUpperCase()} ${info.shape.join("x")}` +
+            (info.large
+              ? `, large file (cache ${info.status?.stage ?? "?"} ${info.status?.percent ?? 0}%)`
+              : ", in memory") +
+            ` in ${Math.round(performance.now() - openedAt)} ms`,
+        );
         setFile((current) => {
           if (!current || current.name !== info.name) return current;
-          if (
+          const unchanged =
             current.kind === info.kind &&
             current.shape.length === info.shape.length &&
-            current.shape.every((size, i) => size === info.shape[i])
-          ) {
-            return current;
-          }
-          return { ...current, ...info };
+            current.shape.every((size, i) => size === info.shape[i]) &&
+            !info.large &&
+            !current.large &&
+            (current.pages?.count ?? 1) === (info.pages?.count ?? 1);
+          return unchanged ? current : { ...current, ...info };
         });
       })
       .catch((err: Error) => {
@@ -386,6 +419,57 @@ export default function App() {
       cancelled = true;
     };
   }, [file?.name]);
+
+  // Large files: poll the background cache build until it finishes, so
+  // the progress overlay and the axis gating stay current.
+  const cacheSettled = !file?.large || Boolean(file.status?.ready) || file.status?.stage === "error";
+  useEffect(() => {
+    if (!file?.large || cacheSettled) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = () => {
+      timer = window.setTimeout(async () => {
+        try {
+          const info = await getFileStatus(file.name);
+          if (cancelled) return;
+          setFile((current) =>
+            current && current.name === info.name ? { ...current, ...info } : current,
+          );
+          setFiles((prev) => prev.map((f) => (f.name === info.name ? { ...f, ...info } : f)));
+          if (!info.status?.ready && info.status?.stage !== "error") poll();
+        } catch {
+          if (!cancelled) poll();
+        }
+      }, 1000);
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [file?.name, file?.large, cacheSettled]);
+
+  useEffect(() => {
+    if (!file || !cacheStatus) return;
+    const key = `${file.name}:${cacheStatus.stage}`;
+    if (lastStageRef.current === key) return;
+    lastStageRef.current = key;
+    console.info(
+      `[seismic] ${file.name} cache: ${cacheStatus.stage} (${cacheStatus.percent}%) - ${cacheStatus.message}`,
+    );
+  }, [file, cacheStatus]);
+
+  // An axis of a large file that is still being cached cannot be shown;
+  // fall back to one that can (usually inline) instead of a blank viewer.
+  useEffect(() => {
+    if (!file?.large || file.kind !== "3d" || axisReady) return;
+    const ready = (["inline", "crossline", "time"] as Axis[]).find((a) => axesReady[a]);
+    if (ready && ready !== axis) {
+      console.info(`[seismic] ${axis} axis not cached yet; switching to ${ready}`);
+      setAxis(ready);
+      setIndex(0);
+    }
+  }, [file?.name, file?.large, file?.kind, axis, axisReady, axesReady]);
 
   const setObjectMask = useCallback((objectId: number, url: string | null) => {
     setObjects((prev) =>
@@ -509,7 +593,7 @@ export default function App() {
   // single-slice previews, pre-encode the slice, then re-preview objects
   // that have points here.
   useEffect(() => {
-    if (!file || !pointReady) return;
+    if (!file || !pointReady || !axisReady) return;
     abortAll();
     setSegmenting(false);
     setObjects((prev) => prev.map((o) => ({ ...o, maskUrl: null })));
@@ -544,7 +628,37 @@ export default function App() {
     }, 250);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [file?.name, axis, index, pointReady]);
+  }, [file?.name, axis, index, pointReady, axisReady]);
+
+  const imageUrl = file && axisReady ? sliceUrl(file.name, axis, index) : null;
+  useEffect(() => {
+    if (!imageUrl) {
+      setSliceLoading(false);
+      return;
+    }
+    sliceRequestedAt.current = performance.now();
+    setSliceLoading(true);
+  }, [imageUrl]);
+
+  const handleSliceLoad = useCallback(() => {
+    setSliceLoading(false);
+    setSliceError(null);
+    console.info(
+      `[seismic] slice ${file?.name} ${axis}[${index}] loaded in ${Math.round(
+        performance.now() - sliceRequestedAt.current,
+      )} ms`,
+    );
+  }, [file?.name, axis, index]);
+
+  const handleSliceError = useCallback(() => {
+    setSliceLoading(false);
+    console.warn(`[seismic] slice ${file?.name} ${axis}[${index}] failed to load`);
+    setSliceError(
+      file?.large && !axisReady
+        ? "This axis is still being cached."
+        : "Could not load this slice from the inference server.",
+    );
+  }, [file?.name, file?.large, axis, index, axisReady]);
 
   const handlePick = useCallback(
     (col: number, row: number, label: 0 | 1) => {
@@ -670,14 +784,21 @@ export default function App() {
       // single-slice previews so they don't double-tint the anchor frame.
       setObjects((prev) => prev.map((o) => ({ ...o, maskUrl: null })));
     }
+    const requestedWindow = propWindow.trim() === "" ? null : Math.max(0, Math.floor(Number(propWindow)));
+    const windowArg = requestedWindow != null && Number.isFinite(requestedWindow) ? requestedWindow : null;
     setPropagation({
       axis,
       running: true,
       done: 0,
-      total: axisCount,
+      total: windowArg != null ? Math.min(axisCount, 2 * windowArg + 1) : axisCount,
       resweeping: reuseSessions,
     });
     setExportInfo(null);
+    const propagateStarted = performance.now();
+    console.info(
+      `[seismic] ${reuseSessions ? "re-sweep" : "propagate"} ${file.name} ${axis} from slice ${index}` +
+        ` (range ${windowArg != null ? `+/-${windowArg}` : "auto"})`,
+    );
 
     const onEvent = (event: PropagationEvent) => {
       if (event.type === "frame") {
@@ -692,6 +813,14 @@ export default function App() {
         if (event.frame === index) setPropMaskUrl(maskDataUrl(event.mask));
       } else if (event.type === "done") {
         setPropagation((prev) => (prev ? { ...prev, running: false } : null));
+        if (event.start != null && event.stop != null) {
+          setTrackedRange({ start: event.start, stop: event.stop });
+        }
+        console.info(
+          `[seismic] tracking done in ${((performance.now() - propagateStarted) / 1000).toFixed(1)} s` +
+            (event.start != null ? `, slices ${event.start}-${(event.stop ?? 0) - 1}` : "") +
+            (event.window_reason ? ` (${event.window_reason})` : ""),
+        );
         setPendingEdits(0);
         setPromptsDropped(false);
         setTrackedObjectIds(objectsWithPoints.map((o) => o.id));
@@ -706,7 +835,7 @@ export default function App() {
 
     const request = reuseSessions
       ? resweep(file.name, axis, onEvent)
-      : propagate(file.name, axis, index, objectsWithPoints, onEvent);
+      : propagate(file.name, axis, index, objectsWithPoints, onEvent, undefined, windowArg);
     request.catch((err) =>
       setPropagation((prev) =>
         prev ? { ...prev, running: false, error: err.message } : null,
@@ -720,6 +849,7 @@ export default function App() {
     axisCount,
     needsFullPropagate,
     pendingEdits,
+    propWindow,
   ]);
 
   const canExport = trackedIds.length > 0 || Boolean(liveTracked);
@@ -746,7 +876,10 @@ export default function App() {
     return <div className="app-empty">{status || "Loading..."}</div>;
   }
 
-  const imageUrl = sliceUrl(file.name, axis, index);
+  const pageStart =
+    file.kind === "2d" && file.pages
+      ? Math.min(index * file.pages.step, file.shape[1] - file.pages.width)
+      : 0;
   const progressPct = propagation
     ? Math.round((100 * propagation.done) / propagation.total)
     : 0;
@@ -867,9 +1000,20 @@ export default function App() {
             {files.map((f) => (
               <option key={f.name} value={f.name}>
                 {f.name} — {f.kind.toUpperCase()} {f.shape.join(" × ")}
+                {f.large ? (f.status?.ready ? " (large, cached)" : " (large)") : ""}
               </option>
             ))}
           </select>
+          {file.large && (
+            <p className="hint">
+              Large file — served from a disk cache instead of RAM
+              {cacheStatus?.ready
+                ? "; all axes are ready."
+                : cacheStatus?.stage === "error"
+                  ? "; the cache build failed (see below)."
+                  : `; building the cache (${cacheStatus?.percent ?? 0}%).`}
+            </p>
+          )}
           {trackerBlocked && (
             <p className="hint hint-notice">
               {runtime?.load_error && !pointReady
@@ -897,9 +1041,24 @@ export default function App() {
                   setIndex(0);
                 }}
               >
-                <option value="inline">Inline</option>
-                <option value="crossline">Crossline</option>
-                <option value="time">Time slice</option>
+                {(
+                  [
+                    ["inline", "Inline"],
+                    ["crossline", "Crossline"],
+                    ["time", "Time slice"],
+                  ] as [Axis, string][]
+                ).map(([value, label]) => (
+                  <option
+                    key={value}
+                    value={value}
+                    disabled={!axesReady[value]}
+                    title={axesReady[value] ? undefined : "Available when the cache build finishes"}
+                  >
+                    {axesReady[value]
+                      ? label
+                      : `${label} (building cache ${cacheStatus?.percent ?? 0}%)`}
+                  </option>
+                ))}
               </select>
             </label>
             <label className="field">
@@ -916,8 +1075,41 @@ export default function App() {
                 value={index}
                 onChange={(e) => setIndex(Number(e.target.value))}
               />
+              {trackedRange && propagation?.axis === axis && axisCount > 1 && (
+                <div
+                  className="range-track"
+                  title={`Tracked slices ${trackedRange.start + 1}-${trackedRange.stop}`}
+                >
+                  <div
+                    className="range-track-fill"
+                    style={{
+                      left: `${(100 * trackedRange.start) / axisCount}%`,
+                      width: `${(100 * (trackedRange.stop - trackedRange.start)) / axisCount}%`,
+                    }}
+                  />
+                </div>
+              )}
             </label>
           </>
+        )}
+
+        {file.kind === "2d" && pageCount > 1 && (
+          <label className="field">
+            <span>
+              Trace page {index + 1} of {pageCount}
+              <em className="hint">
+                {" "}
+                — traces {pageStart + 1}-{pageStart + sliceSize.w}
+              </em>
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={pageCount - 1}
+              value={index}
+              onChange={(e) => setIndex(Number(e.target.value))}
+            />
+          </label>
         )}
 
         <div className="field">
@@ -1009,6 +1201,28 @@ export default function App() {
             </button>
           </div>
         </div>
+
+        {file.kind === "3d" && (
+          <label className="field">
+            <span>Propagation range ± slices</span>
+            <input
+              className="number-input"
+              type="number"
+              min={1}
+              placeholder={file.large ? "auto (sized to RAM)" : "auto (whole axis)"}
+              value={propWindow}
+              disabled={propagation?.running}
+              onChange={(e) => setPropWindow(e.target.value)}
+            />
+            {trackedRange && propagation?.axis === axis && (
+              <p className="hint">
+                Tracked slices {trackedRange.start + 1}-{trackedRange.stop} of {axisCount}.
+                {(trackedRange.start > 0 || trackedRange.stop < axisCount) &&
+                  " Edits outside this range need a wider propagation."}
+              </p>
+            )}
+          </label>
+        )}
 
         {file.kind === "3d" && (
           <button
@@ -1264,30 +1478,68 @@ export default function App() {
             </p>
           </div>
         )}
+        {cacheStatus && !cacheStatus.ready && (
+          <div
+            className={`stage-status ${cacheStatus.stage === "error" ? "stage-status-error" : ""}`}
+            role="status"
+          >
+            {cacheStatus.stage !== "error" && <div className="loading-spinner" />}
+            <h2>
+              {cacheStatus.stage === "error"
+                ? `Could not prepare ${file.name}`
+                : `Preparing ${file.name}`}
+            </h2>
+            <p>{cacheStatus.error ?? cacheStatus.message}</p>
+            {cacheStatus.stage !== "error" && (
+              <>
+                <div className="progress-wrap cache-progress">
+                  <div className="progress-bar" style={{ width: `${cacheStatus.percent}%` }} />
+                </div>
+                <p className="loading-hint">
+                  {cacheStatus.stage} · {cacheStatus.percent}%
+                  {cacheStatus.mb_per_s != null && ` · ${Math.round(cacheStatus.mb_per_s)} MB/s`}
+                  {cacheStatus.eta_s != null && ` · about ${formatSeconds(cacheStatus.eta_s)} left`}
+                </p>
+                <p className="loading-hint">
+                  {axisReady
+                    ? "You can already view and segment this axis. The other axes unlock when the one-time cache is finished; later opens are instant."
+                    : "This one-time cache makes every axis load instantly next time."}
+                </p>
+              </>
+            )}
+          </div>
+        )}
         {sliceError && <p className="stage-error">{sliceError}</p>}
-        <Viewer
-          imageUrl={imageUrl}
-          propagatedMaskUrl={propMaskUrl}
-          autoMaskUrl={autoMaskUrl}
-          objects={viewerObjects}
-          activeObjectId={activeObjectId}
-          sliceWidth={sliceSize.w}
-          sliceHeight={sliceSize.h}
-          displayWidth={displayWidth}
-          displayHeight={displayHeight}
-          maskOpacity={maskOpacity}
-          busy={
-            propagation?.running ||
-            autoDetecting ||
-            (!pointReady && !detectorCanStayInteractive) ||
-            (!prepared && trackedIds.length === 0 && !autoMaskUrl && !sliceError)
-          }
-          onPick={handlePick}
-          onImageLoad={() => setSliceError(null)}
-          onImageError={() =>
-            setSliceError("Could not load this slice from the inference server.")
-          }
-        />
+        {imageUrl && (
+          <div className="viewer-wrap">
+            {sliceLoading && (
+              <div className="slice-loading" role="status">
+                <div className="loading-spinner" />
+              </div>
+            )}
+            <Viewer
+              imageUrl={imageUrl}
+              propagatedMaskUrl={propMaskUrl}
+              autoMaskUrl={autoMaskUrl}
+              objects={viewerObjects}
+              activeObjectId={activeObjectId}
+              sliceWidth={sliceSize.w}
+              sliceHeight={sliceSize.h}
+              displayWidth={displayWidth}
+              displayHeight={displayHeight}
+              maskOpacity={maskOpacity}
+              busy={
+                propagation?.running ||
+                autoDetecting ||
+                (!pointReady && !detectorCanStayInteractive) ||
+                (!prepared && trackedIds.length === 0 && !autoMaskUrl && !sliceError)
+              }
+              onPick={handlePick}
+              onImageLoad={handleSliceLoad}
+              onImageError={handleSliceError}
+            />
+          </div>
+        )}
       </main>
     </div>
   );

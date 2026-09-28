@@ -290,6 +290,49 @@ body {
   transition: width 0.15s ease;
 }
 
+.cache-progress {
+  margin-top: 12px;
+}
+
+.range-track {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: #232b33;
+}
+
+.range-track-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 2px;
+  border-radius: 2px;
+  background: #19c37d;
+}
+
+.number-input {
+  width: 100%;
+  background: #0f1317;
+  color: #e6e9ec;
+  border: 1px solid #2c343d;
+  border-radius: 6px;
+  padding: 7px 9px;
+}
+
+.viewer-wrap {
+  position: relative;
+}
+
+.slice-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  background: rgba(16, 20, 24, 0.35);
+  pointer-events: none;
+}
+
 .display-settings summary {
   cursor: pointer;
   color: #8a949e;

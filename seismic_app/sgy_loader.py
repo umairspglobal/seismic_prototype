@@ -20,6 +20,7 @@ hence the transpose here, once, at the boundary.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -221,26 +222,33 @@ def load_numpy(path: str | Path) -> tuple[np.ndarray, SectionGeometry]:
     return data, geometry
 
 
-def _inspect_sgy_listing(path: Path) -> tuple[tuple[int, ...], SectionGeometry]:
-    """Dropdown metadata only: sample/trace counts, no 3D index or per-trace scan.
+_listing_cache: dict[tuple[str, int, int], tuple[tuple[int, ...], SectionGeometry]] = {}
+_listing_lock = threading.Lock()
 
-    Building an inline/crossline index or reading every CDP header on a
-    multi-GB volume can stall the API for minutes and freeze every other
-    request, including opening a different .sgy file. Full geometry is
-    recovered when the file is actually loaded.
+
+def _inspect_sgy_listing(path: Path) -> tuple[tuple[int, ...], SectionGeometry]:
+    """Dropdown metadata from a few thousand sampled headers, no full index scan.
+
+    Building segyio's inline/crossline index or reading every CDP header
+    on a multi-GB volume can stall the API for minutes, so the grid is
+    detected from sampled headers (any known header layout, either sort
+    order). The exact geometry is recovered when the file is opened.
+    Results are memoized per file version.
     """
-    with segyio.open(str(path), ignore_geometry=True) as f:
-        n_samples = len(f.samples)
-        n_traces = f.tracecount
-        dt_us = float(f.bin[segyio.BinField.Interval])
-        dt_ms = dt_us / 1000.0 if 100.0 <= dt_us <= 32000.0 else DEFAULT_NPY_DT_MS
-        return (n_samples, n_traces), SectionGeometry(
-            kind="2d",
-            n_traces=n_traces,
-            n_samples=n_samples,
-            dt_ms=dt_ms,
-            t0_ms=0.0,
-        )
+    stat = path.stat()
+    key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    with _listing_lock:
+        cached = _listing_cache.get(key)
+    if cached is not None:
+        return cached
+    from .segy_geometry import TraceReader, detect_layout_fast, listing_geometry
+
+    with TraceReader(path) as reader:
+        layout = detect_layout_fast(reader, path)
+        result = (layout.shape, listing_geometry(reader, layout))
+    with _listing_lock:
+        _listing_cache[key] = result
+    return result
 
 
 def _inspect_sgy_2d(path: Path) -> tuple[tuple[int, ...], SectionGeometry]:

@@ -148,8 +148,12 @@ def export_volume_vti(
     geometry: SectionGeometry,
     out_path: str | Path,
     include_amplitude: bool = True,
+    origin_xy: tuple[float, float] = (0.0, 0.0),
 ) -> Path:
     """Write a 3D volume as ImageData with real bin/sample spacings.
+
+    ``origin_xy`` places a sub-volume (a windowed propagation) at its
+    inline/crossline offset in metres, so it lines up with a full export.
 
     masks are (n_ilines, n_samples, n_xlines) stacks (pipeline
     convention); amplitude is the raw (n_ilines, n_xlines, n_samples)
@@ -180,7 +184,7 @@ def export_volume_vti(
 
     written = imageToVTK(
         str(out_path.with_suffix("")),
-        origin=(0.0, 0.0, float(z_depths[-1])),
+        origin=(float(origin_xy[0]), float(origin_xy[1]), float(z_depths[-1])),
         spacing=(
             geometry.iline_spacing_m or 25.0,
             geometry.xline_spacing_m or 25.0,

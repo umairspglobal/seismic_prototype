@@ -77,7 +77,7 @@ def test_listing_timeout_falls_back_to_2d_headers(monkeypatch):
 
     monkeypatch.setattr("seismic_app.sgy_loader.inspect_any", hang)
     try:
-        shape, geometry = inspect_any_for_listing(path, timeout_s=0.2)
+        shape, geometry = inspect_any_for_listing(path)
     finally:
         blocked.set()
 

@@ -1,12 +1,38 @@
+export type Axis = "inline" | "crossline" | "time";
+
+/** Background cache build of a large file (see /api/file-status). */
+export interface CacheStatus {
+  stage: "queued" | "scanning" | "sampling" | "converting" | "finalizing" | "ready" | "error";
+  message: string;
+  percent: number;
+  mb_per_s: number | null;
+  eta_s: number | null;
+  elapsed_s: number | null;
+  error: string | null;
+  ready: boolean;
+  cache_dir: string;
+}
+
+/** Overlapping trace windows of a 2D line too wide to show at once. */
+export interface PageInfo {
+  count: number;
+  width: number;
+  step: number;
+}
+
 export interface FileInfo {
   name: string;
   format: "sgy" | "npy";
   kind: "2d" | "3d";
   shape: number[];
   axes: { inline: number; crossline: number; time: number };
+  /** Served from the disk cache instead of being loaded into RAM. */
+  large?: boolean;
+  pages?: PageInfo | null;
+  /** Large files only: axes whose slices can be served right now. */
+  axes_ready?: Record<Axis, boolean>;
+  status?: CacheStatus | null;
 }
-
-export type Axis = "inline" | "crossline" | "time";
 
 export type ModelFamily = "sam2" | "sam3" | "sam31";
 
@@ -71,6 +97,10 @@ export interface DoneEvent {
   timings: Record<string, number>;
   /** Tracker sessions were kept, so slices can be edited in place. */
   editable?: boolean;
+  /** Tracked slice range [start, stop) along the axis. */
+  start?: number;
+  stop?: number;
+  window_reason?: string;
 }
 
 export interface ErrorEvent {
@@ -86,6 +116,8 @@ export interface TrackedVolume {
   axis: Axis;
   objects: number[];
   edited_slices: number[];
+  start?: number;
+  stop?: number;
 }
 
 export interface ExportResult {
@@ -206,6 +238,14 @@ export async function getFileMeta(file: string): Promise<FileInfo> {
   const params = new URLSearchParams({ file });
   const res = await fetch(apiUrl(`/api/meta?${params}`));
   if (!res.ok) throw new Error(await errorMessage(res, "Failed to open seismic file"));
+  return res.json();
+}
+
+/** Cache progress and axis readiness; cheap enough to poll every second. */
+export async function getFileStatus(file: string): Promise<FileInfo> {
+  const params = new URLSearchParams({ file });
+  const res = await fetch(apiUrl(`/api/file-status?${params}`));
+  if (!res.ok) throw new Error(await errorMessage(res, "Failed to read file status"));
   return res.json();
 }
 
@@ -332,6 +372,8 @@ export async function propagate(
   objects: ObjectPrompt[],
   onEvent: (event: PropagationEvent) => void,
   signal?: AbortSignal,
+  /** Half-width of the tracked range; null lets the server choose. */
+  window: number | null = null,
 ): Promise<void> {
   const res = await fetch(apiUrl("/api/propagate"), {
     method: "POST",
@@ -341,6 +383,7 @@ export async function propagate(
       file,
       axis,
       index: anchor,
+      ...(window != null ? { window } : {}),
       objects: objects.map((o) => ({
         id: o.id,
         points: o.points.map((p) => [p.col, p.row]),

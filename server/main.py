@@ -17,9 +17,12 @@ family stays on the GPU.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import gc
 import io
 import json
+import logging
+import math
 import platform
 import queue
 import sys
@@ -38,7 +41,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 
-from seismic_app import config
+from seismic_app import config, sysinfo
 from seismic_app.config import ModelFamily
 from seismic_app.geometry import SectionGeometry
 from seismic_app.inference import (
@@ -52,7 +55,7 @@ from seismic_app.inference import (
     transformers_version,
 )
 from seismic_app.logutil import get_logger
-from seismic_app.preprocessing import inline_to_rgb_25d, normalize_to_uint8, to_rgb
+from seismic_app.preprocessing import normalize_to_uint8
 from seismic_app.pipeline import _segment_section_rgb
 from seismic_app.sgy_loader import (
     SUPPORTED_SEISMIC_SUFFIXES,
@@ -60,6 +63,19 @@ from seismic_app.sgy_loader import (
     load_any,
 )
 from seismic_app.stitching import binarize
+from seismic_app.volume import (
+    AxisNotReady,
+    CachedVolume,
+    DirectVolume,
+    InMemoryVolume,
+    SeismicVolume,
+    estimated_in_memory_bytes,
+    in_memory_budget,
+    make_pages,
+    needs_cache,
+    slice_rgb,
+)
+from seismic_app.volume_cache import CacheManager
 from seismic_app.vtk_export import FIRST_INTERACTIVE_LABEL_ID, export_volume_vti
 
 log = get_logger("server")
@@ -116,14 +132,32 @@ class Propagation:
     without re-running anything.
     """
 
-    def __init__(self, file: str, axis: str, object_ids: list[int], live: LiveTracker):
+    def __init__(
+        self,
+        file: str,
+        axis: str,
+        object_ids: list[int],
+        live: LiveTracker,
+        start: int = 0,
+        stop: int | None = None,
+    ):
         self.file = file
         self.axis = axis
         self.object_ids = object_ids
         self.live = live
+        # Tracked slice range [start, stop) along ``axis``; the live
+        # tracker's frame i is slice start + i.
+        self.start = start
+        self.stop = stop if stop is not None else start + int(live.n_frames)
 
     def covers(self, file: str, axis: str) -> bool:
         return self.file == file and self.axis == axis
+
+    def local_frame(self, index: int) -> int | None:
+        """Live-tracker frame of an absolute slice index, None when outside the range."""
+        if self.start <= index < self.stop:
+            return index - self.start
+        return None
 
     def position_of(self, object_id: int) -> int | None:
         """Row of a frontend object id in the tracked mask stack."""
@@ -324,7 +358,12 @@ def _ensure_text_segmenter_locked() -> tuple[Sam3SeismicSegmenter, bool]:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     threading.Thread(target=_warmup_models, daemon=True, name="model-warmup").start()
+    # CPU/disk only: never takes _gpu_lock, so model warmup is unaffected.
+    threading.Thread(
+        target=_prepare_large_files, daemon=True, name="large-file-scan"
+    ).start()
     yield
+    _cache_manager.shutdown()
 
 
 app = FastAPI(title="Seismic SAM interactive API", lifespan=lifespan)
@@ -367,25 +406,6 @@ def _list_seismic_files() -> list[Path]:
 def _lock_for_file(name: str) -> threading.Lock:
     with _file_load_locks_guard:
         return _file_load_locks.setdefault(name, threading.Lock())
-
-
-def _file_info_payload(
-    name: str, data: np.ndarray, geometry: SectionGeometry
-) -> dict:
-    shape = [int(size) for size in data.shape]
-    return {
-        "name": name,
-        "format": Path(name).suffix.lower().lstrip("."),
-        "kind": geometry.kind,
-        "shape": shape,
-        "axes": {
-            "inline": shape[0],
-            "crossline": shape[1],
-            "time": shape[2],
-        }
-        if geometry.kind == "3d"
-        else {"inline": 1, "crossline": 1, "time": 1},
-    }
 
 
 def _drop_tracked_volume_if_other_file_locked(file: str) -> None:
@@ -435,6 +455,101 @@ def _get_file(name: str) -> tuple[np.ndarray, SectionGeometry, np.ndarray]:
             return _file_cache.get(name, packed)
 
 
+# ---- large files: routing, disk cache, volumes ------------------------------
+
+_cache_manager = CacheManager()
+_route_lock = threading.Lock()
+_routes: dict[str, tuple[tuple, bool, tuple]] = {}
+_volumes_lock = threading.Lock()
+_large_volumes: dict[str, SeismicVolume] = {}
+
+
+def _route(path: Path) -> tuple[bool, tuple[tuple[int, ...], SectionGeometry]]:
+    """(needs the disk cache, fast listing) for one file version; logged once."""
+    stat = path.stat()
+    key = (stat.st_size, stat.st_mtime_ns)
+    with _route_lock:
+        cached = _routes.get(path.name)
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+    listing = inspect_any_for_listing(path)
+    shape = listing[0]
+    # math.prod: np.prod overflows int32 on Windows for multi-billion-sample volumes.
+    n_values = math.prod(int(s) for s in shape)
+    large = needs_cache(n_values)
+    log.info(
+        "Routing %s (%s on disk, %s %s = %d values): in-memory cost ~%s vs budget %s -> %s",
+        path.name,
+        sysinfo.gb(stat.st_size),
+        listing[1].kind.upper(),
+        "x".join(str(s) for s in shape),
+        n_values,
+        sysinfo.gb(estimated_in_memory_bytes(n_values)),
+        sysinfo.gb(in_memory_budget()),
+        "disk cache (large-file path)" if large else "in-memory",
+    )
+    with _route_lock:
+        _routes[path.name] = (key, large, listing)
+    return large, listing
+
+
+def _large_volume(name: str, path: Path, priority: bool = False, retry: bool = False) -> SeismicVolume:
+    """Cached volume when the cache is complete, otherwise a direct reader."""
+    state = _cache_manager.ensure(name, path, priority=priority, retry=retry)
+    with _volumes_lock:
+        current = _large_volumes.get(name)
+        if state.ready:
+            if isinstance(current, CachedVolume) and current.state is state:
+                return current
+            volume: SeismicVolume = CachedVolume(name, path, state)
+            log.info("%s now served from its memmap cache (%s)", name, state.directory)
+        else:
+            if isinstance(current, DirectVolume) and current.state is state:
+                return current
+            _, listing = _route(path)
+            volume = DirectVolume(name, path, state, listing)
+        if current is not None:
+            closer = getattr(current, "close", None)
+            if closer is not None:
+                closer()
+        _large_volumes[name] = volume
+        return volume
+
+
+def _get_volume(name: str, priority: bool = False, retry: bool = False) -> SeismicVolume:
+    """The slice source for a survey: in-memory for small files, cached for large."""
+    path = {p.name: p for p in _list_seismic_files()}.get(name)
+    if path is not None:
+        try:
+            large, _listing = _route(path)
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            raise HTTPException(422, f"Could not inspect seismic file {name}: {exc}") from exc
+        if large:
+            return _large_volume(name, path, priority=priority, retry=retry)
+    data, geometry, data_u8 = _get_file(name)
+    return InMemoryVolume(name, data, geometry, data_u8)
+
+
+def _prepare_large_files() -> None:
+    """Startup pass: route every data file and queue caches for the large ones."""
+    started = time.perf_counter()
+    queued = []
+    for path in _list_seismic_files():
+        try:
+            large, _ = _route(path)
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            log.warning("Could not inspect %s at startup: %s", path.name, exc)
+            continue
+        if large:
+            state = _cache_manager.ensure(path.name, path)
+            queued.append(f"{path.name} ({state.stage})")
+    log.info(
+        "Large-file startup scan done in %.1fs: %s",
+        time.perf_counter() - started,
+        ", ".join(queued) if queued else "no files need the disk cache",
+    )
+
+
 def _require_point_segmenter() -> Sam3PointSegmenter | Sam31PointSegmenter:
     if _load_state["error"] and _point_segmenter is None:
         raise HTTPException(503, f"Model failed to load: {_load_state['error']}")
@@ -469,32 +584,27 @@ def _require_propagator() -> Sam3VolumePropagator | Sam31VolumePropagator:
     return _propagator
 
 
-def _axis_count(data: np.ndarray, geometry: SectionGeometry, axis: str) -> int:
-    if geometry.kind == "2d":
-        return 1
-    return {"inline": data.shape[0], "crossline": data.shape[1], "time": data.shape[2]}[
-        axis
-    ]
-
-
 def _slice_rgb(
     data_u8: np.ndarray, geometry: SectionGeometry, axis: str, index: int
 ) -> np.ndarray:
-    if geometry.kind == "2d":
-        return to_rgb(data_u8)
-    if axis == "inline":
-        return inline_to_rgb_25d(data_u8, index)
-    if axis == "crossline":
-        return to_rgb(data_u8[:, index, :].T)
-    return to_rgb(data_u8[:, :, index])
+    """Slice image of an in-memory uint8 array (index = page for wide 2D lines)."""
+    return slice_rgb(data_u8, geometry, axis, index)
 
 
-def _validate_slice(
-    data: np.ndarray, geometry: SectionGeometry, axis: str, index: int
-) -> None:
+def _volume_rgb(volume: SeismicVolume, axis: str, index: int) -> np.ndarray:
+    """(H, W, 3) uint8 slice image; 409 when that axis of a large file is not ready."""
+    if isinstance(volume, InMemoryVolume):
+        return _slice_rgb(volume.data_u8, volume.geometry, axis, index)
+    try:
+        return volume.rgb(axis, index)
+    except AxisNotReady as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def _validate_slice(volume: SeismicVolume, axis: str, index: int) -> None:
     if axis not in ("inline", "crossline", "time"):
         raise HTTPException(422, f"Unknown axis: {axis}")
-    count = _axis_count(data, geometry, axis)
+    count = volume.axis_count(axis)
     if not 0 <= index < count:
         raise HTTPException(422, f"Slice index {index} out of range [0, {count - 1}]")
 
@@ -550,6 +660,9 @@ class ObjectPrompt(BaseModel):
 
 class PropagateRequest(SliceRef):
     objects: list[ObjectPrompt] = Field(min_length=1)
+    # Half-width of the tracked slice range around the anchor. None tracks
+    # the whole axis when it fits the memory budget (always for small files).
+    window: int | None = Field(default=None, ge=0)
 
 
 class RefineRequest(SliceRef):
@@ -622,33 +735,80 @@ def list_files(format: str | None = None) -> list[dict]:
         if requested_suffix is not None and path.suffix.lower() != requested_suffix:
             continue
         try:
-            shape, geometry = inspect_any_for_listing(path)
+            large, (shape, geometry) = _route(path)
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
             log.warning("Skipping unusable data file %s: %s", path, exc)
             continue
-        entries.append(
-            {
-                "name": path.name,
-                "format": path.suffix.lower().lstrip("."),
-                "kind": geometry.kind,
-                "shape": list(shape),
-                "axes": {
-                    "inline": shape[0],
-                    "crossline": shape[1],
-                    "time": shape[2],
-                }
-                if geometry.kind == "3d"
-                else {"inline": 1, "crossline": 1, "time": 1},
+        entry = {
+            "name": path.name,
+            "format": path.suffix.lower().lstrip("."),
+            "kind": geometry.kind,
+            "shape": list(shape),
+            "axes": {
+                "inline": shape[0],
+                "crossline": shape[1],
+                "time": shape[2],
             }
-        )
+            if geometry.kind == "3d"
+            else {"inline": 1, "crossline": 1, "time": 1},
+        }
+        # Large-file fields (large, status, axes_ready, pages) are only added
+        # where they apply, so small-file entries keep their original shape.
+        if geometry.kind == "2d":
+            pages = make_pages(int(shape[1]))
+            if pages.count > 1:
+                entry["pages"] = pages.to_json()
+        if large:
+            volume = _large_volume(path.name, path)
+            entry.update(volume.info())
+        entries.append(entry)
     return entries
 
 
 @app.get("/api/meta")
 def file_meta(file: str) -> dict:
-    """Return kind/shape for a survey. Does not require a loaded tracker."""
-    data, geometry, _ = _get_file(file)
-    return _file_info_payload(file, data, geometry)
+    """Return kind/shape for a survey. Does not require a loaded tracker.
+
+    Large files answer immediately (their cache builds in the background,
+    and opening one moves it to the front of the queue); small files are
+    loaded into memory as before.
+    """
+    started = time.perf_counter()
+    volume = _get_volume(file, priority=True, retry=True)
+    info = volume.info()
+    log.info(
+        "Opened %s: %s %s%s [%.2fs]",
+        file,
+        info["kind"].upper(),
+        "x".join(str(s) for s in info["shape"]),
+        f", cache {info['status']['stage']} {info['status']['percent']:.0f}%"
+        if info.get("status")
+        else " (in memory)",
+        time.perf_counter() - started,
+    )
+    return info
+
+
+@app.get("/api/file-status")
+def file_status(file: str) -> dict:
+    """Cache build progress and axis readiness for one survey (cheap to poll)."""
+    path = {p.name: p for p in _list_seismic_files()}.get(file)
+    if path is None:
+        raise HTTPException(404, f"Unknown seismic file: {file}")
+    try:
+        large, (shape, geometry) = _route(path)
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+        raise HTTPException(422, f"Could not inspect seismic file {file}: {exc}") from exc
+    if not large:
+        return {
+            "name": file,
+            "large": False,
+            "kind": geometry.kind,
+            "shape": list(shape),
+            "axes_ready": {"inline": True, "crossline": True, "time": True},
+            "status": None,
+        }
+    return _large_volume(file, path).info()
 
 
 def _bytes_to_gb(n: int | None) -> float | None:
@@ -738,7 +898,11 @@ def runtime_info() -> dict:
                 "file": _propagation.file,
                 "axis": _propagation.axis,
                 "objects": list(_propagation.object_ids),
-                "edited_slices": sorted(_propagation.live.dirty_frames),
+                "edited_slices": sorted(
+                    _propagation.start + f for f in _propagation.live.dirty_frames
+                ),
+                "start": _propagation.start,
+                "stop": _propagation.stop,
             }
             if _propagation is not None
             else None
@@ -762,11 +926,26 @@ def runtime_info() -> dict:
 
 @app.get("/api/slice")
 def get_slice(file: str, axis: str = "inline", index: int = 0) -> Response:
-    data, geometry, data_u8 = _get_file(file)
-    _validate_slice(data, geometry, axis, index)
-    rgb = _slice_rgb(data_u8, geometry, axis, index)
+    started = time.perf_counter()
+    volume = _get_volume(file)
+    _validate_slice(volume, axis, index)
+    rgb = _volume_rgb(volume, axis, index)
+    read_done = time.perf_counter()
     buffer = io.BytesIO()
     Image.fromarray(rgb).save(buffer, format="JPEG", quality=90)
+    total = time.perf_counter() - started
+    log.log(
+        logging.INFO if total > 0.25 else logging.DEBUG,
+        "slice %s %s[%d] %dx%d: read %.0f ms, jpeg %.0f ms (%s)",
+        file,
+        axis,
+        index,
+        rgb.shape[1],
+        rgb.shape[0],
+        1000 * (read_done - started),
+        1000 * (total - (read_done - started)),
+        type(volume).__name__,
+    )
     return Response(
         buffer.getvalue(),
         media_type="image/jpeg",
@@ -777,9 +956,9 @@ def get_slice(file: str, axis: str = "inline", index: int = 0) -> Response:
 @app.post("/api/prepare")
 def prepare_slice(req: SliceRef) -> dict:
     """Encode the slice with the vision backbone before the first click."""
-    data, geometry, data_u8 = _get_file(req.file)
-    _validate_slice(data, geometry, req.axis, req.index)
-    rgb = _slice_rgb(data_u8, geometry, req.axis, req.index)
+    volume = _get_volume(req.file)
+    _validate_slice(volume, req.axis, req.index)
+    rgb = _volume_rgb(volume, req.axis, req.index)
     with _gpu_lock:
         _drop_tracked_volume_if_other_file_locked(req.file)
         segmenter = _require_point_segmenter()
@@ -787,7 +966,7 @@ def prepare_slice(req: SliceRef) -> dict:
         prepare_seconds = segmenter.last_timings.get("prepare_image", 0.0)
     return {
         "prepare_seconds": prepare_seconds,
-        **_file_info_payload(req.file, data, geometry),
+        **volume.info(),
     }
 
 
@@ -795,9 +974,9 @@ def prepare_slice(req: SliceRef) -> dict:
 def segment(req: SegmentRequest) -> dict:
     if len(req.points) != len(req.labels):
         raise HTTPException(422, "points and labels must be equal length")
-    data, geometry, data_u8 = _get_file(req.file)
-    _validate_slice(data, geometry, req.axis, req.index)
-    rgb = _slice_rgb(data_u8, geometry, req.axis, req.index)
+    volume = _get_volume(req.file)
+    _validate_slice(volume, req.axis, req.index)
+    rgb = _volume_rgb(volume, req.axis, req.index)
     started = time.perf_counter()
     with _gpu_lock:
         segmenter = _require_point_segmenter()
@@ -826,9 +1005,9 @@ def auto_segment(req: SliceRef) -> dict:
     Uses ``Sam3SeismicSegmenter`` (not the click tracker). The tracker
     stays loaded when VRAM allows; otherwise it is unloaded for this pass.
     """
-    data, geometry, data_u8 = _get_file(req.file)
-    _validate_slice(data, geometry, req.axis, req.index)
-    rgb = _slice_rgb(data_u8, geometry, req.axis, req.index)
+    volume = _get_volume(req.file)
+    _validate_slice(volume, req.axis, req.index)
+    rgb = _volume_rgb(volume, req.axis, req.index)
     started = time.perf_counter()
     prompts = [config.FACIES_PROMPT]
     with _gpu_lock:
@@ -859,11 +1038,13 @@ def auto_segment(req: SliceRef) -> dict:
 def _stream_tracking(
     object_ids: list[int],
     work: Callable[[Callable[[int, int, int, np.ndarray], None]], dict],
+    frame_offset: int = 0,
 ) -> StreamingResponse:
     """Run a tracking job on a worker thread, one NDJSON event per slice.
 
     ``work`` is called with a progress callback and returns the payload
-    to merge into the terminating "done" event.
+    to merge into the terminating "done" event. ``frame_offset`` turns the
+    tracker's window-local frame numbers back into absolute slice indices.
     """
     events: queue.Queue[dict | None] = queue.Queue(maxsize=32)
 
@@ -871,7 +1052,7 @@ def _stream_tracking(
         events.put(
             {
                 "type": "frame",
-                "frame": int(frame_idx),
+                "frame": int(frame_idx) + frame_offset,
                 "done": int(done),
                 "total": int(total),
                 "coverage": float(masks.any(axis=0).mean()),
@@ -900,13 +1081,82 @@ def _stream_tracking(
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
+def _propagation_window(
+    volume: SeismicVolume,
+    axis: str,
+    anchor: int,
+    prompted: list[int],
+    n_objects: int,
+    requested: int | None,
+) -> tuple[int, int, str]:
+    """Slice range [start, stop) to track, always covering every prompted slice.
+
+    Small (in-memory) volumes track the whole axis unless a half-width is
+    requested, exactly as before. Large volumes size the window from the
+    RAM a propagation needs per frame: the RGB slice, its mask per object
+    and the processor's resized float tensor.
+    """
+    n = volume.axis_count(axis)
+    h, w = volume.frame_shape(axis)
+    side = config.PROPAGATION_MODEL_SIDE
+    per_frame = h * w * (3 + n_objects) + 3 * side * side * 4
+    total, available = sysinfo.memory_status()
+    budget = int(config.PROPAGATION_RAM_FRACTION * total) if total else 4 * 1024**3
+    if available:
+        budget = min(budget, int(available * 0.6))
+    max_frames = max(config.PROPAGATION_MIN_FRAMES, budget // per_frame)
+    if requested is not None and requested >= 0:
+        start, stop = anchor - requested, anchor + requested + 1
+        reason = f"requested +/-{requested}"
+    elif not volume.large or n <= max_frames:
+        start, stop = 0, n
+        reason = "full axis" + ("" if volume.large else " (in-memory volume)")
+    else:
+        half = max(1, (max_frames - 1) // 2)
+        start, stop = anchor - half, anchor + half + 1
+        reason = f"auto +/-{half} from a {sysinfo.gb(budget)} RAM budget"
+    touched = prompted + [anchor]
+    start = max(0, min(start, min(touched)))
+    stop = min(n, max(stop, max(touched) + 1))
+    estimate = (stop - start) * per_frame
+    log.info(
+        "Propagation window on %s %s: slices [%d, %d) of %d (%s); ~%s for %d frames of %dx%d "
+        "(budget %s, %s available)",
+        volume.name,
+        axis,
+        start,
+        stop,
+        n,
+        reason,
+        sysinfo.gb(estimate),
+        stop - start,
+        w,
+        h,
+        sysinfo.gb(budget),
+        sysinfo.gb(available),
+    )
+    if estimate > budget and volume.large:
+        log.warning(
+            "Requested propagation range needs ~%s, above the %s budget; it may be slow "
+            "or run out of memory",
+            sysinfo.gb(estimate),
+            sysinfo.gb(budget),
+        )
+    return start, stop, reason
+
+
 @app.post("/api/propagate")
 def propagate(req: PropagateRequest) -> StreamingResponse:
-    data, geometry, data_u8 = _get_file(req.file)
-    if geometry.kind != "3d":
+    volume = _get_volume(req.file)
+    if volume.kind != "3d":
         raise HTTPException(422, "Propagation requires a 3D volume")
-    _validate_slice(data, geometry, req.axis, req.index)
-    n_frames = _axis_count(data, geometry, req.axis)
+    _validate_slice(volume, req.axis, req.index)
+    if not volume.axes_ready().get(req.axis, False):
+        raise HTTPException(
+            409,
+            f"The {req.axis} axis of {req.file} is not ready yet; wait for its cache to finish.",
+        )
+    n_frames = volume.axis_count(req.axis)
     for obj in req.objects:
         if len(obj.points) != len(obj.labels):
             raise HTTPException(422, "points and labels must be equal length")
@@ -921,7 +1171,20 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
                 raise HTTPException(422, "slices must match points length")
             if any(not 0 <= s < n_frames for s in obj.slices):
                 raise HTTPException(422, "point slice index out of range")
-    frames = [_slice_rgb(data_u8, geometry, req.axis, i) for i in range(n_frames)]
+    prompted = sorted(
+        {int(s) for obj in req.objects for s in (obj.slices or [req.index])}
+    )
+    start, stop, reason = _propagation_window(
+        volume, req.axis, req.index, prompted, len(req.objects), req.window
+    )
+    frames_started = time.perf_counter()
+    frames = [_volume_rgb(volume, req.axis, i) for i in range(start, stop)]
+    log.info(
+        "Built %d %s frames for propagation in %.1fs",
+        len(frames),
+        req.axis,
+        time.perf_counter() - frames_started,
+    )
     object_ids = [obj.id for obj in req.objects]
 
     def work(on_progress) -> dict:
@@ -933,7 +1196,7 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
             _propagation = None
             propagator.propagate(
                 frames,
-                anchor_idx=req.index,
+                anchor_idx=req.index - start,
                 points_per_object=[
                     [(int(c), int(r)) for c, r in obj.points] for obj in req.objects
                 ],
@@ -941,9 +1204,9 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
                     [int(l) for l in obj.labels] for obj in req.objects
                 ],
                 frame_indices_per_object=[
-                    [int(s) for s in obj.slices]
+                    [int(s) - start for s in obj.slices]
                     if obj.slices is not None
-                    else [req.index] * len(obj.points)
+                    else [req.index - start] * len(obj.points)
                     for obj in req.objects
                 ],
                 progress=on_progress,
@@ -951,16 +1214,21 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
             )
             live = propagator.live
             if live is not None:
-                _propagation = Propagation(req.file, req.axis, object_ids, live)
+                _propagation = Propagation(
+                    req.file, req.axis, object_ids, live, start=start, stop=stop
+                )
             timings = {
                 k: float(v) for k, v in propagator.last_timings.items()
             }
         return {
             "timings": timings,
             "editable": live is not None,
+            "start": start,
+            "stop": stop,
+            "window_reason": reason,
         }
 
-    return _stream_tracking(object_ids, work)
+    return _stream_tracking(object_ids, work, frame_offset=start)
 
 
 @app.post("/api/refine")
@@ -973,8 +1241,8 @@ def refine(req: RefineRequest) -> dict:
     """
     if len(req.points) != len(req.labels):
         raise HTTPException(422, "points and labels must be equal length")
-    data, geometry, _ = _get_file(req.file)
-    _validate_slice(data, geometry, req.axis, req.index)
+    volume = _get_volume(req.file)
+    _validate_slice(volume, req.axis, req.index)
     started = time.perf_counter()
     with _gpu_lock:
         state = _require_propagation(req.file, req.axis)
@@ -985,11 +1253,18 @@ def refine(req: RefineRequest) -> dict:
                 f"Object {req.object_id + 1} is not part of the tracked volume - "
                 "propagate again to include it.",
             )
+        local = state.local_frame(req.index)
+        if local is None:
+            raise HTTPException(
+                409,
+                f"Slice {req.index + 1} is outside the tracked range "
+                f"{state.start + 1}-{state.stop} - propagate with a wider range to edit it.",
+            )
         propagator = _require_propagator()
         frame_masks = propagator.refine_frame(
             state.live,
             position,
-            req.index,
+            local,
             [(int(c), int(r)) for c, r in req.points],
             [int(l) for l in req.labels],
         )
@@ -1003,8 +1278,8 @@ def refine(req: RefineRequest) -> dict:
 @app.post("/api/resweep")
 def resweep(req: VolumeRef) -> StreamingResponse:
     """Re-track the volume outward from the slices edited since the last sweep."""
-    data, geometry, _ = _get_file(req.file)
-    if geometry.kind != "3d":
+    volume = _get_volume(req.file)
+    if volume.kind != "3d":
         raise HTTPException(422, "Propagation requires a 3D volume")
     with _gpu_lock:
         state = _require_propagation(req.file, req.axis)
@@ -1013,6 +1288,8 @@ def resweep(req: VolumeRef) -> StreamingResponse:
                 409, "Nothing was edited since the last propagation."
             )
         object_ids = list(state.object_ids)
+        offset = state.start
+        start, stop = state.start, state.stop
 
     def work(on_progress) -> dict:
         with _gpu_lock:
@@ -1031,9 +1308,11 @@ def resweep(req: VolumeRef) -> StreamingResponse:
         return {
             "timings": timings,
             "editable": True,
+            "start": start,
+            "stop": stop,
         }
 
-    return _stream_tracking(object_ids, work)
+    return _stream_tracking(object_ids, work, frame_offset=offset)
 
 
 def _slice_masks_to_cube(
@@ -1060,30 +1339,56 @@ def _slice_masks_to_cube(
 
 @app.post("/api/export")
 def export_volume(req: ExportRequest) -> dict:
-    """Write a tracked SEG-Y or NumPy volume to a ParaView .vti."""
-    data, geometry, _ = _get_file(req.file)
-    if geometry.kind != "3d":
+    """Write a tracked SEG-Y or NumPy volume to a ParaView .vti.
+
+    Only the tracked slice range is written, placed at its offset in the
+    survey, so windowed propagations on large volumes export quickly.
+    """
+    volume = _get_volume(req.file)
+    if volume.kind != "3d":
         raise HTTPException(422, "Volume export requires a 3D volume")
     state = _require_propagation(req.file, req.axis)
     masks = state.live.masks
+    start, stop = state.start, state.stop
 
     started = time.perf_counter()
+    sub_shape = list(volume.shape)
+    sub_shape[{"inline": 0, "crossline": 1, "time": 2}[req.axis]] = stop - start
+    sub_shape_t = (int(sub_shape[0]), int(sub_shape[1]), int(sub_shape[2]))
     # One named mask per object; vtk_export folds them into a single int
     # label array, assigning ids in insertion order. Later objects win
     # where two masks overlap.
     label_masks = {
         f"object {object_id + 1}": np.transpose(
-            _slice_masks_to_cube(masks[row], req.axis, data.shape), (0, 2, 1)
+            _slice_masks_to_cube(masks[row], req.axis, sub_shape_t), (0, 2, 1)
         )
         for row, object_id in enumerate(state.object_ids)
     }
+    if req.include_amplitude:
+        try:
+            amplitude = volume.amplitude_window(req.axis, start, stop)
+        except AxisNotReady as exc:
+            raise HTTPException(409, str(exc)) from exc
+    else:
+        amplitude = np.zeros((0, 0, 0), dtype=np.float32)
+    geometry, origin_xy = _window_geometry(volume.geometry, req.axis, start, stop)
+    log.info(
+        "Exporting %s %s slices [%d, %d) as a %s sub-volume%s",
+        req.file,
+        req.axis,
+        start,
+        stop,
+        "x".join(str(s) for s in sub_shape_t),
+        " with amplitude" if req.include_amplitude else "",
+    )
     out_base = _export_path(req.file, req.axis).with_suffix("")
     written = export_volume_vti(
         label_masks,
-        data,
+        amplitude,
         geometry,
         out_base,
         include_amplitude=req.include_amplitude,
+        origin_xy=origin_xy,
     )
     elapsed = time.perf_counter() - started
     legend = {
@@ -1098,6 +1403,28 @@ def export_volume(req: ExportRequest) -> dict:
         "labels": legend,
         "seconds": elapsed,
     }
+
+
+def _window_geometry(
+    geometry: SectionGeometry, axis: str, start: int, stop: int
+) -> tuple[SectionGeometry, tuple[float, float]]:
+    """Geometry of a [start, stop) sub-volume and its (x, y) origin in metres."""
+    il_sp = geometry.iline_spacing_m or 25.0
+    xl_sp = geometry.xline_spacing_m or 25.0
+    if axis == "inline":
+        ilines = geometry.ilines[start:stop] if geometry.ilines is not None else None
+        return dataclasses.replace(geometry, ilines=ilines), (start * il_sp, 0.0)
+    if axis == "crossline":
+        xlines = geometry.xlines[start:stop] if geometry.xlines is not None else None
+        return dataclasses.replace(geometry, xlines=xlines), (0.0, start * xl_sp)
+    return (
+        dataclasses.replace(
+            geometry,
+            n_samples=stop - start,
+            t0_ms=geometry.t0_ms + start * geometry.dt_ms,
+        ),
+        (0.0, 0.0),
+    )
 
 
 def _export_path(file: str, axis: str) -> Path:

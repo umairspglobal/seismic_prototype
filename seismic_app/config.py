@@ -237,6 +237,33 @@ LABEL_COLORS: dict[str, tuple[int, int, int]] = {
 CLIP_LOW_PERCENTILE = 2.0
 CLIP_HIGH_PERCENTILE = 98.0
 
+# --- Large files ----------------------------------------------------------
+# A file takes the disk-cache path when loading it into RAM would need
+# more than this fraction of physical memory. Loading costs about
+# IN_MEMORY_BYTES_PER_VALUE bytes per sample: the float32 cube plus the
+# clip/scale temporaries of normalize_to_uint8 and the uint8 copy.
+IN_MEMORY_BUDGET_FRACTION = float(os.environ.get("SEISMIC_IN_MEMORY_FRACTION", "0.5"))
+IN_MEMORY_BYTES_PER_VALUE = 18
+# Absolute override in GB (e.g. to force the cache path in tests).
+IN_MEMORY_BUDGET_GB = os.environ.get("SEISMIC_IN_MEMORY_BUDGET_GB")
+
+CACHE_DIR = Path(os.environ.get("SEISMIC_CACHE_DIR", str(_REPO_ROOT / "outputs" / "cache")))
+# Traces sampled to estimate the clip percentiles of a large file.
+CACHE_PERCENTILE_TRACES = 20_000
+# Float32 bytes per conversion block.
+CACHE_BLOCK_BYTES = 256 * 1024**2
+
+# 2D lines wider than this are served as overlapping pages of traces.
+MAX_2D_PAGE_TRACES = 4096
+PAGE_OVERLAP_TRACES = 256
+
+# Share of physical RAM a single propagation may use for its frames,
+# processor tensors and masks when no explicit window is requested.
+PROPAGATION_RAM_FRACTION = float(os.environ.get("SEISMIC_PROPAGATION_RAM_FRACTION", "0.25"))
+# SAM video processors resize every frame to this square before encoding.
+PROPAGATION_MODEL_SIDE = 1008
+PROPAGATION_MIN_FRAMES = 8
+
 # --- Tiling ---------------------------------------------------------------
 
 TILE_SIZE = 1024
