@@ -28,6 +28,7 @@ import queue
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -40,6 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
+from scipy import ndimage
 
 from seismic_app import config, sysinfo
 from seismic_app.config import ModelFamily
@@ -124,6 +126,71 @@ _load_state: dict[str, str | bool | None] = {
 }
 
 
+class MaskStore:
+    """Disk-backed masks for the slices tracked outside the live session.
+
+    Full-axis propagations on large volumes track most slices in chunks
+    whose sessions are discarded; their masks (n_slices x n_objects x H x W
+    booleans, several GB) live in a memmap under the cache directory.
+    """
+
+    DIR = config.CACHE_DIR / "propagation"
+
+    def __init__(self, name: str, axis: str, n_slices: int, n_objects: int, height: int, width: int):
+        self.DIR.mkdir(parents=True, exist_ok=True)
+        self.remove_stale()
+        self.path = self.DIR / f"{Path(name).stem}-{axis}-{uuid.uuid4().hex[:8]}.masks"
+        self.data = np.memmap(
+            self.path, dtype=bool, mode="w+", shape=(n_slices, n_objects, height, width)
+        )
+        log.info(
+            "Mask store for %s %s: %d slices x %d object(s) of %dx%d (%s on disk) at %s",
+            name,
+            axis,
+            n_slices,
+            n_objects,
+            width,
+            height,
+            sysinfo.gb(self.data.nbytes),
+            self.path,
+        )
+
+    @classmethod
+    def remove_stale(cls) -> None:
+        """Delete stores of earlier propagations (skips any still mapped)."""
+        if not cls.DIR.exists():
+            return
+        for old in cls.DIR.glob("*.masks"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+    def write(self, index: int, masks: np.ndarray) -> None:
+        self.data[index] = masks
+
+    def flush(self) -> None:
+        self.data.flush()
+
+
+class _ObjectMasks:
+    """One object's masks along the whole tracked extent, indexed by slice - extent start."""
+
+    def __init__(self, state: "Propagation", row: int):
+        self.state = state
+        self.row = row
+        live = state.live
+        self.shape = (state.extent[1] - state.extent[0], live.height, live.width)
+
+    def __getitem__(self, i: int) -> np.ndarray:
+        index = self.state.extent[0] + i
+        local = self.state.local_frame(index)
+        if local is not None:
+            return self.state.live.masks[self.row, local]
+        assert self.state.store is not None
+        return np.asarray(self.state.store.data[index, self.row])
+
+
 class Propagation:
     """The last completed propagation: its live tracker plus what it covers.
 
@@ -140,15 +207,23 @@ class Propagation:
         live: LiveTracker,
         start: int = 0,
         stop: int | None = None,
+        store: MaskStore | None = None,
+        extent: tuple[int, int] | None = None,
     ):
         self.file = file
         self.axis = axis
         self.object_ids = object_ids
         self.live = live
-        # Tracked slice range [start, stop) along ``axis``; the live
+        # Live (editable) slice range [start, stop) along ``axis``; the live
         # tracker's frame i is slice start + i.
         self.start = start
         self.stop = stop if stop is not None else start + int(live.n_frames)
+        # Every tracked slice: the live range plus chunks kept in ``store``.
+        self.store = store
+        self.extent = extent if extent is not None else (self.start, self.stop)
+
+    def object_masks(self, row: int) -> _ObjectMasks:
+        return _ObjectMasks(self, row)
 
     def covers(self, file: str, axis: str) -> bool:
         return self.file == file and self.axis == axis
@@ -901,8 +976,10 @@ def runtime_info() -> dict:
                 "edited_slices": sorted(
                     _propagation.start + f for f in _propagation.live.dirty_frames
                 ),
-                "start": _propagation.start,
-                "stop": _propagation.stop,
+                "start": _propagation.extent[0],
+                "stop": _propagation.extent[1],
+                "live_start": _propagation.start,
+                "live_stop": _propagation.stop,
             }
             if _propagation is not None
             else None
@@ -1081,22 +1158,15 @@ def _stream_tracking(
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
-def _propagation_window(
-    volume: SeismicVolume,
-    axis: str,
-    anchor: int,
-    prompted: list[int],
-    n_objects: int,
-    requested: int | None,
-) -> tuple[int, int, str]:
-    """Slice range [start, stop) to track, always covering every prompted slice.
+def _propagation_budget(
+    volume: SeismicVolume, axis: str, n_objects: int, share: float = 1.0
+) -> tuple[int, int, int, int]:
+    """(max frames per session, bytes per frame, RAM budget, available RAM).
 
-    Small (in-memory) volumes track the whole axis unless a half-width is
-    requested, exactly as before. Large volumes size the window from the
-    RAM a propagation needs per frame: the RGB slice, its mask per object
-    and the processor's resized float tensor.
+    A session needs, per frame, the RGB slice, its mask per object and the
+    processor's resized float tensor. Measured fresh on every call, so
+    later chunks shrink when an earlier session still holds memory.
     """
-    n = volume.axis_count(axis)
     h, w = volume.frame_shape(axis)
     side = config.PROPAGATION_MODEL_SIDE
     per_frame = h * w * (3 + n_objects) + 3 * side * side * 4
@@ -1104,7 +1174,30 @@ def _propagation_window(
     budget = int(config.PROPAGATION_RAM_FRACTION * total) if total else 4 * 1024**3
     if available:
         budget = min(budget, int(available * 0.6))
+    budget = int(budget * share)
     max_frames = max(config.PROPAGATION_MIN_FRAMES, budget // per_frame)
+    return max_frames, per_frame, budget, available
+
+
+def _propagation_window(
+    volume: SeismicVolume,
+    axis: str,
+    anchor: int,
+    prompted: list[int],
+    n_objects: int,
+    requested: int | None,
+    share: float = 1.0,
+) -> tuple[int, int, str]:
+    """Slice range [start, stop) to track, always covering every prompted slice.
+
+    Small (in-memory) volumes track the whole axis unless a half-width is
+    requested, exactly as before. Large volumes size the window from the
+    RAM budget (``share`` of it); the rest of the axis is then tracked in
+    chunks by ``_continue_propagation``.
+    """
+    n = volume.axis_count(axis)
+    h, w = volume.frame_shape(axis)
+    max_frames, per_frame, budget, available = _propagation_budget(volume, axis, n_objects, share)
     if requested is not None and requested >= 0:
         start, stop = anchor - requested, anchor + requested + 1
         reason = f"requested +/-{requested}"
@@ -1114,7 +1207,13 @@ def _propagation_window(
     else:
         half = max(1, (max_frames - 1) // 2)
         start, stop = anchor - half, anchor + half + 1
-        reason = f"auto +/-{half} from a {sysinfo.gb(budget)} RAM budget"
+        reason = f"live window +/-{half} from a {sysinfo.gb(budget)} RAM budget"
+    # Near either end of the axis, slide the window inward rather than
+    # clipping it, so it always spans its full length.
+    if start < 0:
+        stop, start = stop - start, 0
+    if stop > n:
+        start, stop = max(0, start - (stop - n)), n
     touched = prompted + [anchor]
     start = max(0, min(start, min(touched)))
     stop = min(n, max(stop, max(touched) + 1))
@@ -1177,11 +1276,22 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
     start, stop, reason = _propagation_window(
         volume, req.axis, req.index, prompted, len(req.objects), req.window
     )
+    # Large volumes without an explicit range cover the whole axis: a live
+    # window around the clicks (half the RAM budget, so the chunks after it
+    # still fit), then RAM-sized chunks outward to both ends.
+    chunked = volume.large and req.window is None and (start > 0 or stop < n_frames)
+    if chunked:
+        start, stop, reason = _propagation_window(
+            volume, req.axis, req.index, prompted, len(req.objects), None, share=0.5
+        )
+        reason += "; rest of the axis in chunks"
     frames_started = time.perf_counter()
-    frames = [_volume_rgb(volume, req.axis, i) for i in range(start, stop)]
+    # Boxed so the tracker holds the only reference and can free the RGB
+    # slices once they are preprocessed.
+    frames_box = [[_volume_rgb(volume, req.axis, i) for i in range(start, stop)]]
     log.info(
         "Built %d %s frames for propagation in %.1fs",
-        len(frames),
+        stop - start,
         req.axis,
         time.perf_counter() - frames_started,
     )
@@ -1189,13 +1299,30 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
 
     def work(on_progress) -> dict:
         global _propagation
+        emitted: set[int] = set()
+
+        def emit(index: int, masks: np.ndarray) -> None:
+            emitted.add(index)
+            on_progress(len(emitted), n_frames, index, masks)
+
+        def anchor_progress(done: int, total: int, frame: int, masks: np.ndarray) -> None:
+            if chunked:
+                emit(start + frame, masks)
+            else:
+                on_progress(done, total, start + frame, masks)
+
         with _gpu_lock:
             propagator = _require_propagator()
             # Drop the previous volume while model switching is excluded, so
             # a completed stale job cannot restore an already-closed session.
             _propagation = None
-            propagator.propagate(
-                frames,
+            mask_prompts: dict = {}
+            if isinstance(propagator, Sam3VolumePropagator):
+                mask_prompts = _preview_mask_prompts(
+                    req, volume, frames_box[0], start, _require_point_segmenter()
+                )
+            anchor_masks = propagator.propagate(
+                frames_box.pop(),
                 anchor_idx=req.index - start,
                 points_per_object=[
                     [(int(c), int(r)) for c, r in obj.points] for obj in req.objects
@@ -1209,41 +1336,243 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
                     else [req.index - start] * len(obj.points)
                     for obj in req.objects
                 ],
-                progress=on_progress,
+                progress=anchor_progress,
                 keep_live=True,
+                **mask_prompts,
             )
             live = propagator.live
-            if live is not None:
-                _propagation = Propagation(
-                    req.file, req.axis, object_ids, live, start=start, stop=stop
-                )
             timings = {
                 k: float(v) for k, v in propagator.last_timings.items()
             }
+            store = None
+            if chunked:
+                chunks_started = time.perf_counter()
+                store = _continue_propagation(
+                    volume, req.axis, propagator, anchor_masks, start, stop, emit
+                )
+                timings["chunks"] = time.perf_counter() - chunks_started
+                timings["total"] = timings.get("total", 0.0) + timings["chunks"]
+                timings["fps"] = n_frames / timings["total"] if timings["total"] else 0.0
+            del anchor_masks
+            extent = (0, n_frames) if chunked else (start, stop)
+            if live is not None:
+                _propagation = Propagation(
+                    req.file,
+                    req.axis,
+                    object_ids,
+                    live,
+                    start=start,
+                    stop=stop,
+                    store=store,
+                    extent=extent,
+                )
         return {
             "timings": timings,
             "editable": live is not None,
-            "start": start,
-            "stop": stop,
+            "start": extent[0],
+            "stop": extent[1],
+            "live_start": start,
+            "live_stop": stop,
             "window_reason": reason,
         }
 
-    return _stream_tracking(object_ids, work, frame_offset=start)
+    return _stream_tracking(object_ids, work)
+
+
+def _preview_mask_prompts(
+    req: PropagateRequest,
+    volume: SeismicVolume,
+    frames: list[np.ndarray],
+    start: int,
+    segmenter: Sam3PointSegmenter,
+) -> dict:
+    """Mask prompts so propagation starts from exactly the masks previewed.
+
+    Every slice where an object has a positive click is conditioned on that
+    slice's click-chain mask (cached from the preview, so usually free)
+    rather than on the clicks re-decoded by the video tracker, which reads
+    a long click list very differently. Negative-only slices refine the
+    tracked mask through the same click chain.
+    """
+    seeds: list[dict[int, np.ndarray]] = []
+    for obj in req.objects:
+        slices = obj.slices if obj.slices is not None else [req.index] * len(obj.points)
+        per_slice: dict[int, tuple[list, list]] = {}
+        for (c, r), label, s in zip(obj.points, obj.labels, slices):
+            bucket = per_slice.setdefault(int(s), ([], []))
+            bucket[0].append((int(c), int(r)))
+            bucket[1].append(int(label))
+        seeds.append(
+            {
+                s - start: segmenter.segment(
+                    frames[s - start],
+                    points,
+                    labels,
+                    image_key=(req.file, req.axis, s),
+                    object_id=obj.id,
+                )
+                for s, (points, labels) in per_slice.items()
+                if 1 in labels
+            }
+        )
+
+    def refine_mask(position: int, frame: int, points, labels, base) -> np.ndarray:
+        index = start + int(frame)
+        return segmenter.segment(
+            _volume_rgb(volume, req.axis, index),
+            [(int(c), int(r)) for c, r in points],
+            [int(l) for l in labels],
+            image_key=(req.file, req.axis, index),
+            object_id=req.objects[position].id,
+            base=base,
+        )
+
+    return {"seed_masks_per_object": seeds, "refine_mask": refine_mask}
+
+
+def _seed_points(mask: np.ndarray, count: int = 3) -> list[tuple[int, int]]:
+    """Up to ``count`` well-separated interior (col, row) points of a mask."""
+    dist = ndimage.distance_transform_edt(mask)
+    points: list[tuple[int, int]] = []
+    for _ in range(count):
+        flat = int(np.argmax(dist))
+        r, c = np.unravel_index(flat, dist.shape)
+        radius = float(dist[r, c])
+        if radius <= 0:
+            break
+        points.append((int(c), int(r)))
+        reach = int(max(3.0, 2.0 * radius))
+        dist[max(0, r - reach) : r + reach + 1, max(0, c - reach) : c + reach + 1] = 0
+    return points
+
+
+def _track_chunk_with_points(
+    propagator,
+    frames: list[np.ndarray],
+    seed_idx: int,
+    seed_masks: np.ndarray,
+    reverse: bool,
+    on_frame: Callable[[int, np.ndarray], None],
+) -> None:
+    """Chunk continuation for trackers without mask prompts (SAM 3.1).
+
+    Re-prompts every still-present object with interior points of its
+    boundary mask. The anchor window's live session is set aside so the
+    tracker does not close it.
+    """
+    n_objects, h, w = seed_masks.shape
+    present = [i for i in range(n_objects) if seed_masks[i].any()]
+    frame_range = range(seed_idx, -1, -1) if reverse else range(seed_idx, len(frames))
+    empty = np.zeros((n_objects, h, w), dtype=bool)
+    if not present:
+        for frame in frame_range:
+            on_frame(frame, empty)
+        return
+    points = [_seed_points(seed_masks[i]) for i in present]
+    saved_live = propagator.live
+    propagator.live = None
+    try:
+        def progress(_done: int, _total: int, frame: int, masks: np.ndarray) -> None:
+            full = np.zeros((n_objects, h, w), dtype=bool)
+            full[present] = masks
+            on_frame(frame, full)
+
+        propagator.propagate(
+            frames,
+            anchor_idx=seed_idx,
+            points_per_object=points,
+            labels_per_object=[[1] * len(p) for p in points],
+            progress=progress,
+            keep_live=False,
+        )
+    finally:
+        propagator.live = saved_live
+
+
+def _continue_propagation(
+    volume: SeismicVolume,
+    axis: str,
+    propagator,
+    anchor_masks: np.ndarray,
+    start: int,
+    stop: int,
+    emit: Callable[[int, np.ndarray], None],
+) -> MaskStore:
+    """Track from the live window's edges to both ends of the axis, chunk by chunk.
+
+    Each chunk starts on the previous chunk's last slice, conditioned on
+    the mask found there; its masks go to a disk-backed ``MaskStore``.
+    """
+    n = volume.axis_count(axis)
+    n_objects, h, w = anchor_masks.shape[0], anchor_masks.shape[2], anchor_masks.shape[3]
+    store = MaskStore(volume.name, axis, n, n_objects, h, w)
+    with_masks = hasattr(propagator, "propagate_from_masks")
+    for reverse in (False, True):
+        edge = start if reverse else stop - 1
+        seed = anchor_masks[:, edge - start].copy()
+        while edge > 0 if reverse else edge < n - 1:
+            chunk, _, budget, available = _propagation_budget(volume, axis, n_objects)
+            chunk = max(2, chunk)
+            if reverse:
+                lo, hi = max(0, edge - chunk + 1), edge + 1
+            else:
+                lo, hi = edge, min(n, edge + chunk)
+            seed_local = edge - lo
+            final_local = 0 if reverse else hi - lo - 1
+            log.info(
+                "Propagation chunk %s %s: slices [%d, %d) seeded from slice %d "
+                "(%d object(s) present; budget %s, %s available)",
+                axis,
+                "backward" if reverse else "forward",
+                lo,
+                hi,
+                edge,
+                int(sum(bool(m.any()) for m in seed)),
+                sysinfo.gb(budget),
+                sysinfo.gb(available),
+            )
+            last: dict[str, np.ndarray] = {}
+
+            def on_frame(local: int, masks: np.ndarray, lo=lo, edge=edge, final_local=final_local, last=last) -> None:
+                index = lo + local
+                if local == final_local:
+                    last["masks"] = masks.copy()
+                if index == edge:
+                    return
+                store.write(index, masks)
+                emit(index, masks)
+
+            frames_box = [[_volume_rgb(volume, axis, i) for i in range(lo, hi)]]
+            if with_masks:
+                propagator.propagate_from_masks(
+                    frames_box.pop(), seed_local, seed, reverse, on_frame
+                )
+            else:
+                _track_chunk_with_points(
+                    propagator, frames_box.pop(), seed_local, seed, reverse, on_frame
+                )
+            seed = last.get("masks", np.zeros_like(seed))
+            edge = lo if reverse else hi - 1
+    store.flush()
+    return store
 
 
 @app.post("/api/refine")
 def refine(req: RefineRequest) -> dict:
-    """Re-decode one slice for one object using the live tracker's memory.
+    """Correct one object on one tracked slice, SAM 2 style.
 
-    This is the interactive edit path: because the slice has already been
-    tracked, a negative click carves into the propagated mask and a
-    positive click extends it, both visible on this slice immediately.
+    This is the interactive edit path: the clicks refine the mask the
+    tracker produced there, so a negative click carves into the propagated
+    mask and a positive click extends it, both visible on this slice
+    immediately. The corrected slice then anchors the next re-sweep.
     """
     if len(req.points) != len(req.labels):
         raise HTTPException(422, "points and labels must be equal length")
     volume = _get_volume(req.file)
     _validate_slice(volume, req.axis, req.index)
     started = time.perf_counter()
+    points = [(int(c), int(r)) for c, r in req.points]
+    labels = [int(l) for l in req.labels]
     with _gpu_lock:
         state = _require_propagation(req.file, req.axis)
         position = state.position_of(req.object_id)
@@ -1261,13 +1590,18 @@ def refine(req: RefineRequest) -> dict:
                 f"{state.start + 1}-{state.stop} - propagate with a wider range to edit it.",
             )
         propagator = _require_propagator()
-        frame_masks = propagator.refine_frame(
-            state.live,
-            position,
-            local,
-            [(int(c), int(r)) for c, r in req.points],
-            [int(l) for l in req.labels],
-        )
+        if isinstance(propagator, Sam3VolumePropagator):
+            mask = _require_point_segmenter().segment(
+                _volume_rgb(volume, req.axis, req.index),
+                points,
+                labels,
+                image_key=(req.file, req.axis, req.index),
+                object_id=req.object_id,
+                base=propagator.refine_base(state.live, position, local),
+            )
+            frame_masks = propagator.pin_mask(state.live, position, local, mask)
+        else:
+            frame_masks = propagator.refine_frame(state.live, position, local, points, labels)
     return {
         "mask": _masks_png_base64(frame_masks, state.object_ids),
         "coverage": float(frame_masks.any(axis=0).mean()),
@@ -1348,8 +1682,7 @@ def export_volume(req: ExportRequest) -> dict:
     if volume.kind != "3d":
         raise HTTPException(422, "Volume export requires a 3D volume")
     state = _require_propagation(req.file, req.axis)
-    masks = state.live.masks
-    start, stop = state.start, state.stop
+    start, stop = state.extent
 
     started = time.perf_counter()
     sub_shape = list(volume.shape)
@@ -1360,7 +1693,7 @@ def export_volume(req: ExportRequest) -> dict:
     # where two masks overlap.
     label_masks = {
         f"object {object_id + 1}": np.transpose(
-            _slice_masks_to_cube(masks[row], req.axis, sub_shape_t), (0, 2, 1)
+            _slice_masks_to_cube(state.object_masks(row), req.axis, sub_shape_t), (0, 2, 1)
         )
         for row, object_id in enumerate(state.object_ids)
     }

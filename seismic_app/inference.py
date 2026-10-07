@@ -14,8 +14,9 @@ but quality against natural-image-trained weights will vary per concept.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from contextlib import nullcontext
+from dataclasses import dataclass
 import gc
 import importlib.util
 import inspect
@@ -25,8 +26,10 @@ import sys
 import threading
 import time
 from typing import Any
+import uuid
 
 import numpy as np
+from scipy import ndimage
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -249,6 +252,18 @@ class Sam3SeismicSegmenter:
         return {prompt: probs[i] for i, prompt in enumerate(self.prompts)}
 
 
+@dataclass(frozen=True)
+class MaskBase:
+    """Low-res mask logits that a click chain refines instead of starting empty.
+
+    ``key`` names where the logits came from (one tracked slice of one
+    propagation), so a cached chain is only extended from the same start.
+    """
+
+    key: Hashable
+    logits: torch.Tensor  # (h, w) float32 on CPU, at the decoder's mask resolution
+
+
 class Sam3PointSegmenter:
     """Interactive point-prompted segmentation (SAM 3 tracker or SAM 2).
 
@@ -302,6 +317,11 @@ class Sam3PointSegmenter:
         # Keep only a few sections resident: embeddings are large GPU tensors.
         self.embedding_cache_size = max(1, int(embedding_cache_size))
         self._prepared: OrderedDict[Hashable, dict] = OrderedDict()
+        # Decoded click chains per (slice, object, base). Small CPU tensors, so
+        # they outlive the embeddings: propagation re-reads the exact preview
+        # masks from here even after the user has scrubbed to other slices.
+        self.chain_cache_size = 64
+        self._chains: OrderedDict[Hashable, list[dict]] = OrderedDict()
         self.last_timings: dict[str, float] = {}
 
     def _sync_cuda(self) -> None:
@@ -357,15 +377,28 @@ class Sam3PointSegmenter:
         labels: list[int],
         image_key: Hashable | None = None,
         object_id: int = 0,
+        base: MaskBase | None = None,
     ) -> np.ndarray:
         """Segment one object indicated by clicked points.
+
+        Clicks are decoded one at a time, in the order given, each together
+        with the mask logits of the click before it. That is how SAM is
+        trained and how Meta's SAM 2 / SAM 3 demos refine a mask; decoding
+        a long click list in one pass is far outside the training range and
+        returns speckled or frame-filling masks on seismic sections. Every
+        step is cached, so a new click costs one decode and undo none, and
+        the same clicks always give the same mask.
 
         Parameters
         ----------
         rgb : (H, W, 3) uint8 full-resolution section image, time down.
         points : (trace_idx, sample_idx) array-index pairs, i.e. (x, y)
-            pixel coordinates on the section image.
+            pixel coordinates on the section image, in click order.
         labels : 1 for positive (inside the object), 0 for negative.
+        object_id : clicks of different objects form separate chains.
+        base : mask logits the first click refines (e.g. the tracked mask
+            on this slice) instead of starting from an empty mask; each
+            click then only changes the region it touches.
 
         Returns
         -------
@@ -376,67 +409,228 @@ class Sam3PointSegmenter:
 
         h, w = rgb.shape[:2]
         n_pos = sum(1 for lab in labels if lab == 1)
-        n_neg = len(labels) - n_pos
+        t0 = time.perf_counter()
+        key = image_key if image_key is not None else ("array", id(rgb), rgb.shape)
+        clicks = [(int(x), int(y), int(l)) for (x, y), l in zip(points, labels)]
+        chain_key = (key, int(object_id), None if base is None else base.key)
+        chain = self._chains.pop(chain_key, [])
+        self._chains[chain_key] = chain
+        while len(self._chains) > self.chain_cache_size:
+            self._chains.popitem(last=False)
+        keep = 0
+        while keep < min(len(chain), len(clicks)) and chain[keep]["click"] == clicks[keep]:
+            keep += 1
+        del chain[keep:]
+
+        decoded = len(clicks) - keep
+        if decoded or chain[-1]["mask"] is None:
+            prepared = self._prepared[self.prepare_image(rgb, image_key=key)]
+            self._sync_cuda()
+            if not decoded:
+                chain[-1]["mask"] = self._mask_from_logits(prepared, chain[-1]["logits"])
+            previous = chain[-1]["logits"] if chain else (None if base is None else base.logits)
+            for k in range(keep, len(clicks)):
+                logits, mask = self._click_step(prepared, points[: k + 1], labels[: k + 1], previous)
+                if base is not None:
+                    logits, mask = self._local_edit(prepared, previous, logits, mask, clicks[k])
+                if chain:
+                    chain[-1]["mask"] = None  # only the newest step keeps its full-size mask
+                chain.append({"click": clicks[k], "logits": logits, "mask": mask})
+                previous = logits
+            self._sync_cuda()
+            low_h, low_w = chain[-1]["logits"].shape[-2:]
+            # 4x4 decoder cells: anything smaller is upsampling noise.
+            chain[-1]["mask"] = _tidy_mask(
+                chain[-1]["mask"], points, labels, max_hole_area=16 * (h / low_h) * (w / low_w)
+            )
+        mask = chain[-1]["mask"]
+        self.last_timings.update(total=time.perf_counter() - t0, clicks_decoded=float(decoded))
         log.info(
-            "Point segmentation: image %dx%d, %d positive / %d negative points, device=%s",
+            "Point segmentation %dx%d: %d positive / %d negative clicks, %d decoded%s "
+            "in %.2fs (mask coverage %.2f%%)",
             w,
             h,
             n_pos,
-            n_neg,
-            self.device,
+            len(clicks) - n_pos,
+            decoded,
+            " from a tracked mask" if base is not None else "",
+            time.perf_counter() - t0,
+            100.0 * float(mask.mean()),
         )
-        t0 = time.perf_counter()
+        return mask
 
-        key = self.prepare_image(rgb, image_key=image_key)
-        prepared = self._prepared[key]
-        # 4D: (image, object, point, xy) - one image, one object.
-        input_points = [[[[float(x), float(y)] for x, y in points]]]
-        input_labels = [[[int(l) for l in labels]]]
+    def _decode(
+        self,
+        prepared: dict,
+        points: Sequence[tuple[int, int]],
+        labels: Sequence[int],
+        prior: torch.Tensor | None,
+        multimask: bool,
+    ) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+        """One prompt-encoder + mask-decoder pass.
 
-        self._sync_cuda()
-        prompt_started = time.perf_counter()
+        Returns (n, h, w) float32 CPU low-res logits, (n,) predicted IoUs
+        and (n, H, W) full-resolution boolean masks.
+        """
         inputs = self.processor(
-            input_points=input_points,
-            input_labels=input_labels,
+            # 4D: (image, object, point, xy) - one image, one object.
+            input_points=[[[[float(x), float(y)] for x, y in points]]],
+            input_labels=[[[int(l) for l in labels]]],
             original_sizes=prepared["original_sizes"],
             return_tensors="pt",
         ).to(self.device)
-
         model_inputs = dict(inputs)
-        model_inputs["image_embeddings"] = prepared["embeddings"]
-
-        log.info("Running prompt encoder + mask decoder...")
+        embeddings = prepared["embeddings"]
+        model_inputs["image_embeddings"] = embeddings
+        if prior is not None:
+            reference = embeddings[-1] if isinstance(embeddings, (list, tuple)) else embeddings
+            # Clamped as in SAM's own click refinement, against rare large logits.
+            model_inputs["input_masks"] = torch.clamp(prior.float(), -32.0, 32.0)[None, None].to(
+                self.device, reference.dtype
+            )
         with self._autocast():
-            outputs = self.model(**model_inputs)
-        self._sync_cuda()
-        decoder_elapsed = time.perf_counter() - prompt_started
-
-        # post_process_masks -> list per image of (n_objects, n_masks, H, W).
-        post_started = time.perf_counter()
+            outputs = self.model(**model_inputs, multimask_output=multimask)
+        logits = outputs.pred_masks.float().cpu()
         masks = self.processor.post_process_masks(
-            outputs.pred_masks.cpu(),
-            inputs["original_sizes"],
-            mask_threshold=0.0,
-            binarize=True,
+            logits, inputs["original_sizes"], mask_threshold=0.0, binarize=True
         )[0]
-        candidates = np.asarray(masks[0].cpu().numpy(), dtype=bool)
         iou = outputs.iou_scores.float().cpu().numpy().reshape(-1)
-        best = _select_prompt_mask(candidates, iou, points, labels)
-        mask = candidates[best]
-        post_elapsed = time.perf_counter() - post_started
-        self.last_timings.update(
-            prompt_decode=decoder_elapsed,
-            post_process=post_elapsed,
-            total=time.perf_counter() - t0,
+        return logits[0, 0], iou, np.asarray(masks[0].numpy(), dtype=bool)
+
+    def _mask_from_logits(self, prepared: dict, logits: torch.Tensor) -> np.ndarray:
+        masks = self.processor.post_process_masks(
+            logits[None, None, None], prepared["original_sizes"], mask_threshold=0.0, binarize=True
+        )[0]
+        return np.asarray(masks[0, 0].numpy(), dtype=bool)
+
+    def _local_edit(
+        self,
+        prepared: dict,
+        previous: torch.Tensor,
+        logits: torch.Tensor,
+        mask: np.ndarray,
+        click: tuple[int, int, int],
+    ) -> tuple[torch.Tensor, np.ndarray]:
+        """Apply a correction click only to the region it touches.
+
+        On a tracked slice the decoder sometimes answers one click by
+        redrawing the whole mask, e.g. a negative click on a layer's tail
+        also drops half the layer. Only the removed (negative click) or
+        added (positive click) region connected to the click is taken from
+        the new decode; the rest of the tracked mask stays as it was.
+        """
+        x, y, label = click
+        before = self._mask_from_logits(prepared, previous)
+        changed = before & ~mask if label == 0 else mask & ~before
+        parts, n = ndimage.label(changed, structure=np.ones((3, 3), dtype=bool))
+        height, width = changed.shape
+        x, y = min(width - 1, max(0, x)), min(height - 1, max(0, y))
+        touched = np.zeros(n + 1, dtype=bool)
+        touched[parts[max(0, y - 2) : y + 3, max(0, x - 2) : x + 3].ravel()] = True
+        touched[0] = False
+        region = torch.from_numpy(touched[parts])[None, None].float()
+        region = F.interpolate(region, size=tuple(previous.shape[-2:]), mode="area")[0, 0] > 0
+        edited = torch.where(region, logits, previous)
+        return edited, self._mask_from_logits(prepared, edited)
+
+    def _click_step(
+        self,
+        prepared: dict,
+        points: Sequence[tuple[int, int]],
+        labels: Sequence[int],
+        previous: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, np.ndarray]:
+        """Decode the newest click on top of ``previous`` mask logits.
+
+        The first click of a chain is ambiguous (part, object, region), so it
+        uses SAM's three-mask output ranked by click agreement. Later clicks
+        refine the previous mask, preferably through the single-mask output
+        as SAM was trained. That output can also redraw the mask as most of
+        the section, which obeys every positive click (SAM 2.1 does so on
+        the second click of a thin horizon). So among the candidates with
+        the fewest violated clicks, the one that keeps most of the previous
+        mask wins; the single-mask output wins near-ties.
+        """
+        if previous is None:
+            logits, iou, masks = self._decode(prepared, points, labels, None, multimask=True)
+            best = _select_prompt_mask(masks, iou, points, labels)
+            return logits[best], masks[best]
+        margin = 0.05
+        before = self._mask_from_logits(prepared, previous)
+        logits, _iou, masks = self._decode(prepared, points, labels, previous, multimask=False)
+        scores = [(_click_errors(masks[0], points, labels), _mask_iou(masks[0], before))]
+        if scores[0][0] == 0 and scores[0][1] >= 1.0 - margin:
+            return logits[0], masks[0]
+        multi_logits, _multi_iou, multi_masks = self._decode(
+            prepared, points, labels, previous, multimask=True
         )
-        coverage = 100.0 * float(mask.mean())
-        log.info(
-            "Point segmentation done in %.1fs (best IoU=%.3f, mask coverage=%.2f%%)",
-            time.perf_counter() - t0,
-            float(iou[best]),
-            coverage,
-        )
-        return mask
+        candidates = [(logits[0], masks[0])] + list(zip(multi_logits, multi_masks))
+        scores += [(_click_errors(m, points, labels), _mask_iou(m, before)) for m in multi_masks]
+        best = min(range(len(candidates)), key=lambda i: (scores[i][0], -scores[i][1]))
+        if scores[0][0] == scores[best][0] and scores[0][1] >= scores[best][1] - margin:
+            best = 0
+        return candidates[best]
+
+
+def _tidy_mask(
+    mask: np.ndarray,
+    points: Sequence[tuple[int, int]],
+    labels: Sequence[int],
+    max_hole_area: float,
+) -> np.ndarray:
+    """Drop stray fragments and fill pinholes, as SAM 2 cleans its masks.
+
+    Upsampled low-res logits leave hundreds of specks around the clicked
+    object on seismic. Besides looking noisy, a speckled mask used as a
+    tracking prompt gives the memory bank no clear object, and the tracker
+    floods the section within a few slices. Components holding a positive
+    click are the object; other components stay only when at least a
+    quarter of its size (a second part SAM grouped with it). Enclosed holes
+    up to ``max_hole_area`` pixels without a negative click are filled.
+    """
+    height, width = mask.shape
+
+    def at(lab: np.ndarray, x: int, y: int) -> int:
+        return int(lab[min(height - 1, max(0, int(y))), min(width - 1, max(0, int(x)))])
+
+    parts, n = ndimage.label(mask, structure=np.ones((3, 3), dtype=bool))
+    clicked = sorted({at(parts, x, y) for (x, y), l in zip(points, labels) if l == 1} - {0})
+    if n > 1 and clicked:
+        sizes = np.bincount(parts.ravel())
+        keep = sizes >= 0.25 * sizes[clicked].sum()
+        keep[clicked] = True
+        keep[0] = False
+        mask = keep[parts]
+    holes, n = ndimage.label(~mask)
+    if n:
+        fill = np.bincount(holes.ravel()) <= max_hole_area
+        fill[0] = False
+        edges = np.concatenate([holes[0], holes[-1], holes[:, 0], holes[:, -1]])
+        fill[edges] = False
+        for (x, y), l in zip(points, labels):
+            if l == 0:
+                fill[at(holes, x, y)] = False
+        mask = mask | fill[holes]
+    return mask
+
+
+def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    union = np.count_nonzero(a | b)
+    return np.count_nonzero(a & b) / union if union else 1.0
+
+
+def _click_errors(
+    mask: np.ndarray,
+    points: Sequence[tuple[int, int]],
+    labels: Sequence[int],
+) -> int:
+    """Count clicks the mask disobeys: positives outside plus negatives inside."""
+    height, width = mask.shape[-2:]
+    errors = 0
+    for (x, y), label in zip(points, labels):
+        inside = bool(mask[min(height - 1, max(0, int(y))), min(width - 1, max(0, int(x)))])
+        errors += inside != (int(label) == 1)
+    return errors
 
 
 def _select_prompt_mask(
@@ -679,6 +873,13 @@ class LiveTracker:
         self.slots: dict[int, tuple[int, int]] = {}
         # Slices edited since the last sweep; the next sweep starts from these.
         self.dirty_frames: set[int] = set()
+        # (object, slice) pairs whose mask came from the object's own positive
+        # clicks; edits there redo the click chain instead of refining tracking.
+        self.prompted: set[tuple[int, int]] = set()
+        # (object, slice) -> tracked mask logits that slice's edits refine,
+        # captured before its first edit so undo can return to it.
+        self.bases: dict[tuple[int, int], MaskBase | None] = {}
+        self.uid = uuid.uuid4().hex
 
     @property
     def n_objects(self) -> int:
@@ -706,6 +907,74 @@ class LiveTracker:
     def close(self) -> None:
         self.sessions.clear()
         self.slots.clear()
+
+
+def _install_temporal_mask_selection(model: Any) -> None:
+    """Pick each tracked slice's mask by agreement with the slice before it.
+
+    On tracked slices SAM's decoder proposes three masks and the tracker
+    keeps the one its IoU head rates highest. That head was trained on
+    natural video; on seismic it rates a layer, part of it and most of the
+    section nearly alike, so the mask flips between them from slice to slice
+    or floods the section. Neighbouring slices of a volume are nearly
+    identical, so the candidate overlapping the previous slice's mask most
+    is kept instead. The object score still decides whether the object is
+    present at all.
+    """
+    run_frame = model._run_single_frame_inference
+    decode = model.mask_decoder.forward
+    previous: dict[str, torch.Tensor] = {}
+
+    def run_single_frame_inference(*args: Any, **kwargs: Any) -> Any:
+        previous.clear()
+        if kwargs.get("point_inputs") is None and kwargs.get("mask_inputs") is None:
+            outputs = kwargs["inference_session"].output_dict_per_obj[kwargs["obj_idx"]]
+            neighbour = int(kwargs["frame_idx"]) + (1 if kwargs.get("reverse") else -1)
+            entry = outputs["non_cond_frame_outputs"].get(neighbour)
+            if entry is None:
+                entry = outputs["cond_frame_outputs"].get(neighbour)
+            if entry is not None:
+                logits = entry["pred_masks"]
+                previous["mask"] = logits.reshape(-1, *logits.shape[-2:])[0] > 0
+        return run_frame(*args, **kwargs)
+
+    def mask_decoder_forward(*args: Any, **kwargs: Any) -> Any:
+        masks, iou_scores, tokens, object_scores = decode(*args, **kwargs)
+        prior = previous.pop("mask", None)
+        if (
+            kwargs.get("multimask_output")
+            and prior is not None
+            and prior.any()
+            and masks.shape[:2] == (1, 1)
+            and masks.shape[2] > 1
+            and tuple(prior.shape) == tuple(masks.shape[-2:])
+        ):
+            candidates = masks[0, 0] > 0
+            prior = prior.to(candidates.device)
+            overlap = (candidates & prior).flatten(1).sum(1) / (candidates | prior).flatten(1).sum(
+                1
+            ).clamp(min=1)
+            iou_scores = overlap.to(iou_scores.dtype).reshape(iou_scores.shape)
+        return masks, iou_scores, tokens, object_scores
+
+    model._run_single_frame_inference = run_single_frame_inference
+    model.mask_decoder.forward = mask_decoder_forward
+
+
+def _keep_as_conditioning(session: Any, obj_ids: Sequence[int], frame_idx: int) -> None:
+    """Hold a corrected slice's latest output as a conditioning frame.
+
+    The HF session files inputs on an already-tracked slice as an ordinary
+    tracked output: the next sweep re-predicts it and drops the correction,
+    and it leaves the memory bank after a few slices. Meta's SAM 2 / SAM 3
+    predictors keep every corrected frame as conditioning
+    (``add_all_frames_to_correct_as_cond``); this does the same.
+    """
+    for obj_id in obj_ids:
+        outputs = session.output_dict_per_obj[session.obj_id_to_idx(obj_id)]
+        entry = outputs["non_cond_frame_outputs"].pop(frame_idx, None)
+        if entry is not None:
+            outputs["cond_frame_outputs"][frame_idx] = entry
 
 
 def _native_mask_rows(outputs: dict | None) -> dict[int, np.ndarray]:
@@ -1268,6 +1537,7 @@ class Sam3VolumePropagator:
         t0 = time.perf_counter()
         self.model = ModelCls.from_pretrained(checkpoint).to(self.device)
         self.model.eval()
+        _install_temporal_mask_selection(self.model)
         if compile_model and hasattr(torch, "compile"):
             log.info(
                 "Compiling %s video tracker (first propagation will warm up)...",
@@ -1358,23 +1628,30 @@ class Sam3VolumePropagator:
         masks: np.ndarray,
         on_frame: Callable[[int, int], None],
         live: LiveTracker | None = None,
+        seed_masks_per_object: Sequence[Mapping[int, np.ndarray]] | None = None,
+        refine_mask: Callable[..., np.ndarray] | None = None,
     ) -> None:
         """Track one GPU-sized batch of objects through the volume.
 
         Points may live on several slices, mirroring SAM2's video
         refinement. Slices where an object has at least one positive
-        point anchor the object (conditioning frames). Slices with only
-        negative points for an object cannot stand alone - segmenting
-        from negatives alone is meaningless - so they are applied AFTER
-        the first sweep, when the tracker already has memory of the
+        point anchor the object (conditioning frames): with the preview
+        mask from ``seed_masks_per_object`` when given, so the tracker
+        starts from exactly what the user saw, else from the clicks.
+        Slices with only negative points for an object cannot stand alone -
+        segmenting from negatives alone is meaningless - so they are applied
+        AFTER the first sweep, when the tracker already has memory of the
         object on that slice; the negative click then subtracts from the
-        remembered mask instead of erasing the object. The corrections
-        are swept outward afterwards.
+        remembered mask instead of erasing the object. Each correction is
+        kept as a conditioning frame and swept outward afterwards.
         """
         # frame -> [(wave_position, points_on_frame, labels_on_frame)]
         anchor_groups: dict[int, list[tuple[int, list, list]]] = {}
         refine_groups: dict[int, list[tuple[int, list, list]]] = {}
+        # frame -> [(wave_position, preview mask)]
+        seed_groups: dict[int, list[tuple[int, np.ndarray]]] = {}
         for wave_pos, global_idx in enumerate(object_indices):
+            seeds = seed_masks_per_object[global_idx] if seed_masks_per_object else {}
             per_frame: dict[int, tuple[list, list]] = {}
             for (x, y), label, frame_idx in zip(
                 points_per_object[global_idx],
@@ -1385,8 +1662,14 @@ class Sam3VolumePropagator:
                 bucket[0].append((float(x), float(y)))
                 bucket[1].append(int(label))
             for frame_idx, (pts, labs) in per_frame.items():
-                target = anchor_groups if 1 in labs else refine_groups
-                target.setdefault(frame_idx, []).append((wave_pos, pts, labs))
+                seed = seeds.get(frame_idx)
+                if seed is not None and seed.any():
+                    seed_groups.setdefault(frame_idx, []).append((wave_pos, seed))
+                else:
+                    target = anchor_groups if 1 in labs else refine_groups
+                    target.setdefault(frame_idx, []).append((wave_pos, pts, labs))
+                if live is not None and 1 in labs:
+                    live.prompted.add((global_idx, frame_idx))
 
         n_frames = masks.shape[1]
         visited: set[int] = set()
@@ -1407,7 +1690,7 @@ class Sam3VolumePropagator:
             # Re-emits refresh the browser overlay after refinements.
             on_frame(out.frame_idx, done)
 
-        def prompt_frame(frame_idx: int, group: list[tuple[int, list, list]]) -> None:
+        def add_points(frame_idx: int, group: list[tuple[int, list, list]]) -> None:
             self.processor.add_inputs_to_inference_session(
                 session,
                 frame_idx=frame_idx,
@@ -1416,20 +1699,57 @@ class Sam3VolumePropagator:
                 input_labels=[[labs for _, _, labs in group]],
                 original_size=(height, width),
             )
+
+        def condition_frame(frame_idx: int) -> None:
+            seeded = seed_groups.get(frame_idx, [])
+            clicked = anchor_groups.get(frame_idx, [])
+            if seeded:
+                self.processor.add_inputs_to_inference_session(
+                    session,
+                    frame_idx=frame_idx,
+                    obj_ids=[wave_pos + 1 for wave_pos, _ in seeded],
+                    input_masks=[mask for _, mask in seeded],
+                )
+            if clicked:
+                add_points(frame_idx, clicked)
+            if seeded and clicked:
+                # Each add replaces the session's to-decode list; decode both.
+                session.obj_with_new_inputs = [pos + 1 for pos, _ in seeded] + [
+                    pos + 1 for pos, _, _ in clicked
+                ]
             record(self.model(inference_session=session, frame_idx=frame_idx))
+
+        def apply_refinement(frame_idx: int, group: list[tuple[int, list, list]]) -> None:
+            if refine_mask is None:
+                add_points(frame_idx, group)
+                record(self.model(inference_session=session, frame_idx=frame_idx))
+                _keep_as_conditioning(session, [pos + 1 for pos, _, _ in group], frame_idx)
+                return
+            for wave_pos, pts, labs in group:
+                global_idx = object_indices[wave_pos]
+                key = (global_idx, frame_idx)
+                base = self._mask_base(
+                    session, wave_pos + 1, frame_idx, (live.uid if live else uuid.uuid4().hex, *key)
+                )
+                if live is not None:
+                    live.bases[key] = base
+                mask = refine_mask(global_idx, frame_idx, pts, labs, base)
+                record(self._condition_on_mask(session, wave_pos + 1, frame_idx, mask))
 
         session = self._new_session(pixel_values, height, width)
         keep_session = False
         try:
             with self._autocast():
                 # Pass 1: condition every anchored slice, then sweep both ways.
-                for frame_idx in sorted(anchor_groups):
-                    prompt_frame(frame_idx, anchor_groups[frame_idx])
+                conditioned = sorted(set(seed_groups) | set(anchor_groups))
+                for frame_idx in conditioned:
+                    condition_frame(frame_idx)
                 log.info(
-                    "Conditioned %d anchored slice(s); propagating...",
-                    len(anchor_groups),
+                    "Conditioned %d anchored slice(s) (%d from preview masks); propagating...",
+                    len(conditioned),
+                    len(seed_groups),
                 )
-                start_frame = min(anchor_groups)
+                start_frame = conditioned[0]
                 for reverse in (False, True):
                     for out in self.model.propagate_in_video_iterator(
                         session, start_frame_idx=start_frame, reverse=reverse
@@ -1448,7 +1768,7 @@ class Sam3VolumePropagator:
                         sorted(refine_groups),
                     )
                     for frame_idx in sorted(refine_groups):
-                        prompt_frame(frame_idx, refine_groups[frame_idx])
+                        apply_refinement(frame_idx, refine_groups[frame_idx])
                     for reverse, start in (
                         (False, min(refine_groups)),
                         (True, max(refine_groups)),
@@ -1480,6 +1800,8 @@ class Sam3VolumePropagator:
         frame_indices_per_object: Sequence[Sequence[int]] | None = None,
         progress: Callable[[int, int, int, np.ndarray], None] | None = None,
         keep_live: bool = False,
+        seed_masks_per_object: Sequence[Mapping[int, np.ndarray]] | None = None,
+        refine_mask: Callable[..., np.ndarray] | None = None,
     ) -> np.ndarray:
         """Track one or more objects through a stack of slices.
 
@@ -1503,8 +1825,16 @@ class Sam3VolumePropagator:
         progress : called as (done, total, frame_idx, frame_masks) where
             frame_masks is (n_objects, H, W) bool for every object so far.
         keep_live : keep the tracker sessions resident afterwards (on
-            ``self.live``) so ``refine_frame``/``resweep`` can edit the
-            result interactively. Costs host RAM until replaced.
+            ``self.live``) so ``pin_mask``/``resweep`` can edit the result
+            interactively. Costs host RAM until replaced.
+        seed_masks_per_object : per object, {slice: (H, W) bool mask} for
+            prompted slices. A seeded slice is conditioned on that mask (the
+            preview the user saw) instead of re-decoding its clicks.
+        refine_mask : ``(object, slice, points, labels, base) -> mask`` used
+            for slices with only negative clicks: it should refine the
+            tracked mask logits ``base`` with the clicks, e.g. via
+            ``Sam3PointSegmenter.segment(..., base=base)``. Without it those
+            clicks go to the tracker directly.
 
         Returns
         -------
@@ -1518,6 +1848,8 @@ class Sam3VolumePropagator:
             ]
         if len(frame_indices_per_object) != len(points_per_object):
             raise ValueError("frame_indices_per_object must match points_per_object")
+        if seed_masks_per_object is not None and len(seed_masks_per_object) != len(points_per_object):
+            raise ValueError("seed_masks_per_object must match points_per_object")
         n_frames = len(frames)
         for pts, labs, frs in zip(
             points_per_object, labels_per_object, frame_indices_per_object
@@ -1603,6 +1935,8 @@ class Sam3VolumePropagator:
                     masks,
                     on_frame,
                     live,
+                    seed_masks_per_object,
+                    refine_mask,
                 )
             except Exception as exc:
                 if not self._is_cuda_oom(exc) or len(wave) == 1:
@@ -1644,68 +1978,124 @@ class Sam3VolumePropagator:
         self.live = live
         return masks
 
-    @torch.no_grad()
-    def refine_frame(
-        self,
-        live: LiveTracker,
-        object_index: int,
-        frame_idx: int,
-        points: Sequence[tuple[int, int]],
-        labels: Sequence[int],
-    ) -> np.ndarray:
-        """Re-decode one slice for one object from its clicks on that slice.
-
-        The slice has already been tracked, so the tracker conditions on
-        its memory of the object *and* the new clicks - this is SAM2's
-        refinement path. A negative click therefore carves away part of
-        the propagated mask rather than redefining the object, and a
-        positive click extends it, both visible immediately.
-
-        Clicks replace whatever was previously prompted on this slice for
-        this object, so callers should send the object's full point list
-        for the slice. Returns the (n_objects, H, W) stack for the slice.
-        """
-        if not points or len(points) != len(labels):
-            raise ValueError("refinement needs equal-length, non-empty points/labels")
+    def _live_slot(self, live: LiveTracker, object_index: int) -> tuple[int, int]:
         slot = live.slots.get(object_index)
         if slot is None:
             raise ValueError(
                 f"object {object_index} is not part of the live tracker session; "
                 "re-propagate to add it"
             )
-        session_idx, obj_id = slot
+        return slot
+
+    @staticmethod
+    def _mask_base(
+        session: Any,
+        obj_id: int,
+        frame_idx: int,
+        key: Hashable,
+        shown: np.ndarray | None = None,
+    ) -> MaskBase | None:
+        """The session's mask logits for one object on one slice.
+
+        Slices whose memory was cleared by a nearby correction have no
+        output until the next sweep; ``shown`` (the mask on screen) then
+        stands in, as SAM-scale +/-10 logits.
+        """
+        outputs = session.output_dict_per_obj[session.obj_id_to_idx(obj_id)]
+        entry = outputs["cond_frame_outputs"].get(frame_idx)
+        if entry is None:
+            entry = outputs["non_cond_frame_outputs"].get(frame_idx)
+        if entry is not None:
+            logits = entry["pred_masks"]
+            return MaskBase(key=key, logits=logits.reshape(-1, *logits.shape[-2:])[0].float().cpu())
+        stored = next(iter(outputs["cond_frame_outputs"].values()), None)
+        if shown is None or stored is None:
+            return None
+        cover = F.interpolate(
+            torch.from_numpy(np.asarray(shown, dtype=np.float32))[None, None],
+            size=tuple(stored["pred_masks"].shape[-2:]),
+            mode="area",
+        )[0, 0]
+        return MaskBase(key=key, logits=torch.where(cover >= 0.5, 10.0, -10.0))
+
+    def _condition_on_mask(self, session: Any, obj_id: int, frame_idx: int, mask: np.ndarray):
+        """Make ``mask`` the object's conditioning mask on one slice."""
+        outputs = session.output_dict_per_obj[session.obj_id_to_idx(obj_id)]
+        # The memory encoder writes into an existing conditioning entry for
+        # this slice rather than the new output; drop the old one first.
+        outputs["cond_frame_outputs"].pop(frame_idx, None)
+        self.processor.add_inputs_to_inference_session(
+            session, frame_idx=frame_idx, obj_ids=[obj_id], input_masks=[mask]
+        )
+        out = self.model(inference_session=session, frame_idx=frame_idx)
+        _keep_as_conditioning(session, [obj_id], frame_idx)
+        # As Meta's SAM 3 tracker (clear_non_cond_mem_around_input): tracked
+        # memories next to a correction still show the old object and would
+        # outvote it on the next sweep.
+        reach = int(getattr(getattr(self.model, "config", None), "num_maskmem", 7))
+        for t in range(frame_idx - reach, frame_idx + reach + 1):
+            outputs["non_cond_frame_outputs"].pop(t, None)
+        return out
+
+    def refine_base(self, live: LiveTracker, object_index: int, frame_idx: int) -> MaskBase | None:
+        """Mask logits that clicks on this slice should refine.
+
+        ``None`` on slices the object was prompted on with positive clicks:
+        their mask is the click chain itself. Elsewhere, the tracked mask as
+        it was before the slice's first edit, so the clicks refine what the
+        user saw and removing them all returns to it.
+        """
+        key = (int(object_index), int(frame_idx))
+        if key not in live.bases:
+            if key in live.prompted:
+                live.bases[key] = None
+            else:
+                session_idx, obj_id = self._live_slot(live, object_index)
+                live.bases[key] = self._mask_base(
+                    live.sessions[session_idx],
+                    obj_id,
+                    int(frame_idx),
+                    (live.uid, *key),
+                    shown=live.masks[object_index, int(frame_idx)],
+                )
+        return live.bases[key]
+
+    @torch.no_grad()
+    def pin_mask(
+        self,
+        live: LiveTracker,
+        object_index: int,
+        frame_idx: int,
+        mask: np.ndarray,
+    ) -> np.ndarray:
+        """Set one object's mask on a slice and keep it as a conditioning frame.
+
+        This is SAM 2's frame correction: the slice then anchors tracking like
+        the original prompts, so later sweeps propagate it and never overwrite
+        it. Returns the (n_objects, H, W) stack for the slice.
+        """
+        session_idx, obj_id = self._live_slot(live, object_index)
         session = live.sessions[session_idx]
+        frame_idx = int(frame_idx)
         started = time.perf_counter()
-
         with self._autocast():
-            self.processor.add_inputs_to_inference_session(
-                session,
-                frame_idx=int(frame_idx),
-                obj_ids=[obj_id],
-                input_points=[[[[float(x), float(y)] for x, y in points]]],
-                input_labels=[[[int(l) for l in labels]]],
-                original_size=(live.height, live.width),
-            )
-            out = self.model(inference_session=session, frame_idx=int(frame_idx))
-
+            out = self._condition_on_mask(session, obj_id, frame_idx, np.asarray(mask, dtype=bool))
         rows = self._to_masks(out.pred_masks, live.height, live.width)
         by_session_id = live.objects_in(session_idx)
         for row, out_id in zip(rows, out.object_ids):
             global_idx = by_session_id.get(int(out_id))
             if global_idx is not None:
                 live.masks[global_idx, frame_idx] = row
-        live.dirty_frames.add(int(frame_idx))
+        live.dirty_frames.add(frame_idx)
         self.last_timings["refine_frame"] = time.perf_counter() - started
         log.info(
-            "Refined object %d on slice %d with %d point(s) in %.2fs "
-            "(coverage %.2f%%)",
+            "Pinned object %d on slice %d in %.2fs (coverage %.2f%%)",
             object_index + 1,
             frame_idx,
-            len(points),
             self.last_timings["refine_frame"],
             100.0 * float(live.masks[object_index, frame_idx].mean()),
         )
-        return live.masks[:, int(frame_idx)]
+        return live.masks[:, frame_idx]
 
     @torch.no_grad()
     def resweep(
@@ -1774,6 +2164,83 @@ class Sam3VolumePropagator:
             100.0 * float(live.masks.any(axis=0).mean()),
         )
         return live.masks
+
+    @torch.no_grad()
+    def propagate_from_masks(
+        self,
+        frames: Sequence[np.ndarray],
+        seed_idx: int,
+        seed_masks: np.ndarray,
+        reverse: bool,
+        progress: Callable[[int, np.ndarray], None] | None = None,
+    ) -> None:
+        """Continue a propagation through a further chunk of slices.
+
+        Volumes too long to track in one session are covered chunk by
+        chunk: the mask the previous chunk produced on the shared boundary
+        slice ``seed_idx`` conditions this chunk, which is then swept in
+        one direction only. ``progress(frame_idx, masks)`` receives every
+        slice's (n_objects, H, W) masks as it is tracked; nothing is kept
+        live. Objects whose seed mask is empty stay empty.
+        """
+        n_objects = int(seed_masks.shape[0])
+        n_frames = len(frames)
+        h, w = frames[0].shape[:2]
+        t0 = time.perf_counter()
+        processed = self.processor.video_processor(
+            videos=frames, device="cpu", return_tensors="pt"
+        )
+        pixel_values = processed.pixel_values_videos[0]
+        del frames, processed
+        order = range(seed_idx, -1, -1) if reverse else range(seed_idx, n_frames)
+        present = [i for i in range(n_objects) if seed_masks[i].any()]
+        masks = np.zeros((n_objects, n_frames, h, w), dtype=bool)
+        batch_limit = max(1, min(len(present) or 1, self._estimate_max_objects()))
+        waves = [present[i : i + batch_limit] for i in range(0, len(present), batch_limit)]
+        log.info(
+            "Continuing propagation %s through %d slices from a mask seed "
+            "(%d of %d object(s) still present, %d wave(s))",
+            "backward" if reverse else "forward",
+            n_frames,
+            len(present),
+            n_objects,
+            len(waves),
+        )
+        if not waves:
+            if progress is not None:
+                for frame_idx in order:
+                    progress(frame_idx, masks[:, frame_idx])
+            return
+        for wave_no, wave in enumerate(waves):
+            last_wave = wave_no == len(waves) - 1
+            session = self._new_session(pixel_values, h, w)
+            try:
+                with self._autocast():
+                    self.processor.add_inputs_to_inference_session(
+                        session,
+                        frame_idx=int(seed_idx),
+                        obj_ids=[pos + 1 for pos in range(len(wave))],
+                        input_masks=[seed_masks[g] for g in wave],
+                    )
+                    self.model(inference_session=session, frame_idx=int(seed_idx))
+                    for out in self.model.propagate_in_video_iterator(
+                        session, start_frame_idx=int(seed_idx), reverse=reverse
+                    ):
+                        rows = self._to_masks(out.pred_masks, h, w)
+                        for row, obj_id in zip(rows, out.object_ids):
+                            masks[wave[int(obj_id) - 1], out.frame_idx] = row
+                        if last_wave and progress is not None:
+                            progress(int(out.frame_idx), masks[:, out.frame_idx])
+            finally:
+                del session
+                self._free_cuda()
+        elapsed = time.perf_counter() - t0
+        log.info(
+            "Chunk tracked in %.1fs (%.2f slices/s, coverage %.2f%%)",
+            elapsed,
+            n_frames / elapsed if elapsed else float("inf"),
+            100.0 * float(masks.any(axis=0).mean()),
+        )
 
     def _to_masks(self, pred_masks: torch.Tensor, h: int, w: int) -> np.ndarray:
         """Threshold + resize one frame's predicted logits to (n_rows, H, W).

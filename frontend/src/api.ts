@@ -100,6 +100,9 @@ export interface DoneEvent {
   /** Tracked slice range [start, stop) along the axis. */
   start?: number;
   stop?: number;
+  /** Slices held by the live tracker session, where clicks refine the mask. */
+  live_start?: number;
+  live_stop?: number;
   window_reason?: string;
 }
 

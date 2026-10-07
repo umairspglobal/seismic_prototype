@@ -729,10 +729,9 @@ class CacheManager:
         elif kind == "bounds":
             state.lo, state.hi, state.fill_u8 = event["lo"], event["hi"], event["fill_u8"]
         elif kind == "done":
-            manifest = event["manifest"]
-            self._mark_ready(state, manifest)
-            state.finished_at = time.time()
             remove_stale_caches(self.root, state.name, state.directory)
+            self._mark_ready(state, event["manifest"])
+            state.finished_at = time.time()
         elif kind == "error":
             state.error = event["message"]
             state.stage = "error"

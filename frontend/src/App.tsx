@@ -131,9 +131,12 @@ export default function App() {
   // Propagation half-width as typed; empty means the server picks (the
   // whole axis for small files, a RAM-sized window for large ones).
   const [propWindow, setPropWindow] = useState("");
-  const [trackedRange, setTrackedRange] = useState<{ start: number; stop: number } | null>(
-    null,
-  );
+  const [trackedRange, setTrackedRange] = useState<{
+    start: number;
+    stop: number;
+    liveStart: number;
+    liveStop: number;
+  } | null>(null);
   const lastStageRef = useRef<string | null>(null);
   const userPickedTextCheckpoint = useRef(false);
   const pointReady = Boolean(runtime?.point_loaded) && runtime?.family === modelFamily;
@@ -814,7 +817,15 @@ export default function App() {
       } else if (event.type === "done") {
         setPropagation((prev) => (prev ? { ...prev, running: false } : null));
         if (event.start != null && event.stop != null) {
-          setTrackedRange({ start: event.start, stop: event.stop });
+          const { start, stop } = event;
+          setTrackedRange((prev) => ({
+            start,
+            stop,
+            // A re-sweep reports only the live range; keep the full extent.
+            liveStart: event.live_start ?? prev?.liveStart ?? start,
+            liveStop: event.live_stop ?? prev?.liveStop ?? stop,
+            ...(reuseSessions && prev ? { start: prev.start, stop: prev.stop } : {}),
+          }));
         }
         console.info(
           `[seismic] tracking done in ${((performance.now() - propagateStarted) / 1000).toFixed(1)} s` +
@@ -1209,7 +1220,7 @@ export default function App() {
               className="number-input"
               type="number"
               min={1}
-              placeholder={file.large ? "auto (sized to RAM)" : "auto (whole axis)"}
+              placeholder="auto (whole axis)"
               value={propWindow}
               disabled={propagation?.running}
               onChange={(e) => setPropWindow(e.target.value)}
@@ -1217,8 +1228,11 @@ export default function App() {
             {trackedRange && propagation?.axis === axis && (
               <p className="hint">
                 Tracked slices {trackedRange.start + 1}-{trackedRange.stop} of {axisCount}.
+                {(trackedRange.liveStart > trackedRange.start ||
+                  trackedRange.liveStop < trackedRange.stop) &&
+                  ` Clicks edit the tracked mask on slices ${trackedRange.liveStart + 1}-${trackedRange.liveStop}; elsewhere they preview that slice only (re-propagate from there to track the change).`}
                 {(trackedRange.start > 0 || trackedRange.stop < axisCount) &&
-                  " Edits outside this range need a wider propagation."}
+                  " Slices outside the tracked range need a wider propagation."}
               </p>
             )}
           </label>

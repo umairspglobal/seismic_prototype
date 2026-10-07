@@ -388,8 +388,10 @@ def test_propagation_window_requested_and_clamped():
 
     volume = _fake_volume(100, False)
     assert main._propagation_window(volume, "inline", 50, [50], 1, 5)[:2] == (45, 56)
-    assert main._propagation_window(volume, "inline", 2, [2], 1, 10)[:2] == (0, 13)
-    assert main._propagation_window(volume, "inline", 98, [98], 1, 10)[:2] == (88, 100)
+    # Near the ends the window slides inward instead of being clipped.
+    assert main._propagation_window(volume, "inline", 2, [2], 1, 10)[:2] == (0, 21)
+    assert main._propagation_window(volume, "inline", 98, [98], 1, 10)[:2] == (79, 100)
+    assert main._propagation_window(volume, "inline", 0, [0], 1, 200)[:2] == (0, 100)
     # Every prompted slice stays inside the window.
     assert main._propagation_window(volume, "inline", 50, [30, 50, 71], 2, 5)[:2] == (30, 72)
 
@@ -406,9 +408,107 @@ def test_propagation_window_auto_sizes_large_volumes(monkeypatch):
     assert start < 1000 < stop
     assert stop - start <= budget_frames + 1
     assert stop - start >= config.PROPAGATION_MIN_FRAMES
-    assert "auto" in reason
+    assert "live window" in reason
+    half_start, half_stop, _ = main._propagation_window(
+        _fake_volume(2000, True, frame), "time", 1000, [1000], 1, None, share=0.5
+    )
+    assert half_stop - half_start < stop - start
+    edge = main._propagation_window(_fake_volume(2000, True, frame), "time", 0, [0], 1, None)
+    assert edge[0] == 0 and edge[1] - edge[0] == stop - start
     # A large volume that fits the budget is still tracked end to end.
     assert main._propagation_window(_fake_volume(20, True, frame), "time", 10, [10], 1, None)[:2] == (0, 20)
+
+
+class _MaskTracker:
+    """Stands in for the SAM 3 propagator: carries the seed mask along, shifted one row per slice."""
+
+    def __init__(self):
+        self.live = "anchor-session"
+        self.calls = []
+
+    def propagate_from_masks(self, frames, seed_idx, seed_masks, reverse, progress):
+        self.calls.append((len(frames), seed_idx, reverse, int(frames[0][0, 0, 0])))
+        order = range(seed_idx, -1, -1) if reverse else range(seed_idx, len(frames))
+        mask = seed_masks.copy()
+        for step, frame in enumerate(order):
+            progress(frame, np.roll(mask, step, axis=1))
+
+
+class _PointTracker:
+    """Stands in for SAM 3.1: point prompts only, and it closes whatever is live."""
+
+    def __init__(self):
+        self.live = "anchor-session"
+        self.prompts = []
+
+    def propagate(self, frames, anchor_idx, points_per_object, labels_per_object, progress, keep_live):
+        assert self.live is None and not keep_live
+        self.prompts.append(points_per_object)
+        n_obj = len(points_per_object)
+        h, w = frames[0].shape[:2]
+        for frame in range(len(frames)):
+            masks = np.zeros((n_obj, h, w), dtype=bool)
+            for o, pts in enumerate(points_per_object):
+                c, r = pts[0]
+                masks[o, r, c] = True
+            progress(frame, len(frames), frame, masks)
+        return np.zeros((n_obj, len(frames), h, w), dtype=bool)
+
+
+def _chunk_setup(monkeypatch, tmp_path, n=50, frame=(6, 9), chunk=7):
+    from server import main
+
+    monkeypatch.setattr(main.MaskStore, "DIR", tmp_path / "propagation")
+    monkeypatch.setattr(main, "_volume_rgb", lambda _v, _a, i: np.full((*frame, 3), i, dtype=np.uint8))
+    monkeypatch.setattr(main, "_propagation_budget", lambda *_a, **_k: (chunk, 1, 1, 1))
+    return main, _fake_volume(n, True, frame)
+
+
+@pytest.mark.parametrize("tracker_cls", [_MaskTracker, _PointTracker])
+def test_chunked_propagation_covers_the_whole_axis(tmp_path, monkeypatch, tracker_cls):
+    main, volume = _chunk_setup(monkeypatch, tmp_path)
+    n, (h, w) = 50, (6, 9)
+    start, stop = 20, 30
+    anchor = np.zeros((2, stop - start, h, w), dtype=bool)
+    anchor[0, :, 2:4, 3:6] = True  # object 1 present; object 2 already gone
+    emitted = {}
+    tracker = tracker_cls()
+    store = main._continue_propagation(
+        volume, "inline", tracker, anchor, start, stop, lambda i, m: emitted.__setitem__(i, m.copy())
+    )
+    assert tracker.live == "anchor-session"
+    assert sorted(emitted) == [i for i in range(n) if not start <= i < stop]
+    assert store.data.shape == (n, 2, h, w)
+    for i, masks in emitted.items():
+        np.testing.assert_array_equal(store.data[i], masks)
+        assert masks[0].any() and not masks[1].any()
+    if isinstance(tracker, _MaskTracker):
+        # Chunks of 7 share their first slice with the previous chunk's last.
+        forward = [c for c in tracker.calls if not c[2]]
+        backward = [c for c in tracker.calls if c[2]]
+        assert [c[3] for c in forward] == [29, 35, 41, 47]
+        assert [c[3] for c in backward] == [14, 8, 2, 0]
+        assert backward[-1][:2] == (3, 2)
+    else:
+        interior = tracker.prompts[0][0][0]
+        assert 3 <= interior[0] <= 5 and 2 <= interior[1] <= 3
+    del store
+
+
+def test_export_view_reads_live_range_and_store(tmp_path, monkeypatch):
+    main, _volume = _chunk_setup(monkeypatch, tmp_path, n=10, frame=(4, 5))
+    store = main.MaskStore("f.sgy", "inline", 10, 1, 4, 5)
+    store.data[:] = False
+    store.data[1, 0, 0, 0] = True
+    live = SimpleNamespace(masks=np.zeros((1, 3, 4, 5), dtype=bool), height=4, width=5, n_frames=3)
+    live.masks[0, 1, 3, 4] = True
+    state = main.Propagation("f.sgy", "inline", [0], live, start=4, stop=7, store=store, extent=(0, 10))
+    view = state.object_masks(0)
+    assert view.shape == (10, 4, 5)
+    assert view[1][0, 0] and not view[5][0, 0]
+    assert view[5][3, 4]
+    cube = main._slice_masks_to_cube(view, "inline", (10, 5, 4))
+    assert cube[1, 0, 0] and cube[5, 4, 3] and cube.sum() == 2
 
 
 def test_propagation_local_frame_mapping():
