@@ -39,7 +39,7 @@ SAM_FAMILIES: dict[str, dict[str, str | bool]] = {
     },
     "sam31": {
         "id": "sam31",
-        "label": "SAM 3.1",
+        "label": "SAM 3.1 (In Progress)",
         "checkpoint": "facebook/sam3.1",
         "architecture": "SAM 3.1 Object Multiplex (facebookresearch/sam3)",
         "point_model": "Sam3MultiplexVideoPredictor",

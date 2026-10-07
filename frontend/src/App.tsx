@@ -57,7 +57,7 @@ function formatSeconds(seconds: number | null | undefined): string {
 
 const FALLBACK_TRACKERS = [
   { id: "sam3" as const, label: "SAM 3", checkpoint: "facebook/sam3", gated: true },
-  { id: "sam31" as const, label: "SAM 3.1", checkpoint: "facebook/sam3.1", gated: true },
+  { id: "sam31" as const, label: "SAM 3.1 (In Progress)", checkpoint: "facebook/sam3.1", gated: true },
   { id: "sam2" as const, label: "SAM 2", checkpoint: "facebook/sam2.1-hiera-large", gated: false },
 ];
 
@@ -902,7 +902,7 @@ export default function App() {
     (modelFamily === "sam2"
       ? "SAM 2"
       : modelFamily === "sam31"
-        ? "SAM 3.1"
+        ? "SAM 3.1 (In Progress)"
         : "SAM 3");
   const textCheckpointOptions =
     runtime?.available_text_checkpoints?.length
