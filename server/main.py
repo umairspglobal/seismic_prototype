@@ -25,6 +25,8 @@ import logging
 import math
 import platform
 import queue
+import re
+import shutil
 import sys
 import threading
 import time
@@ -36,7 +38,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from PIL import Image
@@ -114,6 +116,7 @@ _file_cache: OrderedDict[str, tuple[np.ndarray, SectionGeometry, np.ndarray]] = 
 )
 _file_load_locks_guard = threading.Lock()
 _file_load_locks: dict[str, threading.Lock] = {}
+_upload_lock = threading.Lock()
 _point_segmenter: Sam3PointSegmenter | Sam31PointSegmenter | None = None
 _propagator: Sam3VolumePropagator | Sam31VolumePropagator | None = None
 _text_segmenter: Sam3SeismicSegmenter | None = None
@@ -799,6 +802,93 @@ def set_text_checkpoint(req: SetTextCheckpointRequest) -> dict:
     return {"checkpoint": checkpoint, "label": label, "loaded": False}
 
 
+def _listing_entry(path: Path) -> dict:
+    """Dropdown metadata for one survey already stored under data/."""
+    large, (shape, geometry) = _route(path)
+    entry = {
+        "name": path.name,
+        "format": path.suffix.lower().lstrip("."),
+        "kind": geometry.kind,
+        "shape": list(shape),
+        "axes": {
+            "inline": shape[0],
+            "crossline": shape[1],
+            "time": shape[2],
+        }
+        if geometry.kind == "3d"
+        else {"inline": 1, "crossline": 1, "time": 1},
+    }
+    # Large-file fields (large, status, axes_ready, pages) are only added
+    # where they apply, so small-file entries keep their original shape.
+    if geometry.kind == "2d":
+        pages = make_pages(int(shape[1]))
+        if pages.count > 1:
+            entry["pages"] = pages.to_json()
+    if large:
+        volume = _large_volume(path.name, path)
+        entry.update(volume.info())
+    return entry
+
+
+def _safe_seismic_filename(original: str) -> str:
+    """Keep the base name, force a supported suffix, and drop path pieces."""
+    raw_name = Path(str(original).replace("\\", "/")).name.strip()
+    suffix = Path(raw_name).suffix.lower()
+    if suffix not in SUPPORTED_SEISMIC_SUFFIXES:
+        raise HTTPException(422, "Only .sgy and .npy files can be uploaded")
+    stem = Path(raw_name).stem
+    cleaned = re.sub(r"[^\w. -]+", "_", stem, flags=re.UNICODE)
+    cleaned = re.sub(r"_+", "_", cleaned).strip(" ._-")
+    if not cleaned or cleaned in {".", ".."}:
+        cleaned = "survey"
+    return f"{cleaned[:180]}{suffix}"
+
+
+def _unique_data_path(filename: str) -> Path:
+    """Pick a path inside data/, adding a numeric suffix when the name is taken."""
+    root = DATA_DIR.resolve()
+    dest = (root / filename).resolve()
+    if dest.parent != root:
+        raise HTTPException(422, "Invalid file name")
+    if not dest.exists():
+        return dest
+    stem, suffix = dest.stem, dest.suffix
+    for index in range(2, 10_000):
+        candidate = root / f"{stem}_{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise HTTPException(409, f"Too many files named like {filename} already exist in data/")
+
+
+def _store_uploaded_survey(upload: UploadFile) -> Path:
+    """Stream an upload into data/ without loading the survey into RAM."""
+    tmp: Path | None = None
+    try:
+        filename = _safe_seismic_filename(upload.filename or "")
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = DATA_DIR / f".upload-{uuid.uuid4().hex}.partial"
+        with tmp.open("wb") as out:
+            shutil.copyfileobj(upload.file, out, length=8 * 1024 * 1024)
+        if tmp.stat().st_size == 0:
+            raise HTTPException(422, "The uploaded file is empty")
+        with _upload_lock:
+            dest = _unique_data_path(filename)
+            tmp.replace(dest)
+        tmp = None
+        log.info("Stored uploaded survey %s in %s", dest.name, DATA_DIR)
+        return dest
+    except HTTPException:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise HTTPException(500, f"Could not store the upload: {exc}") from exc
+    finally:
+        upload.file.close()
+
+
 @app.get("/api/files")
 def list_files(format: str | None = None) -> list[dict]:
     """List data metadata; an optional format filter supports fast NPY discovery."""
@@ -810,34 +900,25 @@ def list_files(format: str | None = None) -> list[dict]:
         if requested_suffix is not None and path.suffix.lower() != requested_suffix:
             continue
         try:
-            large, (shape, geometry) = _route(path)
+            entries.append(_listing_entry(path))
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
             log.warning("Skipping unusable data file %s: %s", path, exc)
-            continue
-        entry = {
-            "name": path.name,
-            "format": path.suffix.lower().lstrip("."),
-            "kind": geometry.kind,
-            "shape": list(shape),
-            "axes": {
-                "inline": shape[0],
-                "crossline": shape[1],
-                "time": shape[2],
-            }
-            if geometry.kind == "3d"
-            else {"inline": 1, "crossline": 1, "time": 1},
-        }
-        # Large-file fields (large, status, axes_ready, pages) are only added
-        # where they apply, so small-file entries keep their original shape.
-        if geometry.kind == "2d":
-            pages = make_pages(int(shape[1]))
-            if pages.count > 1:
-                entry["pages"] = pages.to_json()
-        if large:
-            volume = _large_volume(path.name, path)
-            entry.update(volume.info())
-        entries.append(entry)
     return entries
+
+
+@app.post("/api/files")
+def upload_seismic_file(file: UploadFile = File(...)) -> dict:
+    """Save an uploaded .sgy or .npy survey into data/ and return its listing."""
+    dest = _store_uploaded_survey(file)
+    try:
+        return _listing_entry(dest)
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+        dest.unlink(missing_ok=True)
+        with _route_lock:
+            _routes.pop(dest.name, None)
+        raise HTTPException(
+            422, f"Could not read {dest.name} as a seismic file: {exc}"
+        ) from exc
 
 
 @app.get("/api/meta")

@@ -237,6 +237,39 @@ export async function listFiles(format?: "npy" | "sgy"): Promise<FileInfo[]> {
   return res.json();
 }
 
+/** Copy a .sgy or .npy survey into data/ and return its listing entry. */
+export function uploadSeismicFile(
+  file: File,
+  onProgress?: (percent: number) => void,
+): Promise<FileInfo> {
+  return new Promise((resolve, reject) => {
+    const body = new FormData();
+    body.append("file", file);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", apiUrl("/api/files"));
+    xhr.responseType = "json";
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable || !onProgress) return;
+      onProgress(Math.min(100, Math.round((100 * event.loaded) / event.total)));
+    };
+    xhr.onload = () => {
+      const payload = xhr.response as { detail?: unknown; name?: string } | null;
+      if (xhr.status >= 200 && xhr.status < 300 && payload?.name) {
+        resolve(payload as FileInfo);
+        return;
+      }
+      const detail = payload?.detail;
+      reject(
+        new Error(
+          typeof detail === "string" ? detail : `Upload failed (${xhr.status || "network"})`,
+        ),
+      );
+    };
+    xhr.onerror = () => reject(new Error("Upload failed: could not reach the inference server"));
+    xhr.send(body);
+  });
+}
+
 export async function getFileMeta(file: string): Promise<FileInfo> {
   const params = new URLSearchParams({ file });
   const res = await fetch(apiUrl(`/api/meta?${params}`));

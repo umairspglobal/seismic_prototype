@@ -16,6 +16,7 @@ scipy
 streamlit>=1.37,<2
 streamlit-image-coordinates
 fastapi
+python-multipart
 uvicorn[standard]
 safetensors
 pyevtk

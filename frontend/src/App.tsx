@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   Axis,
   ExportResult,
@@ -25,6 +25,7 @@ import {
   setModel,
   setTextCheckpoint,
   sliceUrl,
+  uploadSeismicFile,
 } from "./api";
 import { Viewer, ViewerObject } from "./Viewer";
 import "./App.css";
@@ -69,6 +70,66 @@ const FALLBACK_TEXT_CHECKPOINTS: TextCheckpointInfo[] = [
     source: "official",
   },
 ];
+
+function isSeismicUpload(name: string): boolean {
+  const lower = name.toLowerCase();
+  return lower.endsWith(".sgy") || lower.endsWith(".npy");
+}
+
+function SurveyUpload({
+  busy,
+  percent,
+  currentName,
+  error,
+  inputRef,
+  onPick,
+}: {
+  busy: boolean;
+  percent: number | null;
+  currentName: string | null;
+  error: string | null;
+  inputRef: RefObject<HTMLInputElement>;
+  onPick: (files: FileList | null) => void;
+}) {
+  const label = busy
+    ? percent != null && percent < 100
+      ? `Uploading ${currentName ?? "file"} ${percent}%`
+      : `Saving ${currentName ?? "file"} to data/…`
+    : "Upload .sgy or .npy";
+  return (
+    <div className="field">
+      <span>Upload a survey</span>
+      <button
+        type="button"
+        className="upload-button"
+        disabled={busy}
+        onClick={() => inputRef.current?.click()}
+      >
+        {label}
+      </button>
+      <input
+        ref={inputRef}
+        className="file-input"
+        type="file"
+        accept=".sgy,.npy"
+        multiple
+        onChange={(event) => {
+          onPick(event.target.files);
+          event.target.value = "";
+        }}
+      />
+      {busy && (
+        <div className="progress-wrap" aria-hidden="true">
+          <div className="progress-bar" style={{ width: `${percent ?? 0}%` }} />
+        </div>
+      )}
+      {error && <p className="error">{error}</p>}
+      <p className="hint">
+        The file is copied into <code>data/</code> and opened in the viewer.
+      </p>
+    </div>
+  );
+}
 
 function matchTextCheckpoint(
   current: string | null,
@@ -139,6 +200,11 @@ export default function App() {
   } | null>(null);
   const lastStageRef = useRef<string | null>(null);
   const userPickedTextCheckpoint = useRef(false);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadPercent, setUploadPercent] = useState<number | null>(null);
+  const [uploadName, setUploadName] = useState<string | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const pointReady = Boolean(runtime?.point_loaded) && runtime?.family === modelFamily;
   const videoReady = Boolean(runtime?.video_loaded) && runtime?.family === modelFamily;
 
@@ -173,6 +239,43 @@ export default function App() {
     setStatus("");
   }, []);
 
+  const handleUpload = useCallback(
+    async (list: FileList | null) => {
+      const picked = Array.from(list ?? []);
+      if (!picked.length || uploading) return;
+      const rejected = picked.find((item) => !isSeismicUpload(item.name));
+      if (rejected) {
+        setUploadError(`${rejected.name} is not a .sgy or .npy file.`);
+        return;
+      }
+      setUploading(true);
+      setUploadError(null);
+      try {
+        for (const item of picked) {
+          setUploadName(item.name);
+          setUploadPercent(0);
+          const saved = await uploadSeismicFile(item, setUploadPercent);
+          setUploadPercent(100);
+          applyFiles([saved]);
+          setFile(saved);
+          setIndex(0);
+          propMasksRef.current = new Map();
+          setPropagation(null);
+          setSliceError(null);
+          setStatus("");
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Upload failed";
+        setUploadError(message);
+      } finally {
+        setUploading(false);
+        setUploadPercent(null);
+        setUploadName(null);
+      }
+    },
+    [applyFiles, uploading],
+  );
+
   useEffect(() => {
     let cancelled = false;
     let sawAny = false;
@@ -200,7 +303,7 @@ export default function App() {
           "Cannot reach the inference server. Start it with: uvicorn server.main:app",
         );
       } else if (!sawAny) {
-        setStatus("No .sgy or .npy files found in data/");
+        setStatus("No surveys in data/ yet. Upload a .sgy or .npy file to open it.");
       }
     });
     return () => {
@@ -883,8 +986,29 @@ export default function App() {
       });
   }, [file, axis, canExport, includeAmplitude]);
 
+  const uploadControl = (
+    <SurveyUpload
+      busy={uploading}
+      percent={uploadPercent}
+      currentName={uploadName}
+      error={uploadError}
+      inputRef={uploadInputRef}
+      onPick={(picked) => {
+        void handleUpload(picked);
+      }}
+    />
+  );
+
   if (!file) {
-    return <div className="app-empty">{status || "Loading..."}</div>;
+    return (
+      <div className="app-empty">
+        <div className="stage-status">
+          <h2>Seismic SAM</h2>
+          <p>{status || "Loading surveys..."}</p>
+          {uploadControl}
+        </div>
+      </div>
+    );
   }
 
   const pageStart =
@@ -1040,6 +1164,8 @@ export default function App() {
             </p>
           )}
         </label>
+
+        {uploadControl}
 
         {file.kind === "3d" && (
           <>
