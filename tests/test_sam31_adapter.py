@@ -1,320 +1,291 @@
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
 from seismic_app.inference import (
     Sam31PointSegmenter,
     Sam31VolumePropagator,
-    _adapt_sam31_init_state,
-    _crop_letterbox_mask,
-    _install_sam31_point_mask_ranking,
-    _letterbox_relative_points,
-    _mask_for_native_id,
-    _pad_to_square,
-    _rerank_sam31_multimask_ious,
+    _install_sam31_feature_provider,
+    _install_sam31_temporal_selection,
 )
 
 
-class FakeMultiplexPredictor:
+def _outputs():
+    return {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
+
+
+class FakeDecoderTracker:
+    """SAM 3.1 tracker heads for click decoding at a 4x4 mask resolution."""
+
+    image_size = 8
+    low_res_mask_size = 4
+
     def __init__(self):
-        self.model = object()
-        self.closed = []
-        self.next_session = 1
-        self.requests = []
-        self.session_shapes = {}
+        self.calls = []
 
-    def handle_request(self, request):
-        self.requests.append(request)
-        if request["type"] == "start_session":
-            session_id = f"session-{self.next_session}"
-            self.next_session += 1
-            image = request["resource_path"][0]
-            width, height = image.size
-            self.session_shapes[session_id] = (height, width)
-            return {"session_id": session_id}
-        if request["type"] == "close_session":
-            self.closed.append(request["session_id"])
-            return {"is_success": True}
-        if request["type"] == "remove_object":
-            return {"is_success": True}
-        if request["type"] == "add_prompt":
-            object_id = request["obj_id"]
-            height, width = self.session_shapes[request["session_id"]]
-            mask = np.ones((height, width), dtype=bool)
-            return {
-                "frame_index": request["frame_index"],
-                "outputs": {
-                    "out_obj_ids": np.array([object_id]),
-                    "out_binary_masks": mask[None, ...],
-                },
-            }
-        raise AssertionError(request)
-
-    def handle_stream_request(self, request):
-        height, width = self.session_shapes[request["session_id"]]
-        for frame_index in range(3):
-            yield {
-                "frame_index": frame_index,
-                "outputs": {
-                    "out_obj_ids": np.array([1]),
-                    "out_binary_masks": np.ones((1, height, width), dtype=bool),
-                },
-            }
+    def _forward_sam_heads(self, **kwargs):
+        self.calls.append(kwargs)
+        full = torch.full((4, 4), 10.0)
+        local = torch.full((4, 4), -10.0)
+        local[0:2, 1:3] = 10.0
+        empty = torch.full((4, 4), -10.0)
+        if not kwargs["multimask_output"]:
+            # Refines the prior: drops the column holding the newest negative click.
+            refined = kwargs["mask_inputs"][0, 0].clone()
+            x, _y = kwargs["point_inputs"]["point_coords"][0, -1].tolist()
+            refined[:, int(x * 4 / 8)] = -10.0
+            return {"low_res_multimasks": refined[None, None], "ious": torch.tensor([[0.9]])}
+        return {
+            "low_res_multimasks": torch.stack([full, local, empty])[None],
+            "ious": torch.tensor([[0.99, 0.5, 0.1]]),
+        }
 
 
-class FakeSam31Model:
-    def init_state(self, resource_path, offload_video_to_cpu=False):
-        return resource_path, offload_video_to_cpu
+def _segmenter(tracker):
+    segmenter = Sam31PointSegmenter.__new__(Sam31PointSegmenter)
+    segmenter.device = "cpu"
+    segmenter.encoder = SimpleNamespace(tracker=tracker, size=tracker.image_size)
+    segmenter._init_caches(4)
+    return segmenter
 
 
-def test_sam31_init_adapter_discards_unsupported_state_offload_option():
-    model = FakeSam31Model()
-    _adapt_sam31_init_state(model)
+def test_sam31_clicks_decode_one_at_a_time_on_stretched_coordinates():
+    tracker = FakeDecoderTracker()
+    segmenter = _segmenter(tracker)
+    image = np.zeros((16, 32, 3), dtype=np.uint8)
+    segmenter._prepared["slice"] = {"pix": None, "high_res": None, "shape": (16, 32)}
 
-    assert model.init_state(
-        resource_path=["frame.png"],
-        offload_video_to_cpu=True,
-        offload_state_to_cpu=True,
-    ) == (["frame.png"], True)
+    first = segmenter.segment(image, [(16, 4)], [1], image_key="slice")
+    # The click-consistent local candidate wins over the frame-filling one.
+    assert first[4, 16] and not first[12, 4]
+    assert tracker.calls[0]["mask_inputs"] is None
+    assert tracker.calls[0]["multimask_output"]
+    assert tracker.calls[0]["point_inputs"]["point_coords"].tolist() == [[[4.0, 2.0]]]
 
-
-def test_sam31_letterbox_keeps_wide_section_aspect():
-    rgb = np.zeros((4, 16, 3), dtype=np.uint8)
-    rgb[2, 8] = 255
-    padded, box = _pad_to_square(rgb)
-
-    assert padded.shape == (16, 16, 3)
-    assert box == {"top": 6, "left": 0, "height": 4, "width": 16, "side": 16}
-    assert np.array_equal(padded[6:10], rgb)
-    assert _letterbox_relative_points([(8, 2)], box) == [[8 / 16, (2 + 6) / 16]]
-
-    native = np.zeros((16, 16), dtype=bool)
-    native[8, 8] = True
-    cropped = _crop_letterbox_mask(native, box)
-    assert cropped.shape == (4, 16)
-    assert cropped[2, 8]
+    second = segmenter.segment(image, [(16, 4), (10, 2)], [1, 0], image_key="slice")
+    refine = tracker.calls[1]
+    assert refine["point_inputs"]["point_coords"].tolist() == [[[4.0, 2.0], [2.5, 1.0]]]
+    prior = refine["mask_inputs"][0, 0]
+    assert prior[0, 1] == 10.0 and prior[3, 0] == -10.0
+    assert second[4, 16] and not second[2, 10]
+    decoded = len(tracker.calls)
+    again = segmenter.segment(image, [(16, 4), (10, 2)], [1, 0], image_key="slice")
+    assert len(tracker.calls) == decoded
+    assert (again == second).all()
 
 
-def test_sam31_point_adapter_reuses_prepared_session():
-    predictor = FakeMultiplexPredictor()
-    segmenter = Sam31PointSegmenter(predictor, embedding_cache_size=1)
-    image = np.zeros((4, 5, 3), dtype=np.uint8)
+class FakeVideoTracker:
+    """SAM 3.1 tracker state API: each slice gets the nearest conditioning mask."""
 
-    first = segmenter.segment(image, [(2, 1)], [1], image_key="slice-a")
-    second = segmenter.segment(image, [(2, 1), (3, 1)], [1, 0], image_key="slice-a")
+    low_res_mask_size = 4
 
-    assert first.shape == (4, 5)
-    assert first.all()
-    assert second.all()
-    assert predictor.next_session == 2
-    session_image = [
-        request for request in predictor.requests if request["type"] == "start_session"
-    ][0]["resource_path"][0]
-    assert session_image.size == (5, 5)
-    prompt = [
-        request for request in predictor.requests if request["type"] == "add_prompt"
-    ][-1]
-    assert prompt["points"] == [[0.4, 0.2], [0.6, 0.2]]
-    assert prompt["rel_coordinates"] is True
+    def __init__(self):
+        self.object_score_logit_threshold = 0.0
+        self.states = []
+        self.added = []
+        self.sweeps = []
 
+    def init_state(self, video_height, video_width, num_frames, cached_features, offload_state_to_cpu):
+        state = {
+            "num_frames": num_frames,
+            "cached_features": cached_features,
+            "multiplex_state": None,
+            "output_dict": _outputs(),
+            "output_dict_per_obj": {0: _outputs()},
+            "masks": {},
+        }
+        self.states.append(state)
+        return state
 
-def test_sam31_one_click_prefers_local_click_consistent_candidate():
-    masks = -torch.ones((1, 3, 4, 4))
-    masks[0, 0] = 1  # Incorrect full-frame candidate with the highest native IoU.
-    masks[0, 1, 1:3, 1:3] = 1
-    ious = torch.tensor([[0.99, 0.65, 0.98]])
+    def add_new_masks(self, state, frame_idx, obj_ids, masks):
+        self.added.append((len(self.states) - 1, frame_idx, state["multiplex_state"]))
+        state["masks"][frame_idx] = masks[0].numpy()
+        state["multiplex_state"] = "multiplex"
 
-    reranked = _rerank_sam31_multimask_ious(
-        masks,
-        ious,
-        torch.tensor([[[2.0, 2.0]]]),
-        torch.tensor([[1]], dtype=torch.int32),
-        image_size=4,
-    )
+    def propagate_in_video_preflight(self, state, run_mem_encoder):
+        for frame_idx in state["masks"]:
+            state["output_dict"]["cond_frame_outputs"][frame_idx] = {"pred_masks": torch.zeros(1, 1, 4, 4)}
 
-    assert int(reranked.argmax(dim=1).item()) == 1
-
-
-def test_sam31_one_click_ranks_upsampled_thin_candidate():
-    masks = -torch.ones((1, 3, 2, 2))
-    masks[0, 0] = 1  # Full-frame candidate, highest native IoU.
-    masks[0, 1, 1] = 1  # Bottom half at 2x2; a thin event after upsample.
-    ious = torch.tensor([[0.99, 0.40, 0.10]])
-
-    reranked = _rerank_sam31_multimask_ious(
-        masks,
-        ious,
-        torch.tensor([[[2.0, 3.0]]]),
-        torch.tensor([[1]], dtype=torch.int32),
-        image_size=4,
-    )
-
-    assert int(reranked.argmax(dim=1).item()) == 1
+    def propagate_in_video(self, state, start, max_frames, reverse, tqdm_disable):
+        self.sweeps.append(([id(s) for s in self.states].index(id(state)), start, reverse))
+        frames = range(start, -1, -1) if reverse else range(start, state["num_frames"])
+        for frame_idx in frames:
+            nearest = min(state["masks"], key=lambda f: abs(f - frame_idx))
+            mask = torch.from_numpy(state["masks"][nearest])
+            if frame_idx not in state["masks"]:
+                state["output_dict"]["non_cond_frame_outputs"][frame_idx] = {
+                    "pred_masks": torch.zeros(1, 1, 4, 4)
+                }
+            video_res = torch.where(mask, 1.0, -1.0)[None, None]
+            yield frame_idx, [1], None, video_res, torch.tensor([[5.0]])
 
 
-def test_sam31_rerank_on_wide_aspect_logits():
-    masks = -torch.ones((1, 3, 8, 8))
-    masks[0, 0] = 1
-    masks[0, 1, 3:5, 1:7] = 1
-    ious = torch.tensor([[0.97, 0.41, 0.20]])
+class FakeVolumeSegmenter:
+    def __init__(self, tracker):
+        self.encoder = SimpleNamespace(tracker=tracker, encode=lambda rgb: (None, {}))
+        self.calls = []
 
-    reranked = _rerank_sam31_multimask_ious(
-        masks,
-        ious,
-        torch.tensor([[[20.0, 16.0]]]),
-        torch.tensor([[1]], dtype=torch.int32),
-        image_size=32,
-    )
-
-    assert int(reranked.argmax(dim=1).item()) == 1
+    def segment(self, rgb, points, labels, image_key=None, object_id=0, base=None):
+        self.calls.append((points, labels, image_key, object_id, base))
+        mask = np.zeros(rgb.shape[:2], dtype=bool)
+        mask[1, 1] = True
+        return mask
 
 
-def test_sam31_uses_only_native_mask_when_object_id_differs():
-    mask = np.ones((4, 5), dtype=bool)
-    chosen = _mask_for_native_id(
-        {
-            "out_obj_ids": np.array([7]),
-            "out_binary_masks": mask[None, ...],
-        },
-        native_id=1,
-    )
-
-    assert chosen is not None
-    assert chosen.shape == (4, 5)
-    assert chosen.all()
+def _propagator(tracker):
+    segmenter = FakeVolumeSegmenter(tracker)
+    propagator = Sam31VolumePropagator(SimpleNamespace(model=None), segmenter=segmenter)
+    return propagator, segmenter
 
 
-def test_sam31_decoder_wrap_prefers_local_mask():
-    prompt = type("Enc", (), {})()
-    prompt.forward = lambda points=None, boxes=None, masks=None: points
-
-    def native_forward(*args, multimask_output=False, **kwargs):
-        masks = -torch.ones((1, 3, 4, 4))
-        masks[0, 0] = 1
-        masks[0, 1, 1:3, 1:3] = 1
-        ious = torch.tensor([[0.99, 0.65, 0.10]])
-        return masks, ious, torch.zeros(1), torch.zeros(1)
-
-    decoder = type("Dec", (), {})()
-    decoder.forward = native_forward
-    tracker_model = type("Tracker", (), {})()
-    tracker_model.image_size = 4
-    tracker_model.interactive_sam_prompt_encoder = prompt
-    tracker_model.interactive_sam_mask_decoder = decoder
-    wrapper = type("Wrapper", (), {})()
-    wrapper.model = tracker_model
-    demo = type("Demo", (), {})()
-    demo.tracker = wrapper
-    predictor = type("Predictor", (), {})()
-    predictor.model = demo
-
-    _install_sam31_point_mask_ranking(predictor)
-    prompt.forward(
-        points=(
-            torch.tensor([[[2.0, 2.0]]]),
-            torch.tensor([[1]], dtype=torch.int32),
-        )
-    )
-    _masks, ious, *_ = decoder.forward(multimask_output=True)
-
-    assert int(ious.argmax(dim=1).item()) == 1
+def _seed(shape, row):
+    mask = np.zeros(shape, dtype=bool)
+    mask[row] = True
+    return mask
 
 
-def test_sam31_point_preview_replaces_native_object_state():
-    predictor = FakeMultiplexPredictor()
-    segmenter = Sam31PointSegmenter(predictor, embedding_cache_size=1)
-    image = np.zeros((4, 5, 3), dtype=np.uint8)
-
-    segmenter.segment(
-        image,
-        [(2, 1)],
-        [1],
-        image_key="slice-a",
-        object_id=3,
-    )
-    segmenter.segment(
-        image,
-        [(2, 1)],
-        [1],
-        image_key="slice-a",
-        object_id=3,
-    )
-    segmenter.segment(
-        image,
-        [(1, 2)],
-        [1],
-        image_key="slice-a",
-        object_id=3,
-    )
-
-    object_requests = [
-        request
-        for request in predictor.requests
-        if request["type"] in ("add_prompt", "remove_object")
-    ]
-    assert [request["type"] for request in object_requests] == [
-        "add_prompt",
-        "remove_object",
-        "add_prompt",
-    ]
-    assert all(request["obj_id"] == 4 for request in object_requests)
-
-
-def test_sam31_point_adapter_closes_other_file_sessions():
-    predictor = FakeMultiplexPredictor()
-    segmenter = Sam31PointSegmenter(predictor, embedding_cache_size=4)
-    image = np.zeros((4, 5, 3), dtype=np.uint8)
-
-    segmenter.prepare_image(image, image_key=("a.sgy", "inline", 0))
-    segmenter.prepare_image(image, image_key=("b.sgy", "inline", 0))
-
-    assert predictor.closed == ["session-1"]
-    assert list(segmenter._prepared) == [("b.sgy", "inline", 0)]
-
-
-def test_sam31_volume_adapter_keeps_live_multiplex_session():
-    predictor = FakeMultiplexPredictor()
-    propagator = Sam31VolumePropagator(predictor)
-    frames = np.zeros((3, 4, 5, 3), dtype=np.uint8)
+def test_sam31_tracks_from_preview_masks_without_presence_gate():
+    tracker = FakeVideoTracker()
+    propagator, segmenter = _propagator(tracker)
+    frames = np.zeros((5, 4, 6, 3), dtype=np.uint8)
+    seed = _seed((4, 6), 2)
     updates = []
 
     masks = propagator.propagate(
         frames,
-        anchor_idx=1,
-        points_per_object=[[(2, 1)]],
-        labels_per_object=[[1]],
-        progress=lambda done, total, frame, _masks: updates.append(
-            (done, total, frame)
-        ),
+        anchor_idx=2,
+        points_per_object=[[(1, 2)], [(1, 2)]],
+        labels_per_object=[[1], [1]],
+        seed_masks_per_object=[{2: seed}, {2: seed}],
+        progress=lambda done, total, frame, _masks: updates.append(frame),
         keep_live=True,
     )
 
-    assert masks.shape == (1, 3, 4, 5)
-    assert masks.all()
-    assert updates == [(1, 3, 0), (2, 3, 1), (3, 3, 2)]
-    assert propagator.live is not None
-    prompt = next(
-        request for request in predictor.requests if request["type"] == "add_prompt"
-    )
-    assert prompt["points"] == [[0.4, 0.2]]
-    assert prompt["rel_coordinates"] is True
+    assert tracker.object_score_logit_threshold == Sam31VolumePropagator.presence_threshold
+    assert segmenter.calls == []
+    # One state per object, both seeded with the preview mask: objects may overlap.
+    assert len(tracker.states) == 2
+    assert [(f, mux) for _, f, mux in tracker.added] == [(2, None), (2, None)]
+    assert masks.shape == (2, 5, 4, 6)
+    assert all((masks[g, f] == seed).all() for g in range(2) for f in range(5))
+    assert sorted(set(updates)) == [0, 1, 2, 3, 4]
+    assert propagator.live.conditioning[0] == {2: seed}
 
 
-def test_sam31_refinement_uses_relative_coordinates():
-    predictor = FakeMultiplexPredictor()
-    propagator = Sam31VolumePropagator(predictor)
-    frames = np.zeros((3, 4, 5, 3), dtype=np.uint8)
+def test_sam31_segments_a_clicked_slice_without_a_preview_mask():
+    tracker = FakeVideoTracker()
+    propagator, segmenter = _propagator(tracker)
+    frames = np.zeros((3, 4, 6, 3), dtype=np.uint8)
+
+    masks = propagator.propagate(frames, anchor_idx=1, points_per_object=[[(1, 1)]], labels_per_object=[[1]])
+
+    assert len(segmenter.calls) == 1
+    points, labels, _key, object_id, base = segmenter.calls[0]
+    assert (points, labels, object_id, base) == ([(1, 1)], [1], 0, None)
+    assert masks[0, :, 1, 1].all() and masks[0].sum() == 3
+
+
+def test_sam31_resweep_rebuilds_edited_object_from_all_its_masks():
+    tracker = FakeVideoTracker()
+    propagator, _segmenter = _propagator(tracker)
+    frames = np.zeros((6, 4, 6, 3), dtype=np.uint8)
+    seed = _seed((4, 6), 0)
     propagator.propagate(
         frames,
         anchor_idx=1,
-        points_per_object=[[(2, 1)]],
-        labels_per_object=[[1]],
+        points_per_object=[[(1, 0)], [(1, 0)]],
+        labels_per_object=[[1], [1]],
+        seed_masks_per_object=[{1: seed}, {1: seed}],
         keep_live=True,
     )
+    live = propagator.live
+    edit = _seed((4, 6), 3)
 
-    propagator.refine_frame(propagator.live, 0, 2, [(4, 3)], [1])
+    shown = propagator.pin_mask(live, 1, 4, edit)
+    assert (shown[1] == edit).all()
+    tracker.added.clear()
+    tracker.sweeps.clear()
+    masks = propagator.resweep(live)
 
-    prompt = [
-        request for request in predictor.requests if request["type"] == "add_prompt"
-    ][-1]
-    assert prompt["points"] == [[0.8, 0.6]]
-    assert prompt["rel_coordinates"] is True
+    # Only object 2 is rebuilt, from its preview mask and the pinned edit,
+    # each added on the plain mask-prompt path.
+    assert [(f, mux) for _, f, mux in tracker.added] == [(1, None), (4, None)]
+    rebuilt = len(tracker.states) - 1
+    assert tracker.sweeps == [(rebuilt, 4, False), (rebuilt, 4, True)]
+    assert (masks[1, 4] == edit).all() and (masks[1, 5] == edit).all()
+    assert (masks[1, 1] == seed).all()
+    assert (masks[0, 5] == seed).all()
+    assert not live.dirty_frames and not live.dirty_objects
+
+
+def test_sam31_chunk_continues_from_masks_of_present_objects():
+    tracker = FakeVideoTracker()
+    propagator, _segmenter = _propagator(tracker)
+    frames = np.zeros((4, 4, 6, 3), dtype=np.uint8)
+    seeds = np.zeros((2, 4, 6), dtype=bool)
+    seeds[0, 2] = True
+    got = {}
+
+    propagator.propagate_from_masks(frames, 0, seeds, False, lambda f, m: got.__setitem__(f, m.copy()))
+
+    assert len(tracker.states) == 1
+    assert sorted(got) == [0, 1, 2, 3]
+    assert all((got[f][0] == seeds[0]).all() and not got[f][1].any() for f in got)
+
+
+class IdentityMultiplex:
+    def demux(self, x):
+        return x
+
+    def mux(self, x):
+        return x
+
+
+def test_sam31_tracking_prefers_candidate_matching_previous_slice():
+    candidates = torch.full((1, 3, 4, 4), -10.0)
+    candidates[0, 0] = 10.0  # the IoU head's favourite: the whole slice
+    candidates[0, 1, 1, :] = 10.0  # the event tracked on the previous slice
+    decoder = SimpleNamespace(
+        forward=lambda **kw: {"masks": candidates, "iou_pred": torch.tensor([[0.9, 0.2, 0.1]])}
+    )
+    tracker = SimpleNamespace(sam_mask_decoder=decoder)
+    tracker._run_single_frame_inference = lambda **kw: tracker.sam_mask_decoder.forward(multimask_output=True)
+    _install_sam31_temporal_selection(tracker)
+    previous = torch.full((1, 1, 4, 4), -10.0)
+    previous[0, 0, 1, :] = 10.0
+    output_dict = _outputs()
+    output_dict["non_cond_frame_outputs"][4] = {"pred_masks": previous}
+
+    out = tracker._run_single_frame_inference(
+        frame_idx=5,
+        reverse=False,
+        output_dict=output_dict,
+        inference_state={"multiplex_state": IdentityMultiplex()},
+        point_inputs=None,
+        mask_inputs=None,
+    )
+    assert int(out["iou_pred"].argmax()) == 1
+
+    clicked = tracker._run_single_frame_inference(
+        frame_idx=5,
+        reverse=False,
+        output_dict=output_dict,
+        inference_state={"multiplex_state": IdentityMultiplex()},
+        point_inputs={"point_coords": None},
+        mask_inputs=None,
+    )
+    assert int(clicked["iou_pred"].argmax()) == 0
+
+
+def test_sam31_states_fetch_missing_slice_features_from_provider():
+    tracker = SimpleNamespace(
+        _get_image_feature=lambda state, frame_idx, batch_size: state["cached_features"][frame_idx]
+    )
+    _install_sam31_feature_provider(tracker)
+    cache = {}
+    state = {"cached_features": cache, "feature_provider": lambda f: cache.__setitem__(f, f"slice-{f}")}
+
+    assert tracker._get_image_feature(state, 3, 1) == "slice-3"
+    assert tracker._get_image_feature(state, 3, 1) == "slice-3"
+    assert list(cache) == [3]

@@ -43,7 +43,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
-from scipy import ndimage
 
 from seismic_app import config, sysinfo
 from seismic_app.config import ModelFamily
@@ -311,9 +310,11 @@ def _load_models(family: ModelFamily, load_id: int) -> None:
                 )
                 _sam31_predictor = build_sam31_predictor()
                 _point_segmenter = Sam31PointSegmenter(
-                    _sam31_predictor, embedding_cache_size=1
+                    _sam31_predictor, embedding_cache_size=4
                 )
-                _propagator = Sam31VolumePropagator(_sam31_predictor)
+                _propagator = Sam31VolumePropagator(
+                    _sam31_predictor, segmenter=_point_segmenter
+                )
             else:
                 _load_state["stage"] = f"Loading {label} point tracker onto the GPU..."
                 _point_segmenter = Sam3PointSegmenter(
@@ -1244,13 +1245,15 @@ def _propagation_budget(
 ) -> tuple[int, int, int, int]:
     """(max frames per session, bytes per frame, RAM budget, available RAM).
 
-    A session needs, per frame, the RGB slice, its mask per object and the
-    processor's resized float tensor. Measured fresh on every call, so
-    later chunks shrink when an earlier session still holds memory.
+    A session needs, per frame, the RGB slice, its mask per object, the
+    processor's resized float tensor and any tracker memory the propagator
+    keeps in host RAM. Measured fresh on every call, so later chunks
+    shrink when an earlier session still holds memory.
     """
     h, w = volume.frame_shape(axis)
     side = config.PROPAGATION_MODEL_SIDE
-    per_frame = h * w * (3 + n_objects) + 3 * side * side * 4
+    state = int(getattr(_propagator, "state_bytes_per_object_frame", 0))
+    per_frame = h * w * (3 + n_objects) + 3 * side * side * 4 + n_objects * state
     total, available = sysinfo.memory_status()
     budget = int(config.PROPAGATION_RAM_FRACTION * total) if total else 4 * 1024**3
     if available:
@@ -1397,11 +1400,9 @@ def propagate(req: PropagateRequest) -> StreamingResponse:
             # Drop the previous volume while model switching is excluded, so
             # a completed stale job cannot restore an already-closed session.
             _propagation = None
-            mask_prompts: dict = {}
-            if isinstance(propagator, Sam3VolumePropagator):
-                mask_prompts = _preview_mask_prompts(
-                    req, volume, frames_box[0], start, _require_point_segmenter()
-                )
+            mask_prompts = _preview_mask_prompts(
+                req, volume, frames_box[0], start, _require_point_segmenter()
+            )
             anchor_masks = propagator.propagate(
                 frames_box.pop(),
                 anchor_idx=req.index - start,
@@ -1511,65 +1512,6 @@ def _preview_mask_prompts(
     return {"seed_masks_per_object": seeds, "refine_mask": refine_mask}
 
 
-def _seed_points(mask: np.ndarray, count: int = 3) -> list[tuple[int, int]]:
-    """Up to ``count`` well-separated interior (col, row) points of a mask."""
-    dist = ndimage.distance_transform_edt(mask)
-    points: list[tuple[int, int]] = []
-    for _ in range(count):
-        flat = int(np.argmax(dist))
-        r, c = np.unravel_index(flat, dist.shape)
-        radius = float(dist[r, c])
-        if radius <= 0:
-            break
-        points.append((int(c), int(r)))
-        reach = int(max(3.0, 2.0 * radius))
-        dist[max(0, r - reach) : r + reach + 1, max(0, c - reach) : c + reach + 1] = 0
-    return points
-
-
-def _track_chunk_with_points(
-    propagator,
-    frames: list[np.ndarray],
-    seed_idx: int,
-    seed_masks: np.ndarray,
-    reverse: bool,
-    on_frame: Callable[[int, np.ndarray], None],
-) -> None:
-    """Chunk continuation for trackers without mask prompts (SAM 3.1).
-
-    Re-prompts every still-present object with interior points of its
-    boundary mask. The anchor window's live session is set aside so the
-    tracker does not close it.
-    """
-    n_objects, h, w = seed_masks.shape
-    present = [i for i in range(n_objects) if seed_masks[i].any()]
-    frame_range = range(seed_idx, -1, -1) if reverse else range(seed_idx, len(frames))
-    empty = np.zeros((n_objects, h, w), dtype=bool)
-    if not present:
-        for frame in frame_range:
-            on_frame(frame, empty)
-        return
-    points = [_seed_points(seed_masks[i]) for i in present]
-    saved_live = propagator.live
-    propagator.live = None
-    try:
-        def progress(_done: int, _total: int, frame: int, masks: np.ndarray) -> None:
-            full = np.zeros((n_objects, h, w), dtype=bool)
-            full[present] = masks
-            on_frame(frame, full)
-
-        propagator.propagate(
-            frames,
-            anchor_idx=seed_idx,
-            points_per_object=points,
-            labels_per_object=[[1] * len(p) for p in points],
-            progress=progress,
-            keep_live=False,
-        )
-    finally:
-        propagator.live = saved_live
-
-
 def _continue_propagation(
     volume: SeismicVolume,
     axis: str,
@@ -1587,7 +1529,6 @@ def _continue_propagation(
     n = volume.axis_count(axis)
     n_objects, h, w = anchor_masks.shape[0], anchor_masks.shape[2], anchor_masks.shape[3]
     store = MaskStore(volume.name, axis, n, n_objects, h, w)
-    with_masks = hasattr(propagator, "propagate_from_masks")
     for reverse in (False, True):
         edge = start if reverse else stop - 1
         seed = anchor_masks[:, edge - start].copy()
@@ -1624,14 +1565,9 @@ def _continue_propagation(
                 emit(index, masks)
 
             frames_box = [[_volume_rgb(volume, axis, i) for i in range(lo, hi)]]
-            if with_masks:
-                propagator.propagate_from_masks(
-                    frames_box.pop(), seed_local, seed, reverse, on_frame
-                )
-            else:
-                _track_chunk_with_points(
-                    propagator, frames_box.pop(), seed_local, seed, reverse, on_frame
-                )
+            propagator.propagate_from_masks(
+                frames_box.pop(), seed_local, seed, reverse, on_frame
+            )
             seed = last.get("masks", np.zeros_like(seed))
             edge = lo if reverse else hi - 1
     store.flush()
@@ -1671,18 +1607,15 @@ def refine(req: RefineRequest) -> dict:
                 f"{state.start + 1}-{state.stop} - propagate with a wider range to edit it.",
             )
         propagator = _require_propagator()
-        if isinstance(propagator, Sam3VolumePropagator):
-            mask = _require_point_segmenter().segment(
-                _volume_rgb(volume, req.axis, req.index),
-                points,
-                labels,
-                image_key=(req.file, req.axis, req.index),
-                object_id=req.object_id,
-                base=propagator.refine_base(state.live, position, local),
-            )
-            frame_masks = propagator.pin_mask(state.live, position, local, mask)
-        else:
-            frame_masks = propagator.refine_frame(state.live, position, local, points, labels)
+        mask = _require_point_segmenter().segment(
+            _volume_rgb(volume, req.axis, req.index),
+            points,
+            labels,
+            image_key=(req.file, req.axis, req.index),
+            object_id=req.object_id,
+            base=propagator.refine_base(state.live, position, local),
+        )
+        frame_masks = propagator.pin_mask(state.live, position, local, mask)
     return {
         "mask": _masks_png_base64(frame_masks, state.object_ids),
         "coverage": float(frame_masks.any(axis=0).mean()),

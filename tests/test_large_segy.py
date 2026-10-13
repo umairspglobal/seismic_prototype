@@ -420,7 +420,7 @@ def test_propagation_window_auto_sizes_large_volumes(monkeypatch):
 
 
 class _MaskTracker:
-    """Stands in for the SAM 3 propagator: carries the seed mask along, shifted one row per slice."""
+    """Stands in for a propagator: carries the seed mask along, shifted one row per slice."""
 
     def __init__(self):
         self.live = "anchor-session"
@@ -434,27 +434,6 @@ class _MaskTracker:
             progress(frame, np.roll(mask, step, axis=1))
 
 
-class _PointTracker:
-    """Stands in for SAM 3.1: point prompts only, and it closes whatever is live."""
-
-    def __init__(self):
-        self.live = "anchor-session"
-        self.prompts = []
-
-    def propagate(self, frames, anchor_idx, points_per_object, labels_per_object, progress, keep_live):
-        assert self.live is None and not keep_live
-        self.prompts.append(points_per_object)
-        n_obj = len(points_per_object)
-        h, w = frames[0].shape[:2]
-        for frame in range(len(frames)):
-            masks = np.zeros((n_obj, h, w), dtype=bool)
-            for o, pts in enumerate(points_per_object):
-                c, r = pts[0]
-                masks[o, r, c] = True
-            progress(frame, len(frames), frame, masks)
-        return np.zeros((n_obj, len(frames), h, w), dtype=bool)
-
-
 def _chunk_setup(monkeypatch, tmp_path, n=50, frame=(6, 9), chunk=7):
     from server import main
 
@@ -464,15 +443,14 @@ def _chunk_setup(monkeypatch, tmp_path, n=50, frame=(6, 9), chunk=7):
     return main, _fake_volume(n, True, frame)
 
 
-@pytest.mark.parametrize("tracker_cls", [_MaskTracker, _PointTracker])
-def test_chunked_propagation_covers_the_whole_axis(tmp_path, monkeypatch, tracker_cls):
+def test_chunked_propagation_covers_the_whole_axis(tmp_path, monkeypatch):
     main, volume = _chunk_setup(monkeypatch, tmp_path)
     n, (h, w) = 50, (6, 9)
     start, stop = 20, 30
     anchor = np.zeros((2, stop - start, h, w), dtype=bool)
     anchor[0, :, 2:4, 3:6] = True  # object 1 present; object 2 already gone
     emitted = {}
-    tracker = tracker_cls()
+    tracker = _MaskTracker()
     store = main._continue_propagation(
         volume, "inline", tracker, anchor, start, stop, lambda i, m: emitted.__setitem__(i, m.copy())
     )
@@ -482,16 +460,12 @@ def test_chunked_propagation_covers_the_whole_axis(tmp_path, monkeypatch, tracke
     for i, masks in emitted.items():
         np.testing.assert_array_equal(store.data[i], masks)
         assert masks[0].any() and not masks[1].any()
-    if isinstance(tracker, _MaskTracker):
-        # Chunks of 7 share their first slice with the previous chunk's last.
-        forward = [c for c in tracker.calls if not c[2]]
-        backward = [c for c in tracker.calls if c[2]]
-        assert [c[3] for c in forward] == [29, 35, 41, 47]
-        assert [c[3] for c in backward] == [14, 8, 2, 0]
-        assert backward[-1][:2] == (3, 2)
-    else:
-        interior = tracker.prompts[0][0][0]
-        assert 3 <= interior[0] <= 5 and 2 <= interior[1] <= 3
+    # Chunks of 7 share their first slice with the previous chunk's last.
+    forward = [c for c in tracker.calls if not c[2]]
+    backward = [c for c in tracker.calls if c[2]]
+    assert [c[3] for c in forward] == [29, 35, 41, 47]
+    assert [c[3] for c in backward] == [14, 8, 2, 0]
+    assert backward[-1][:2] == (3, 2)
     del store
 
 

@@ -58,7 +58,7 @@ function formatSeconds(seconds: number | null | undefined): string {
 
 const FALLBACK_TRACKERS = [
   { id: "sam3" as const, label: "SAM 3", checkpoint: "facebook/sam3", gated: true },
-  { id: "sam31" as const, label: "SAM 3.1 (In Progress)", checkpoint: "facebook/sam3.1", gated: true },
+  { id: "sam31" as const, label: "SAM 3.1", checkpoint: "facebook/sam3.1", gated: true },
   { id: "sam2" as const, label: "SAM 2", checkpoint: "facebook/sam2.1-hiera-large", gated: false },
 ];
 
@@ -643,9 +643,10 @@ export default function App() {
           setSegmenting(false);
           setPendingEdits((n) => n + 1);
         })
-        .catch(() => {
+        .catch((err: Error) => {
           if (controller.signal.aborted) return;
           setSegmenting(false);
+          setStatus(`Tracked edit failed, showing a fresh mask instead: ${err.message}`);
           runSegment(objectId, pts);
         });
     },
@@ -1026,7 +1027,7 @@ export default function App() {
     (modelFamily === "sam2"
       ? "SAM 2"
       : modelFamily === "sam31"
-        ? "SAM 3.1 (In Progress)"
+        ? "SAM 3.1"
         : "SAM 3");
   const textCheckpointOptions =
     runtime?.available_text_checkpoints?.length
@@ -1063,7 +1064,7 @@ export default function App() {
           </select>
           <p className="hint">
             {modelFamily === "sam31"
-              ? "Object Multiplex tracks objects in shared memory. It requires the latest native SAM 3 code and CUDA. You can still open another seismic file while it loads."
+              ? "SAM 3.1's tracker, with each object tracked separately so objects may overlap. It requires the native SAM 3 code and CUDA. You can still open another seismic file while it loads."
               : "Official click/volume trackers only. Switch to compare masks on the same clicks; only one stays on the GPU. Seismic files stay available while a tracker loads."}
           </p>
         </label>
