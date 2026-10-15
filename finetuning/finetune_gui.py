@@ -345,10 +345,12 @@ class FinetuneGUI:
         except (AttributeError, OSError, tk.TclError, ValueError):
             pass
 
-    def _section(self, parent, title: str, *, expand: bool = False, fill_pane: bool = False):
+    def _section(self, parent, title: str, *, expand: bool = False, fill_pane: bool = False, placed: bool = False):
         """Card with a title. Returns the body (for fields) and the header (for side actions)."""
         shell = tk.Frame(parent, bg=BORDER, bd=0, highlightthickness=0)
-        if fill_pane:
+        if placed:
+            pass
+        elif fill_pane:
             shell.pack(fill=tk.BOTH, expand=True)
         else:
             shell.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=(0, 10))
@@ -362,6 +364,7 @@ class FinetuneGUI:
         tk.Label(header, text=title, bg=CARD, fg=FG, font=("Segoe UI", 11, "bold")).pack(side=tk.LEFT)
         body = ttk.Frame(card, style="Card.TFrame", padding=(14, 8, 14, 12))
         body.pack(fill=tk.BOTH, expand=True)
+        body.card_shell = shell
         return body, header
 
     def _wrap_label(self, parent, row, columnspan, textvariable, style, pady=(2, 0)):
@@ -372,6 +375,7 @@ class FinetuneGUI:
         label = ttk.Label(holder, textvariable=textvariable, style=style, anchor="nw", justify=tk.LEFT,
                           wraplength=200)
         label.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+        self._wrap_labels.append(label)
 
         def fit(_event=None, target=label, box=holder):
             width = max(40, box.winfo_width() - 2)
@@ -380,6 +384,7 @@ class FinetuneGUI:
             needed = max(target.winfo_reqheight(), 16)
             if int(box.cget("height")) != needed:
                 box.configure(height=needed)
+                self._schedule_column_layout()
 
         holder.bind("<Configure>", fit)
         textvariable.trace_add("write", lambda *_a: holder.after_idle(fit))
@@ -418,10 +423,23 @@ class FinetuneGUI:
         col_b.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
         col_c.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
 
-        self._build_data_frame(col_a)
-        self._build_output_frame(col_a)
-        self._build_training_frame(col_b)
+        self._col_c = col_c
+        self._base_pady = {}
+        self._factor = {}
+        self._fit_key = {}
+        self._compact = {}
+        self._layout_sig = {}
+        self._layout_pending = False
+        self._layout_again = False
+        self._laying_out = False
+        self._scroll_canvases = set()
+        self._wrap_labels = []
+        self._data_inner, self._data_canvas = self._scroll_column(col_a)
         self._build_buttons(col_b)
+        self._training_inner, self._training_canvas = self._scroll_column(col_b)
+        self._build_data_frame(self._data_inner)
+        self._build_output_frame(self._data_inner)
+        self._build_training_frame(self._training_inner)
         self._build_status(col_c)
 
         bottom = ttk.PanedWindow(panes, orient=tk.HORIZONTAL)
@@ -440,15 +458,278 @@ class FinetuneGUI:
 
     def _place_sash(self) -> None:
         """Keep the form at its own height and give the remaining space to the log."""
+        if not self.root.winfo_exists():
+            return
         self.root.update_idletasks()
+        self._remember_form_height()
         height = self._panes.winfo_height()
-        want = self._top.winfo_reqheight() + self._px(8)
-        if height > self._px(200):
+        want = getattr(self, "_form_natural", 0) + self._px(8)
+        if want < 40:
+            want = self._top.winfo_reqheight() + self._px(8)
+        if height > self._px(200) and want > 40:
             # Keep the whole form on screen, and still leave a usable log strip.
             log_min = self._px(160)
             self._panes.sashpos(0, min(want, max(self._px(240), height - log_min)))
         for entry in getattr(self, "_path_entries", ()):
             entry.xview_moveto(1.0)
+        self._layout_columns()
+
+    def _scroll_column(self, parent) -> tuple[tk.Frame, tk.Canvas]:
+        """A column whose cards fill the visible area and scroll once they cannot shrink further."""
+        canvas = tk.Canvas(parent, bg=APP_BG, highlightthickness=0, bd=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        inner = tk.Frame(canvas, bg=APP_BG, bd=0, highlightthickness=0)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        bar = ttk.Scrollbar(parent, command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.scroll_bar = bar
+        canvas.scroll_window = window
+        canvas.scroll_inner = inner
+        self._scroll_canvases.add(canvas)
+        canvas.bind("<Configure>", self._schedule_column_layout)
+        if not getattr(self, "_wheel_bound", False):
+            self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+            self._wheel_bound = True
+        return inner, canvas
+
+    def _on_mousewheel(self, event) -> str | None:
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        canvas = None
+        while widget is not None:
+            if widget in self._scroll_canvases:
+                canvas = widget
+                break
+            widget = getattr(widget, "master", None)
+        if canvas is None:
+            return None
+        bbox = canvas.bbox("all")
+        if not bbox or bbox[3] <= canvas.winfo_height() + 2:
+            return None
+        canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
+
+    def _schedule_column_layout(self, _event=None) -> None:
+        if self._laying_out:
+            self._layout_again = True
+            return
+        if self._layout_pending:
+            return
+        self._layout_pending = True
+        self.root.after_idle(self._layout_columns)
+
+    def _remember_form_height(self) -> None:
+        """Record the unscaled card heights so later sash moves scale from that size."""
+        if getattr(self, "_form_ready", False):
+            return
+        self._settle_wraps()
+        self.root.update_idletasks()
+        data_h = self._data_shell.winfo_reqheight()
+        output_h = self._output_shell.winfo_reqheight()
+        training_h = self._training_shell.winfo_reqheight()
+        if min(data_h, output_h, training_h) < 40:
+            return
+        self._natural_h = {"data": data_h, "output": output_h, "training": training_h}
+        self._shell_chrome = {
+            "data": data_h - self._data_body.winfo_reqheight(),
+            "output": output_h - self._output_body.winfo_reqheight(),
+            "training": training_h - self._training_body.winfo_reqheight(),
+        }
+        pad_save = self._px(16)
+
+        def minimum(body, natural: int) -> int:
+            _fixed, pad = self._content_parts(body)
+            return max(self._px(120), natural - pad - pad_save)
+
+        self._min_h = {
+            "data": minimum(self._data_body, data_h),
+            "output": minimum(self._output_body, output_h),
+            "training": minimum(self._training_body, training_h),
+        }
+        gap = self._px(6)
+        left = data_h + gap + output_h
+        middle = training_h + self._px(8) + max(self._button_bar.winfo_reqheight(), self._px(36))
+        right = self._col_c.winfo_reqheight()
+        self._form_natural = max(left, middle, right)
+        self._form_ready = True
+
+    def _settle_wraps(self) -> None:
+        for label in self._wrap_labels:
+            holder = label.master
+            width = holder.winfo_width()
+            if width < 80:
+                width = self._data_canvas.winfo_width() - self._px(48)
+            if width < 80:
+                width = 420
+            label.configure(wraplength=max(40, width))
+            holder.configure(height=max(label.winfo_reqheight(), 16))
+
+    def _adopt_grown_cards(self) -> None:
+        """A wrapped path can get taller after the first measure. Keep that as the card's full size."""
+        if not getattr(self, "_form_ready", False):
+            return
+        changed = False
+        for key, shell, body in (
+            ("data", self._data_shell, self._data_body),
+            ("output", self._output_shell, self._output_body),
+            ("training", self._training_shell, self._training_body),
+        ):
+            if self._compact.get(body) or self._factor.get(body, 1.0) < 0.99:
+                continue
+            req = shell.winfo_reqheight()
+            if req > self._natural_h[key] + 2:
+                self._natural_h[key] = req
+                _fixed, pad = self._content_parts(body)
+                self._min_h[key] = max(self._px(120), req - pad - self._px(16))
+                self._shell_chrome[key] = max(0, req - body.winfo_reqheight())
+                changed = True
+        if changed:
+            gap = self._px(6)
+            left = self._natural_h["data"] + gap + self._natural_h["output"]
+            middle = self._natural_h["training"] + self._px(8) + max(self._button_bar.winfo_reqheight(), self._px(36))
+            self._form_natural = max(left, middle, self._form_natural)
+            self._layout_sig.clear()
+
+    def _split_pad(self, raw) -> tuple[int, int]:
+        if isinstance(raw, (tuple, list)):
+            if len(raw) >= 2:
+                return int(float(raw[0])), int(float(raw[1]))
+            if len(raw) == 1:
+                val = int(float(raw[0]))
+                return val, val
+            return 0, 0
+        parts = str(raw).split()
+        if len(parts) >= 2:
+            return int(float(parts[0])), int(float(parts[1]))
+        if parts and parts[0]:
+            val = int(float(parts[0]))
+            return val, val
+        return 0, 0
+
+    def _remember_pads(self, body) -> None:
+        for widget in body.grid_slaves():
+            if widget in self._base_pady:
+                continue
+            self._base_pady[widget] = self._split_pad(widget.grid_info().get("pady", 0))
+
+    def _content_parts(self, body) -> tuple[int, int]:
+        """Fixed row height and the vertical padding those rows have at scale 1."""
+        rows: dict[int, tuple[int, int]] = {}
+        for widget in body.grid_slaves():
+            info = widget.grid_info()
+            if not info:
+                continue
+            row = int(info["row"])
+            top, bottom = self._base_pady.get(widget, (0, 0))
+            fixed, pad = rows.get(row, (0, 0))
+            rows[row] = (max(fixed, widget.winfo_reqheight()), max(pad, top + bottom))
+        return sum(fixed for fixed, _pad in rows.values()), sum(pad for _fixed, pad in rows.values())
+
+    def _sticky(self, widget) -> str:
+        raw = widget.grid_info().get("sticky", "")
+        if isinstance(raw, (tuple, list)):
+            return "".join(str(part) for part in raw)
+        return str(raw)
+
+    def _fit_shell(self, body, key: str, slot: int) -> None:
+        """Tighten a card that lost height, or spread its rows when the column got taller."""
+        if slot < 20 or not body.grid_slaves():
+            return
+        allowed = max(20, slot - self._shell_chrome.get(key, 0))
+        compact = slot < self._natural_h[key] - self._px(8)
+        if self._compact.get(body) != compact:
+            self._compact[body] = compact
+            body.configure(padding=(8, 1, 8, 2) if compact else (14, 8, 14, 12))
+        fixed, pad = self._content_parts(body)
+        last = self._factor.get(body, 1.0)
+        chrome = max(0, body.winfo_reqheight() - (fixed + pad * last))
+        if pad <= 0:
+            factor = 1.0
+        else:
+            factor = (allowed - chrome - fixed) / pad
+        factor = max(0.0, min(1.0, factor))
+        need = chrome + fixed + pad * factor
+        weight = 1 if factor >= 0.99 and allowed > need + 8 else 0
+        fit_key = (round(factor, 2), weight, compact)
+        if self._fit_key.get(body) == fit_key:
+            return
+        self._fit_key[body] = fit_key
+        self._factor[body] = factor
+        for widget in body.grid_slaves():
+            top, bottom = self._base_pady.get(widget, (0, 0))
+            sticky = self._sticky(widget)
+            if weight and "n" not in sticky:
+                sticky = (sticky + "n") if sticky else "nw"
+            widget.grid_configure(pady=(round(top * factor), round(bottom * factor)), sticky=sticky)
+        seen = {int(widget.grid_info()["row"]) for widget in body.grid_slaves() if widget.grid_info()}
+        for row in seen:
+            body.rowconfigure(row, weight=weight)
+
+    def _layout_stack(self, canvas: tk.Canvas, items: list[tuple[tk.Frame, ttk.Frame, str]]) -> None:
+        available = canvas.winfo_height()
+        width = canvas.winfo_width()
+        if available < 40 or width < 40 or not getattr(self, "_form_ready", False):
+            return
+        gap = self._px(6)
+        gaps = gap * (len(items) - 1)
+        naturals = [self._natural_h[key] for _shell, _body, key in items]
+        minimums = [self._min_h[key] for _shell, _body, key in items]
+        natural = sum(naturals) + gaps
+        minimum = sum(minimums) + gaps
+        # Fill the column when there is room. Below the compact size, keep the fields
+        # intact and let the column scroll instead of clipping them.
+        total = available if available >= minimum else minimum
+        if total >= natural and sum(naturals) > 0:
+            space = max(1, total - gaps)
+            heights = [max(1, int(space * height / sum(naturals))) for height in naturals]
+        else:
+            span = max(1, natural - minimum)
+            blend = min(1.0, max(0.0, (total - minimum) / span))
+            heights = [max(1, int(low + (high - low) * blend)) for low, high in zip(minimums, naturals)]
+        heights[-1] = max(1, total - gaps - sum(heights[:-1]))
+        signature = (available, width, tuple(heights))
+        if self._layout_sig.get(canvas) == signature:
+            return
+        self._layout_sig[canvas] = signature
+        y = 0
+        inner = canvas.scroll_inner
+        for (shell, _body, _key), height in zip(items, heights):
+            shell.place(x=0, y=y, relwidth=1, height=height)
+            y += height + gap
+        inner_h = max(1, y - gap)
+        canvas.itemconfigure(canvas.scroll_window, width=width, height=inner_h)
+        inner.configure(width=width, height=inner_h)
+        canvas.configure(scrollregion=(0, 0, width, inner_h))
+        bar = canvas.scroll_bar
+        if inner_h > available + 2:
+            if not bar.winfo_ismapped():
+                bar.pack(side=tk.RIGHT, fill=tk.Y)
+        else:
+            if bar.winfo_ismapped():
+                bar.pack_forget()
+            canvas.yview_moveto(0)
+        for (shell, body, key), height in zip(items, heights):
+            self._fit_shell(body, key, height)
+
+    def _layout_columns(self) -> None:
+        if self._laying_out or not self.root.winfo_exists():
+            return
+        self._layout_pending = False
+        self._remember_form_height()
+        self._adopt_grown_cards()
+        self._laying_out = True
+        try:
+            self._layout_stack(self._data_canvas, [
+                (self._data_shell, self._data_body, "data"),
+                (self._output_shell, self._output_body, "output"),
+            ])
+            self._layout_stack(self._training_canvas, [
+                (self._training_shell, self._training_body, "training"),
+            ])
+        finally:
+            self._laying_out = False
+            if self._layout_again:
+                self._layout_again = False
+                self._schedule_column_layout()
 
     def _path_entry(self, parent, var: tk.StringVar) -> ttk.Entry:
         """Entry that keeps the end of a long path (the folder name) in view."""
@@ -486,7 +767,7 @@ class FinetuneGUI:
         return spin
 
     def _build_data_frame(self, parent) -> None:
-        f, _header = self._section(parent, "1. Data")
+        f, _header = self._section(parent, "1. Data", placed=True)
         f.columnconfigure(1, weight=1)
         preset = ttk.Combobox(f, textvariable=self.preset, values=list(PRESETS), state="readonly")
         preset.bind("<<ComboboxSelected>>", lambda _e: self._apply_preset())
@@ -508,11 +789,15 @@ class FinetuneGUI:
         info.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self.count_label = ttk.Label(info, textvariable=self.count_text, style="Hint.TLabel")
         self.count_label.pack(side=tk.LEFT)
-        ttk.Button(info, text="Preview data", style="Tool.TButton", cursor="hand2",
-                   command=self._preview_data).pack(side=tk.RIGHT)
+        self.preview_btn = ttk.Button(info, text="Preview data", style="Tool.TButton", cursor="hand2",
+                                      command=self._preview_data)
+        self.preview_btn.pack(side=tk.RIGHT)
+        self._data_body = f
+        self._data_shell = f.card_shell
+        self._remember_pads(f)
 
     def _build_output_frame(self, parent) -> None:
-        f, _header = self._section(parent, "2. Output model")
+        f, _header = self._section(parent, "2. Output model", placed=True)
         f.columnconfigure(1, weight=1)
         self._row(f, 0, "Model name", ttk.Entry(f, textvariable=self.model_name))
         self._row(f, 1, "Save in folder", self._path_entry(f, self.output_root),
@@ -521,9 +806,12 @@ class FinetuneGUI:
         base.bind("<Button-1>", lambda _e: base.configure(values=self._base_choices()))
         self._row(f, 2, "Start from", base, browse=lambda: self._browse_dir(self.base_model))
         self.target_label = self._wrap_label(f, 3, 3, self.target_text, "Hint.TLabel", pady=(4, 0))
+        self._output_body = f
+        self._output_shell = f.card_shell
+        self._remember_pads(f)
 
     def _build_training_frame(self, parent) -> None:
-        f, _header = self._section(parent, "3. Training settings")
+        f, _header = self._section(parent, "3. Training settings", placed=True)
         f.columnconfigure(1, weight=1)
         self._spin_row(f, 0, "Sections to use", self.max_samples, from_=50, to=100000, increment=500,
                        hint="0 = all")
@@ -545,10 +833,14 @@ class FinetuneGUI:
         ttk.Checkbutton(checks, text="Flip augmentation", variable=self.hflip).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Checkbutton(checks, text="Keep best epoch", variable=self.keep_best).pack(side=tk.LEFT)
         self._wrap_label(f, 10, 3, self.estimate_text, "Hint.TLabel", pady=(2, 0))
+        self._training_body = f
+        self._training_shell = f.card_shell
+        self._remember_pads(f)
 
     def _build_buttons(self, parent) -> None:
         f = tk.Frame(parent, bg=APP_BG, bd=0, highlightthickness=0)
-        f.pack(fill=tk.X, pady=(2, 0))
+        f.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        self._button_bar = f
         self.start_btn = ttk.Button(f, text="Start fine-tuning", style="Accent.TButton", cursor="hand2",
                                     command=self._start)
         self.start_btn.pack(side=tk.LEFT)
@@ -594,7 +886,7 @@ class FinetuneGUI:
         tk.Label(legend, text=" Training average", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side=tk.LEFT)
         tk.Label(legend, text="    ●", bg=CARD, fg=WARN, font=("Segoe UI", 9)).pack(side=tk.LEFT)
         tk.Label(legend, text=" Validation", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        self.chart = tk.Canvas(chart_body, bg=FIELD, highlightthickness=0, height=self._px(150), bd=0)
+        self.chart = tk.Canvas(chart_body, bg=FIELD, highlightthickness=0, height=self._px(48), bd=0)
         self.chart.pack(fill=tk.BOTH, expand=True)
         self.chart.bind("<Configure>", lambda _e: self._draw_chart())
 
