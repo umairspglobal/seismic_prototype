@@ -62,17 +62,31 @@ PROMPTS = ["fault", "seismic facies", "channel", "salt body", "horizon"]
 
 LOG_RE = re.compile(r"^(\d\d:\d\d:\d\d) \| (\w+)\s*\| (.*)$")
 
-BG = "#1e1f22"
-FG = "#d4d4d4"
+# Same palette as the seismic viewer, so this window feels like part of the app.
+APP_BG = "#101418"
+CARD = "#171c22"
+FIELD = "#0f1317"
+BORDER = "#2c343d"
+FG = "#e6e9ec"
+MUTED = "#8a949e"
+LABEL = "#b8c0c8"
+ACCENT = "#2563eb"
+ACCENT_HOVER = "#3b82f6"
+OK = "#19c37d"
+WARN = "#f0b429"
+ERR = "#ef5350"
+CONSOLE_BG = "#0c1014"
+DISABLED = "#6b7683"
+
 COLORS = {
-    "time": "#6b7280",
-    "INFO": FG,
-    "WARNING": "#f0b45a",
-    "ERROR": "#ff6b6b",
-    "metric": "#7ee787",
-    "banner": "#79c0ff",
-    "other": "#9ca3af",
-    "gui": "#c4a7ff",
+    "time": "#6b7683",
+    "INFO": "#d5dbe1",
+    "WARNING": WARN,
+    "ERROR": ERR,
+    "metric": OK,
+    "banner": "#93c5fd",
+    "other": MUTED,
+    "gui": "#93c5fd",
 }
 
 
@@ -114,17 +128,22 @@ class FinetuneGUI:
         self.run_started = 0.0
 
         root.title("SAM 3 Quick Fine-Tuner")
+        root.configure(bg=APP_BG)
         scale = root.winfo_fpixels("1i") / 96.0
-        width = min(int(1460 * scale), int(root.winfo_screenwidth() * 0.95))
-        height = min(int(900 * scale), int(root.winfo_screenheight() * 0.9))
-        root.geometry(f"{width}x{height}+{(root.winfo_screenwidth() - width) // 2}+{int(20 * scale)}")
-        root.minsize(int(1100 * scale), int(680 * scale))
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+        # Wide enough that the status column is a real panel, not a sliver beside the form.
+        width = min(int(1760 * scale), int(screen_w * 0.94))
+        height = min(int(960 * scale), int(screen_h * 0.92))
+        root.geometry(f"{width}x{height}+{(screen_w - width) // 2}+{int(20 * scale)}")
+        root.minsize(min(int(1280 * scale), int(screen_w * 0.92)), min(int(760 * scale), int(screen_h * 0.85)))
         self._build_vars()
         self._build_ui()
         self._load_settings()
         self._refresh_counts()
         self._update_estimate()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root.after(50, lambda: self._apply_dark_titlebar(root))
         root.after(100, self._drain_events)
         self._gui_log("Ready. Pick a preset, check the folders and press Start.")
 
@@ -174,27 +193,230 @@ class FinetuneGUI:
 
     # --- Layout --------------------------------------------------------------
 
-    def _build_ui(self) -> None:
+    def _apply_theme(self) -> None:
+        """Flat dark theme. Controls stay in the same rows; only the chrome changes."""
+        import tkinter.font as tkfont
+
+        for name, family, size in (
+            ("TkDefaultFont", "Segoe UI", 10),
+            ("TkTextFont", "Segoe UI", 10),
+            ("TkHeadingFont", "Segoe UI", 11),
+            ("TkFixedFont", "Consolas", 10),
+        ):
+            try:
+                tkfont.nametofont(name).configure(family=family, size=size)
+            except tk.TclError:
+                pass
+
+        self.root.option_add("*TCombobox*Listbox.background", FIELD)
+        self.root.option_add("*TCombobox*Listbox.foreground", FG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.root.option_add("*TCombobox*Listbox.font", "{Segoe UI} 10")
+
         style = ttk.Style(self.root)
-        style.configure("Stage.TLabel", font=("Segoe UI", 13, "bold"))
-        style.configure("Big.TButton", font=("Segoe UI", 10, "bold"), padding=(14, 6))
-        style.configure("Hint.TLabel", foreground="#555")
-        style.configure("Warn.TLabel", foreground="#b45309")
-        style.configure("Metric.TLabel", font=("Consolas", 11))
+        style.theme_use("clam")
+        style.configure(".", background=CARD, foreground=FG, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER, troughcolor=FIELD,
+                        font=("Segoe UI", 10), focuscolor=ACCENT)
+        style.configure("TFrame", background=APP_BG)
+        style.configure("App.TFrame", background=APP_BG)
+        style.configure("Card.TFrame", background=CARD)
+        style.configure("TLabel", background=CARD, foreground=FG, font=("Segoe UI", 10))
+        style.configure("Field.TLabel", background=CARD, foreground=LABEL, font=("Segoe UI", 10))
+        style.configure("Card.TLabel", background=CARD, foreground=FG, font=("Segoe UI", 10))
+        style.configure("Hint.TLabel", background=CARD, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("Warn.TLabel", background=CARD, foreground=WARN, font=("Segoe UI", 9))
+        style.configure("Stage.TLabel", background=CARD, foreground=MUTED, font=("Segoe UI", 14, "bold"))
+        style.configure("TPanedwindow", background=APP_BG, borderwidth=0)
+        style.configure("TEntry", fieldbackground=FIELD, foreground=FG, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER, insertcolor=FG, padding=(8, 5))
+        style.map("TEntry",
+                  bordercolor=[("focus", ACCENT)],
+                  lightcolor=[("focus", ACCENT)],
+                  darkcolor=[("focus", ACCENT)])
+        style.configure("TCombobox", fieldbackground=FIELD, background=FIELD, foreground=FG,
+                        arrowcolor=LABEL, bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                        insertcolor=FG, padding=(8, 5), arrowsize=14)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", FIELD), ("disabled", "#12171c")],
+                  foreground=[("readonly", FG), ("disabled", DISABLED)],
+                  background=[("readonly", FIELD), ("active", "#1c242c"), ("disabled", "#12171c")],
+                  arrowcolor=[("disabled", "#4b5563"), ("active", FG)],
+                  bordercolor=[("focus", ACCENT)],
+                  lightcolor=[("focus", ACCENT)],
+                  darkcolor=[("focus", ACCENT)])
+        style.configure("TSpinbox", fieldbackground=FIELD, background=FIELD, foreground=FG,
+                        arrowcolor=LABEL, bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                        insertcolor=FG, padding=(6, 4), arrowsize=12)
+        style.map("TSpinbox",
+                  fieldbackground=[("disabled", "#12171c")],
+                  foreground=[("disabled", DISABLED)],
+                  background=[("disabled", "#12171c")],
+                  arrowcolor=[("disabled", "#4b5563")],
+                  bordercolor=[("focus", ACCENT)],
+                  lightcolor=[("focus", ACCENT)],
+                  darkcolor=[("focus", ACCENT)])
+        style.configure("TCheckbutton", background=CARD, foreground=LABEL, font=("Segoe UI", 10),
+                        indicatorcolor=FIELD, focuscolor=CARD)
+        style.map("TCheckbutton",
+                  background=[("active", CARD), ("disabled", CARD)],
+                  foreground=[("disabled", DISABLED), ("active", FG)],
+                  indicatorcolor=[("selected", ACCENT), ("pressed", ACCENT), ("!selected", FIELD)])
+        flat_button = [
+            ("Button.border", {"sticky": "nswe", "children": [
+                ("Button.padding", {"sticky": "nswe", "children": [
+                    ("Button.label", {"sticky": "nswe"}),
+                ]}),
+            ]}),
+        ]
+        style.layout("TButton", flat_button)
+        style.configure("TButton", background="#1c242c", foreground=FG, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER, padding=(12, 7), font=("Segoe UI", 10),
+                        focusthickness=0, focuscolor=ACCENT, relief="flat")
+        style.map("TButton",
+                  background=[("pressed", FIELD), ("active", "#24303c"), ("disabled", CARD)],
+                  foreground=[("disabled", DISABLED)],
+                  bordercolor=[("disabled", "#232b33"), ("active", "#3a4652")],
+                  lightcolor=[("disabled", "#232b33"), ("active", "#3a4652")],
+                  darkcolor=[("disabled", "#232b33"), ("active", "#3a4652")])
+        for name, bg, hover, fg, font in (
+            ("Accent.TButton", ACCENT, ACCENT_HOVER, "#ffffff", ("Segoe UI", 10, "bold")),
+            ("Warn.TButton", "#3a2e14", "#4a3b1a", WARN, ("Segoe UI", 10)),
+            ("Danger.TButton", "#3f1d1d", "#5c2424", "#ffb4b4", ("Segoe UI", 10)),
+        ):
+            style.configure(name, background=bg, foreground=fg, bordercolor=bg, lightcolor=bg,
+                            darkcolor=bg, padding=(14, 8), font=font, focusthickness=0, relief="flat")
+            style.map(name,
+                      background=[("pressed", bg), ("active", hover), ("disabled", "#24303f")],
+                      foreground=[("disabled", DISABLED)],
+                      bordercolor=[("disabled", "#24303f"), ("active", hover)],
+                      lightcolor=[("disabled", "#24303f"), ("active", hover)],
+                      darkcolor=[("disabled", "#24303f"), ("active", hover)])
+        style.configure("Tool.TButton", background=FIELD, foreground=LABEL, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER, padding=(10, 4), font=("Segoe UI", 9),
+                        focusthickness=0, relief="flat")
+        style.map("Tool.TButton",
+                  background=[("pressed", "#0c1014"), ("active", "#1c242c"), ("disabled", CARD)],
+                  foreground=[("disabled", DISABLED), ("active", FG)],
+                  bordercolor=[("active", "#3a4652"), ("disabled", "#232b33")],
+                  lightcolor=[("active", "#3a4652"), ("disabled", "#232b33")],
+                  darkcolor=[("active", "#3a4652"), ("disabled", "#232b33")])
+        style.layout("Horizontal.TProgressbar", [
+            ("Horizontal.Progressbar.trough", {"sticky": "nswe", "children": [
+                ("Horizontal.Progressbar.pbar", {"side": "left", "sticky": "ns"}),
+            ]}),
+        ])
+        style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor="#232b33",
+                        bordercolor="#232b33", lightcolor=ACCENT, darkcolor=ACCENT, thickness=8)
+        style.layout("Vertical.TScrollbar", [
+            ("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"}),
+            ]}),
+        ])
+        style.configure("Vertical.TScrollbar", background="#2a333c", troughcolor=CONSOLE_BG,
+                        bordercolor=CONSOLE_BG, lightcolor="#2a333c", darkcolor="#2a333c",
+                        arrowsize=0, width=10)
+        style.map("Vertical.TScrollbar", background=[("active", "#3a4652"), ("pressed", "#4b5a68")])
+
+    def _apply_dark_titlebar(self, window: tk.Misc) -> None:
+        """Match the Windows caption to the window so the chrome is not a light strip."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            window.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
+
+            def bgr(hex_color: str) -> int:
+                raw = hex_color.lstrip("#")
+                red, green, blue = int(raw[0:2], 16), int(raw[2:4], 16), int(raw[4:6], 16)
+                return red | (green << 8) | (blue << 16)
+
+            def set_attr(attr: int, value: int) -> None:
+                data = ctypes.c_int(value)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(data), ctypes.sizeof(data))
+
+            set_attr(20, 1)
+            set_attr(34, bgr(BORDER))
+            set_attr(35, bgr(APP_BG))
+            set_attr(36, bgr(FG))
+        except (AttributeError, OSError, tk.TclError, ValueError):
+            pass
+
+    def _section(self, parent, title: str, *, expand: bool = False, fill_pane: bool = False):
+        """Card with a title. Returns the body (for fields) and the header (for side actions)."""
+        shell = tk.Frame(parent, bg=BORDER, bd=0, highlightthickness=0)
+        if fill_pane:
+            shell.pack(fill=tk.BOTH, expand=True)
+        else:
+            shell.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=(0, 10))
+        card = tk.Frame(shell, bg=CARD, bd=0, highlightthickness=0)
+        card.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        accent = tk.Frame(card, bg=ACCENT, height=2, bd=0, highlightthickness=0)
+        accent.pack(fill=tk.X)
+        accent.pack_propagate(False)
+        header = tk.Frame(card, bg=CARD, bd=0, highlightthickness=0)
+        header.pack(fill=tk.X, padx=14, pady=(10, 0))
+        tk.Label(header, text=title, bg=CARD, fg=FG, font=("Segoe UI", 11, "bold")).pack(side=tk.LEFT)
+        body = ttk.Frame(card, style="Card.TFrame", padding=(14, 8, 14, 12))
+        body.pack(fill=tk.BOTH, expand=True)
+        return body, header
+
+    def _wrap_label(self, parent, row, columnspan, textvariable, style, pady=(2, 0)):
+        """A label that wraps to the card width without stretching the card."""
+        holder = tk.Frame(parent, bg=CARD, bd=0, highlightthickness=0, height=18)
+        holder.grid(row=row, column=0, columnspan=columnspan, sticky="ew", pady=pady)
+        holder.grid_propagate(False)
+        label = ttk.Label(holder, textvariable=textvariable, style=style, anchor="nw", justify=tk.LEFT,
+                          wraplength=200)
+        label.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+
+        def fit(_event=None, target=label, box=holder):
+            width = max(40, box.winfo_width() - 2)
+            if int(target.cget("wraplength")) != width:
+                target.configure(wraplength=width)
+            needed = max(target.winfo_reqheight(), 16)
+            if int(box.cget("height")) != needed:
+                box.configure(height=needed)
+
+        holder.bind("<Configure>", fit)
+        textvariable.trace_add("write", lambda *_a: holder.after_idle(fit))
+        return label
+
+    def _build_ui(self) -> None:
+        self._apply_theme()
+
+        header = tk.Frame(self.root, bg=APP_BG, bd=0, highlightthickness=0)
+        header.pack(fill=tk.X, padx=16, pady=(14, 10))
+        tk.Label(header, text="SAM 3 Quick Fine-Tuner", bg=APP_BG, fg=FG,
+                 font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        tk.Label(
+            header,
+            text="Pick a preset, check the folders, name the model, then start.",
+            bg=APP_BG, fg=MUTED, font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(2, 0))
 
         panes = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
-        panes.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        panes.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 14))
         self._panes = panes
 
-        top = ttk.Frame(panes)
+        top = tk.Frame(panes, bg=APP_BG, bd=0, highlightthickness=0)
         panes.add(top, weight=0)
         self._top = top
-        col_a = ttk.Frame(top)
-        col_a.pack(side=tk.LEFT, fill=tk.Y)
-        col_b = ttk.Frame(top)
-        col_b.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 0))
-        col_c = ttk.Frame(top)
-        col_c.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        # Requested control widths stay modest so a narrow window can still
+        # give the status panel room; the grid then stretches fields to fit.
+        top.columnconfigure(0, weight=3, minsize=self._px(430))
+        top.columnconfigure(1, weight=3, minsize=self._px(470))
+        top.columnconfigure(2, weight=2, minsize=self._px(320))
+        top.rowconfigure(0, weight=1)
+        col_a = tk.Frame(top, bg=APP_BG, bd=0, highlightthickness=0)
+        col_b = tk.Frame(top, bg=APP_BG, bd=0, highlightthickness=0)
+        col_c = tk.Frame(top, bg=APP_BG, bd=0, highlightthickness=0)
+        col_a.grid(row=0, column=0, sticky="nsew")
+        col_b.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        col_c.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
 
         self._build_data_frame(col_a)
         self._build_output_frame(col_a)
@@ -204,10 +426,10 @@ class FinetuneGUI:
 
         bottom = ttk.PanedWindow(panes, orient=tk.HORIZONTAL)
         panes.add(bottom, weight=1)
-        console_frame = ttk.Frame(bottom)
+        console_frame = tk.Frame(bottom, bg=APP_BG, bd=0, highlightthickness=0)
         bottom.add(console_frame, weight=3)
         self._build_console(console_frame)
-        preview_frame = ttk.LabelFrame(bottom, text=" Validation preview (double-click to open) ")
+        preview_frame = tk.Frame(bottom, bg=APP_BG, bd=0, highlightthickness=0)
         bottom.add(preview_frame, weight=1)
         self._build_preview(preview_frame)
         self.root.after(80, self._place_sash)
@@ -222,32 +444,51 @@ class FinetuneGUI:
         height = self._panes.winfo_height()
         want = self._top.winfo_reqheight() + self._px(8)
         if height > self._px(200):
-            self._panes.sashpos(0, min(want, int(height * 0.68)))
+            # Keep the whole form on screen, and still leave a usable log strip.
+            log_min = self._px(160)
+            self._panes.sashpos(0, min(want, max(self._px(240), height - log_min)))
         for entry in getattr(self, "_path_entries", ()):
             entry.xview_moveto(1.0)
 
     def _path_entry(self, parent, var: tk.StringVar) -> ttk.Entry:
         """Entry that keeps the end of a long path (the folder name) in view."""
-        entry = ttk.Entry(parent, textvariable=var, width=36)
+        entry = ttk.Entry(parent, textvariable=var)
         self._path_entries = getattr(self, "_path_entries", [])
         self._path_entries.append(entry)
-        var.trace_add("write", lambda *_e, widget=entry: widget.after_idle(lambda: widget.xview_moveto(1.0)))
+
+        def show_end(widget=entry):
+            if widget.focus_get() is not widget:
+                widget.xview_moveto(1.0)
+
+        var.trace_add("write", lambda *_e: entry.after_idle(show_end))
+        entry.bind("<Configure>", lambda _e: entry.after_idle(show_end))
         entry.bind("<FocusOut>", lambda _e: entry.xview_moveto(1.0))
         return entry
 
-    def _row(self, parent, r: int, label: str, widget, browse=None, hint: str | None = None) -> None:
-        ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=(6, 6), pady=2)
-        widget.grid(row=r, column=1, sticky="ew", pady=2)
+    def _row(self, parent, r: int, label: str, widget, browse=None) -> None:
+        ttk.Label(parent, text=label, style="Field.TLabel").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=3)
         if browse:
-            ttk.Button(parent, text="Browse...", width=9, command=browse).grid(row=r, column=2, padx=(4, 6))
+            widget.grid(row=r, column=1, sticky="ew", pady=3, padx=(0, 8))
+            ttk.Button(parent, text="Browse...", width=9, style="Tool.TButton", cursor="hand2",
+                       command=browse).grid(row=r, column=2, pady=3)
+            return
+        widget.grid(row=r, column=1, columnspan=2, sticky="ew", pady=3)
+
+    def _spin_row(self, parent, r, label, variable, *, from_, to, increment=1, width=10, hint=None):
+        """Number field kept next to its label. Created inside the row so it is not covered."""
+        ttk.Label(parent, text=label, style="Field.TLabel").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=3)
+        box = ttk.Frame(parent, style="Card.TFrame")
+        box.grid(row=r, column=1, columnspan=2, sticky="w", pady=3)
+        spin = ttk.Spinbox(box, from_=from_, to=to, increment=increment, textvariable=variable, width=width)
+        spin.pack(side=tk.LEFT)
         if hint:
-            ttk.Label(parent, text=hint, style="Hint.TLabel").grid(row=r, column=2, sticky="w", padx=(6, 6))
+            ttk.Label(box, text=hint, style="Hint.TLabel").pack(side=tk.LEFT, padx=(8, 0))
+        return spin
 
     def _build_data_frame(self, parent) -> None:
-        f = ttk.LabelFrame(parent, text=" 1. Data ")
-        f.pack(fill=tk.X, pady=(0, 6))
+        f, _header = self._section(parent, "1. Data")
         f.columnconfigure(1, weight=1)
-        preset = ttk.Combobox(f, textvariable=self.preset, values=list(PRESETS), state="readonly", width=44)
+        preset = ttk.Combobox(f, textvariable=self.preset, values=list(PRESETS), state="readonly")
         preset.bind("<<ComboboxSelected>>", lambda _e: self._apply_preset())
         self._row(f, 0, "Preset", preset)
         self._row(f, 1, "Data folder", self._path_entry(f, self.data_root),
@@ -259,17 +500,19 @@ class FinetuneGUI:
         self._row(f, 4, "Label type",
                   ttk.Combobox(f, textvariable=self.label_mode, values=list(LABEL_MODES), state="readonly"))
         self.layers_spin = ttk.Spinbox(f, from_=2, to=40, textvariable=self.num_layers, width=6)
-        ttk.Label(f, text="Layers per section").grid(row=5, column=0, sticky="w", padx=6, pady=2)
-        self.layers_spin.grid(row=5, column=1, sticky="w", pady=2)
+        ttk.Label(f, text="Layers per section", style="Field.TLabel").grid(
+            row=5, column=0, sticky="w", padx=(0, 10), pady=3)
+        self.layers_spin.grid(row=5, column=1, sticky="w", pady=3)
         self._row(f, 6, "Text prompt", ttk.Combobox(f, textvariable=self.prompt, values=PROMPTS))
-        info = ttk.Frame(f)
-        info.grid(row=7, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 4))
-        ttk.Label(info, textvariable=self.count_text, style="Hint.TLabel").pack(side=tk.LEFT)
-        ttk.Button(info, text="Preview data", command=self._preview_data).pack(side=tk.RIGHT)
+        info = ttk.Frame(f, style="Card.TFrame")
+        info.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self.count_label = ttk.Label(info, textvariable=self.count_text, style="Hint.TLabel")
+        self.count_label.pack(side=tk.LEFT)
+        ttk.Button(info, text="Preview data", style="Tool.TButton", cursor="hand2",
+                   command=self._preview_data).pack(side=tk.RIGHT)
 
     def _build_output_frame(self, parent) -> None:
-        f = ttk.LabelFrame(parent, text=" 2. Output model ")
-        f.pack(fill=tk.X, pady=6)
+        f, _header = self._section(parent, "2. Output model")
         f.columnconfigure(1, weight=1)
         self._row(f, 0, "Model name", ttk.Entry(f, textvariable=self.model_name))
         self._row(f, 1, "Save in folder", self._path_entry(f, self.output_root),
@@ -277,94 +520,112 @@ class FinetuneGUI:
         base = ttk.Combobox(f, textvariable=self.base_model, values=self._base_choices())
         base.bind("<Button-1>", lambda _e: base.configure(values=self._base_choices()))
         self._row(f, 2, "Start from", base, browse=lambda: self._browse_dir(self.base_model))
-        self.target_label = ttk.Label(f, textvariable=self.target_text, style="Hint.TLabel",
-                                      wraplength=self._px(460))
-        self.target_label.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(2, 4))
+        self.target_label = self._wrap_label(f, 3, 3, self.target_text, "Hint.TLabel", pady=(4, 0))
 
     def _build_training_frame(self, parent) -> None:
-        f = ttk.LabelFrame(parent, text=" 3. Training settings ")
-        f.pack(fill=tk.X, pady=6)
+        f, _header = self._section(parent, "3. Training settings")
         f.columnconfigure(1, weight=1)
-        self._row(f, 0, "Sections to use", ttk.Spinbox(f, from_=50, to=100000, increment=500,
-                                                        textvariable=self.max_samples, width=10),
-                  hint="0 = all")
-        self._row(f, 1, "Validation %", ttk.Spinbox(f, from_=2, to=40, textvariable=self.val_percent, width=10))
-        self._row(f, 2, "Epochs", ttk.Spinbox(f, from_=1, to=200, textvariable=self.epochs, width=10))
-        self._row(f, 3, "Batch size", ttk.Spinbox(f, from_=1, to=8, textvariable=self.batch_size, width=10),
-                  hint="2 = ~4.5 GB VRAM")
+        self._spin_row(f, 0, "Sections to use", self.max_samples, from_=50, to=100000, increment=500,
+                       hint="0 = all")
+        self._spin_row(f, 1, "Validation %", self.val_percent, from_=2, to=40)
+        self._spin_row(f, 2, "Epochs", self.epochs, from_=1, to=200)
+        self._spin_row(f, 3, "Batch size", self.batch_size, from_=1, to=8, hint="2 = ~4.5 GB VRAM")
         self._row(f, 4, "Input layout",
-                  ttk.Combobox(f, textvariable=self.mosaic, values=list(MOSAICS), state="readonly", width=42))
+                  ttk.Combobox(f, textvariable=self.mosaic, values=list(MOSAICS), state="readonly"))
         self._row(f, 5, "Learning rate", ttk.Entry(f, textvariable=self.lr, width=12))
         self._row(f, 6, "What to train",
-                  ttk.Combobox(f, textvariable=self.scope, values=list(SCOPES), state="readonly", width=42))
-        self._row(f, 7, "Unfreeze ViT blocks", ttk.Spinbox(f, from_=0, to=32, textvariable=self.vit_blocks, width=10),
-                  hint="last N of 32; slower")
+                  ttk.Combobox(f, textvariable=self.scope, values=list(SCOPES), state="readonly"))
+        self._spin_row(f, 7, "Unfreeze ViT blocks", self.vit_blocks, from_=0, to=32,
+                       hint="last N of 32; slower")
         self._row(f, 8, "Device", ttk.Combobox(f, textvariable=self.device, values=["cuda", "cpu"],
                                                state="readonly", width=10))
-        checks = ttk.Frame(f)
-        checks.grid(row=9, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 2))
-        ttk.Checkbutton(checks, text="Score base model first", variable=self.eval_base).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(checks, text="Flip augmentation", variable=self.hflip).pack(side=tk.LEFT, padx=8)
-        ttk.Checkbutton(checks, text="Keep best epoch", variable=self.keep_best).pack(side=tk.LEFT, padx=2)
-        ttk.Label(f, textvariable=self.estimate_text, style="Hint.TLabel", wraplength=self._px(520)).grid(
-            row=10, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
+        checks = ttk.Frame(f, style="Card.TFrame")
+        checks.grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        ttk.Checkbutton(checks, text="Score base model first", variable=self.eval_base).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(checks, text="Flip augmentation", variable=self.hflip).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(checks, text="Keep best epoch", variable=self.keep_best).pack(side=tk.LEFT)
+        self._wrap_label(f, 10, 3, self.estimate_text, "Hint.TLabel", pady=(2, 0))
 
     def _build_buttons(self, parent) -> None:
-        f = ttk.Frame(parent)
-        f.pack(fill=tk.X, pady=(6, 0))
-        self.start_btn = ttk.Button(f, text="Start fine-tuning", style="Big.TButton", command=self._start)
+        f = tk.Frame(parent, bg=APP_BG, bd=0, highlightthickness=0)
+        f.pack(fill=tk.X, pady=(2, 0))
+        self.start_btn = ttk.Button(f, text="Start fine-tuning", style="Accent.TButton", cursor="hand2",
+                                    command=self._start)
         self.start_btn.pack(side=tk.LEFT)
-        self.stop_btn = ttk.Button(f, text="Stop and save", command=self._stop, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=6)
-        ttk.Button(f, text="Open output folder", command=self._open_output).pack(side=tk.RIGHT)
+        self.stop_btn = ttk.Button(f, text="Stop and save", style="TButton", cursor="hand2",
+                                   command=self._stop, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(f, text="Open output folder", style="TButton", cursor="hand2",
+                   command=self._open_output).pack(side=tk.RIGHT)
+
+    def _metric_tile(self, parent, title: str, key: str, row: int, col: int) -> None:
+        tile = tk.Frame(parent, bg=FIELD, highlightthickness=1, highlightbackground=BORDER,
+                        highlightcolor=BORDER, bd=0)
+        tile.grid(row=row, column=col, sticky="nsew", padx=(0, 6), pady=(0, 6))
+        tk.Label(tile, text=title, bg=FIELD, fg=MUTED, font=("Segoe UI", 8), anchor="w").pack(
+            fill=tk.X, padx=6, pady=(5, 0))
+        tk.Label(tile, textvariable=self.metric_text[key], bg=FIELD, fg=FG, anchor="w",
+                 font=("Consolas", 12)).pack(fill=tk.X, padx=6, pady=(0, 5))
 
     def _build_status(self, parent) -> None:
-        f = ttk.LabelFrame(parent, text=" Status ")
-        f.pack(fill=tk.X)
-        ttk.Label(f, textvariable=self.stage_text, style="Stage.TLabel").pack(anchor="w", padx=8, pady=(6, 2))
+        f, _header = self._section(parent, "Status")
+        f.columnconfigure(0, weight=1)
+        self.stage_label = ttk.Label(f, textvariable=self.stage_text, style="Stage.TLabel")
+        self.stage_label.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._set_stage("Idle", "idle")
         self.progress = ttk.Progressbar(f, mode="determinate", maximum=100)
-        self.progress.pack(fill=tk.X, padx=8, pady=2)
-        ttk.Label(f, textvariable=self.progress_text, wraplength=self._px(520)).pack(
-            anchor="w", padx=8, pady=(0, 6))
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(0, 4), ipady=1)
+        self._wrap_label(f, 2, 1, self.progress_text, "Card.TLabel", pady=(0, 8))
 
-        m = ttk.Frame(f)
-        m.pack(fill=tk.X, padx=8, pady=(0, 8))
+        metrics = tk.Frame(f, bg=CARD, bd=0, highlightthickness=0)
+        metrics.grid(row=3, column=0, sticky="ew")
+        for col in range(4):
+            metrics.columnconfigure(col, weight=1, uniform="metric")
         cells = [[("Base IoU", "base"), ("Best IoU", "best"), ("Last IoU", "iou"), ("Val loss", "loss")],
                  [("F1", "f1"), ("Precision", "precision"), ("Recall", "recall")]]
-        for block, row_cells in enumerate(cells):
+        for row, row_cells in enumerate(cells):
             for col, (title, key) in enumerate(row_cells):
-                ttk.Label(m, text=title, style="Hint.TLabel").grid(
-                    row=2 * block, column=col, padx=(0, 22), sticky="w")
-                ttk.Label(m, textvariable=self.metric_text[key], style="Metric.TLabel").grid(
-                    row=2 * block + 1, column=col, padx=(0, 22), sticky="w", pady=(0, 4))
+                self._metric_tile(metrics, title, key, row, col)
 
-        chart_frame = ttk.LabelFrame(parent, text=" Loss  (green = training average, orange = validation) ")
-        chart_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        self.chart = tk.Canvas(chart_frame, bg="white", highlightthickness=0, height=self._px(150))
-        self.chart.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        chart_body, _chart_head = self._section(parent, "Loss", expand=True)
+        legend = tk.Frame(chart_body, bg=CARD, bd=0, highlightthickness=0)
+        legend.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(legend, text="●", bg=CARD, fg=OK, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        tk.Label(legend, text=" Training average", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        tk.Label(legend, text="    ●", bg=CARD, fg=WARN, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        tk.Label(legend, text=" Validation", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        self.chart = tk.Canvas(chart_body, bg=FIELD, highlightthickness=0, height=self._px(150), bd=0)
+        self.chart.pack(fill=tk.BOTH, expand=True)
         self.chart.bind("<Configure>", lambda _e: self._draw_chart())
 
     def _build_preview(self, parent) -> None:
         # A canvas (not a label) so a large preview is scaled to the pane
         # instead of pushing the pane wider and getting clipped.
-        self.preview_canvas = tk.Canvas(parent, bg="#f4f4f4", highlightthickness=0)
-        self.preview_canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        body, header = self._section(parent, "Validation preview", fill_pane=True)
+        tk.Label(header, text="Double-click to open", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(side=tk.RIGHT)
+        self.preview_canvas = tk.Canvas(body, bg=FIELD, highlightthickness=0, bd=0)
+        self.preview_canvas.pack(fill=tk.BOTH, expand=True)
         self.preview_canvas.bind("<Configure>", lambda _e: self._show_preview())
         self.preview_canvas.bind("<Double-Button-1>", lambda _e: self._open_preview())
         self._preview_note = "Appears after the first validation"
 
     def _build_console(self, parent) -> None:
-        bar = ttk.Frame(parent)
-        bar.pack(fill=tk.X, pady=(4, 2))
-        ttk.Label(bar, text="Training output", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
-        ttk.Button(bar, text="Clear", command=self._clear_log).pack(side=tk.RIGHT)
-        ttk.Button(bar, text="Copy all", command=self._copy_log).pack(side=tk.RIGHT, padx=4)
-        ttk.Checkbutton(bar, text="Auto-scroll", variable=self.autoscroll).pack(side=tk.RIGHT, padx=8)
+        body, header = self._section(parent, "Training output", fill_pane=True)
+        ttk.Button(header, text="Clear", style="Tool.TButton", cursor="hand2",
+                   command=self._clear_log).pack(side=tk.RIGHT)
+        ttk.Button(header, text="Copy all", style="Tool.TButton", cursor="hand2",
+                   command=self._copy_log).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Checkbutton(header, text="Auto-scroll", variable=self.autoscroll).pack(side=tk.RIGHT, padx=(0, 10))
 
-        frame = ttk.Frame(parent)
+        frame = tk.Frame(body, bg=CONSOLE_BG, bd=0, highlightthickness=1, highlightbackground=BORDER,
+                         highlightcolor=BORDER)
         frame.pack(fill=tk.BOTH, expand=True)
-        self.console = tk.Text(frame, bg=BG, fg=FG, insertbackground=FG, font=("Consolas", 10),
-                               wrap=tk.WORD, relief=tk.FLAT, padx=8, pady=6, state=tk.DISABLED)
+        self.console = tk.Text(
+            frame, bg=CONSOLE_BG, fg=FG, insertbackground=FG, font=("Consolas", 10),
+            wrap=tk.WORD, relief=tk.FLAT, bd=0, padx=10, pady=8, state=tk.DISABLED,
+            selectbackground=ACCENT, selectforeground="#ffffff", insertwidth=1,
+        )
         scroll = ttk.Scrollbar(frame, command=self.console.yview)
         self.console.configure(yscrollcommand=scroll.set)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -372,6 +633,13 @@ class FinetuneGUI:
         for tag, color in COLORS.items():
             self.console.tag_configure(tag, foreground=color)
         self.console.tag_configure("bold", font=("Consolas", 10, "bold"))
+
+    def _set_stage(self, text: str, tone: str = "idle") -> None:
+        self.stage_text.set(text)
+        color = {"idle": MUTED, "run": "#93c5fd", "ok": OK, "warn": WARN, "err": ERR}.get(tone, FG)
+        label = getattr(self, "stage_label", None)
+        if label is not None:
+            label.configure(foreground=color)
 
     # --- Form helpers --------------------------------------------------------
 
@@ -424,6 +692,8 @@ class FinetuneGUI:
             except OSError as exc:
                 self.pair_count = 0
                 self.count_text.set(f"Cannot read folders: {exc}")
+        if getattr(self, "count_label", None) is not None:
+            self.count_label.configure(foreground=OK if self.pair_count else WARN)
         self._update_estimate()
 
     def _update_target(self) -> None:
@@ -497,11 +767,16 @@ class FinetuneGUI:
         grid = grid.resize((grid.width * scale, grid.height * scale), Image.NEAREST)
         win = tk.Toplevel(self.root)
         win.title(f"Data preview - files {', '.join(stems)}  (label in blue)")
+        win.configure(bg=APP_BG)
+        self._apply_dark_titlebar(win)
         photo = ImageTk.PhotoImage(grid)
-        lbl = ttk.Label(win, image=photo)
+        lbl = tk.Label(win, image=photo, bg=APP_BG, bd=0)
         lbl.image = photo
-        lbl.pack(padx=6, pady=6)
-        ttk.Label(win, text=f"Foreground covers {100 * sec.positive_fraction:.1f}% of these sections").pack(pady=(0, 6))
+        lbl.pack(padx=16, pady=(16, 8))
+        tk.Label(
+            win, text=f"Foreground covers {100 * sec.positive_fraction:.1f}% of these sections",
+            bg=APP_BG, fg=MUTED, font=("Segoe UI", 10),
+        ).pack(pady=(0, 14))
 
     # --- Run control ---------------------------------------------------------
 
@@ -596,8 +871,8 @@ class FinetuneGUI:
         self.run_started = time.time()
         self.stop_sent = False
         self.start_btn.configure(state=tk.DISABLED)
-        self.stop_btn.configure(state=tk.NORMAL, text="Stop and save")
-        self.stage_text.set("Starting...")
+        self.stop_btn.configure(state=tk.NORMAL, text="Stop and save", style="Warn.TButton")
+        self._set_stage("Starting...", "run")
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
 
     def _reader(self, proc: subprocess.Popen) -> None:
@@ -616,8 +891,8 @@ class FinetuneGUI:
             if self.stop_file:
                 self.stop_file.write_text("stop", encoding="utf-8")
             self._gui_log("Stop requested: the current step finishes, then the model is validated and saved.")
-            self.stage_text.set("Stopping - validating and saving...")
-            self.stop_btn.configure(text="Force kill")
+            self._set_stage("Stopping - validating and saving...", "warn")
+            self.stop_btn.configure(text="Force kill", style="Danger.TButton")
         elif messagebox.askyesno("Force kill?", "Kill training now? Nothing will be saved.", parent=self.root):
             self.proc.kill()
             self._gui_log("Training process killed.", tag="ERROR")
@@ -674,7 +949,7 @@ class FinetuneGUI:
     def _handle_event(self, ev: dict) -> None:
         kind = ev.get("type")
         if kind == "stage":
-            self.stage_text.set(ev.get("message", ""))
+            self._set_stage(ev.get("message", ""), "run")
             if ev.get("stage") in ("model", "validate", "save", "setup"):
                 self.progress.configure(mode="indeterminate")
                 self.progress.start(15)
@@ -691,7 +966,7 @@ class FinetuneGUI:
             self.total_steps = ev["total"]
             self.last_step = ev["step"]
             self.progress["value"] = 100 * ev["step"] / max(1, ev["total"])
-            self.stage_text.set(f"Training - epoch {ev['epoch']} of {ev['epochs']}")
+            self._set_stage(f"Training - epoch {ev['epoch']} of {ev['epochs']}", "run")
             self.progress_text.set(
                 f"Step {ev['step']:,} / {ev['total']:,}     loss {ev['avg_loss']:.4f}     "
                 f"{ev['sec_per_step']:.2f} s/step\n"
@@ -720,12 +995,12 @@ class FinetuneGUI:
             if ev.get("saved"):
                 base = ev.get("base_iou")
                 change = f"IoU {base:.3f} -> {ev['iou']:.3f}" if base is not None else f"IoU {ev['iou']:.3f}"
-                self.stage_text.set(f"Done - {change}")
+                self._set_stage(f"Done - {change}", "ok")
                 self.progress_text.set(f"Saved to {ev['output']}")
             else:
-                self.stage_text.set("Stopped - nothing saved")
+                self._set_stage("Stopped - nothing saved", "warn")
         elif kind == "error":
-            self.stage_text.set("Failed - see the log below")
+            self._set_stage("Failed - see the log below", "err")
 
     def _finished(self, code: int) -> None:
         self.progress.stop()
@@ -736,13 +1011,13 @@ class FinetuneGUI:
             self._gui_log(f"Training process finished after {elapsed}.")
         else:
             if not self.stage_text.get().startswith("Failed"):
-                self.stage_text.set(f"Failed (exit code {code}) - see the log below")
+                self._set_stage(f"Failed (exit code {code}) - see the log below", "err")
             self._gui_log(f"Training process exited with code {code} after {elapsed}.", tag="ERROR")
         self.proc = None
         if self.stop_file:
             self.stop_file.unlink(missing_ok=True)
         self.start_btn.configure(state=tk.NORMAL)
-        self.stop_btn.configure(state=tk.DISABLED, text="Stop and save")
+        self.stop_btn.configure(state=tk.DISABLED, text="Stop and save", style="TButton")
         self._update_target()
 
     def _reset_status(self) -> None:
@@ -773,7 +1048,8 @@ class FinetuneGUI:
         axis_font = self._point_font(13)
         pts = self.loss_points + self.val_points
         if not pts:
-            c.create_text(w / 2, h / 2, text="Waiting for training steps", fill="#999")
+            c.create_text(w / 2, h / 2, text="Waiting for training steps", fill=MUTED,
+                          font=self._point_font(13))
             return
         ys = [p[1] for p in pts]
         lo, hi = min(ys), max(ys)
@@ -786,22 +1062,22 @@ class FinetuneGUI:
             y = pad_t + (h - pad_t - pad_b) * (1 - (val - lo) / (hi - lo))
             return x, y
 
-        c.create_rectangle(pad_l, pad_t, w - pad_r, h - pad_b, outline="#ddd")
+        c.create_rectangle(pad_l, pad_t, w - pad_r, h - pad_b, outline=BORDER)
         for frac in (0, 0.5, 1):
             val = lo + (hi - lo) * frac
             _, y = xy(0, val)
-            c.create_line(pad_l, y, w - pad_r, y, fill="#eee")
-            c.create_text(pad_l - self._px(6), y, text=f"{val:.2f}", anchor="e", fill="#666", font=axis_font)
-        c.create_text(w - pad_r, h - self._px(4), text=f"step {span_x}", anchor="se", fill="#666", font=axis_font)
-        c.create_text(pad_l, h - self._px(4), text="0", anchor="sw", fill="#666", font=axis_font)
+            c.create_line(pad_l, y, w - pad_r, y, fill="#1e262e")
+            c.create_text(pad_l - self._px(6), y, text=f"{val:.2f}", anchor="e", fill=MUTED, font=axis_font)
+        c.create_text(w - pad_r, h - self._px(4), text=f"step {span_x}", anchor="se", fill=MUTED, font=axis_font)
+        c.create_text(pad_l, h - self._px(4), text="0", anchor="sw", fill=MUTED, font=axis_font)
         if len(self.loss_points) > 1:
             stride = max(1, len(self.loss_points) // 600)
             coords = [v for p in self.loss_points[::stride] for v in xy(*p)]
-            c.create_line(*coords, fill="#16a34a", width=2)
+            c.create_line(*coords, fill=OK, width=2)
         for step, val in self.val_points:
             x, y = xy(step, val)
             r = self._px(4)
-            c.create_oval(x - r, y - r, x + r, y + r, fill="#f97316", outline="")
+            c.create_oval(x - r, y - r, x + r, y + r, fill=WARN, outline="")
 
     def _point_font(self, pixels: int, family: str = "Segoe UI") -> tuple[str, int]:
         """A Tk font whose on-screen size stays near ``pixels`` at any DPI."""
@@ -816,7 +1092,7 @@ class FinetuneGUI:
         canvas.delete("all")
         if w < 20 or h < 20 or not self.preview_path or not Path(self.preview_path).exists():
             canvas.create_text(
-                max(w, 20) / 2, max(h, 20) / 2, text=self._preview_note, fill="#888",
+                max(w, 20) / 2, max(h, 20) / 2, text=self._preview_note, fill=MUTED,
                 font=self._point_font(14),
             )
             return
