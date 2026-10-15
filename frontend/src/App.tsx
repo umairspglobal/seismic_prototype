@@ -688,7 +688,7 @@ export default function App() {
         setAutoCheckpoint(result.checkpoint);
         if (result.unloaded_tracker) {
           setStatus(
-            "Facies detector needed the GPU, so the click tracker was unloaded. Re-select a tracker model to reload it.",
+            "The text detector needed the GPU, so the click tracker was unloaded. Re-select a tracker model to reload it.",
           );
         }
       })
@@ -1037,6 +1037,9 @@ export default function App() {
     textCheckpoint ?? runtime?.text_checkpoint ?? null,
     textCheckpointOptions,
   );
+  const detectPrompt =
+    textCheckpointOptions.find((item) => item.path === selectedTextCheckpoint)?.prompt ||
+    "seismic facies";
   const loadMessage = runtime?.load_error && !pointReady
     ? runtime.load_error
     : (runtime?.load_stage as string | undefined) ?? "Connecting to inference server...";
@@ -1086,9 +1089,9 @@ export default function App() {
                 ))}
               </select>
               <p className="hint">
-                Folders in <code>finetuned_checkpoints/</code> appear here after
-                you convert a training run. Detect uses this checkpoint; point
-                clicks still use the official SAM 3 tracker.
+                Folders saved by the fine-tune window show up here. Detect runs
+                that model&apos;s prompt ({detectPrompt}); point clicks still use
+                the official SAM 3 tracker.
               </p>
             </label>
 
@@ -1098,9 +1101,9 @@ export default function App() {
                 className="primary"
                 onClick={handleAutoDetect}
                 disabled={!file || autoDetecting}
-                title="Run the seismic facies text-prompt model on this slice"
+                title={`Run the "${detectPrompt}" text prompt on this slice`}
               >
-                {autoDetecting ? "Detecting facies..." : "Detect seismic facies"}
+                {autoDetecting ? `Detecting ${detectPrompt}...` : `Detect ${detectPrompt}`}
               </button>
               {(autoCheckpoint || textCheckpoint) && (
                 <p className="hint">
@@ -1109,7 +1112,7 @@ export default function App() {
               )}
               {autoCoverage !== null && (
                 <p className="hint">
-                  Facies coverage {(100 * autoCoverage).toFixed(1)}%
+                  {detectPrompt} coverage {(100 * autoCoverage).toFixed(1)}%
                 </p>
               )}
               {autoError && <p className="error">{autoError}</p>}

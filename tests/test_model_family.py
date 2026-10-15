@@ -87,6 +87,12 @@ def test_list_text_checkpoints_includes_official_and_converted(monkeypatch, tmp_
     local = [item for item in listed if item["source"] == "local"]
     assert [item["id"] for item in local] == ["run_a"]
     assert local[0]["path"] == str(tmp_path / "run_a")
+    assert local[0]["prompt"] == config.FACIES_PROMPT
+    (tmp_path / "run_a" / "finetune_info.json").write_text('{"prompt": "fault"}', encoding="utf-8")
+    again = config.list_text_checkpoints()
+    fault = next(item for item in again if item["id"] == "run_a")
+    assert fault["prompt"] == "fault"
+    assert config.prompt_for_checkpoint(str(tmp_path / "run_a")) == "fault"
 
 
 def test_set_text_checkpoint_accepts_folder_name(monkeypatch, tmp_path):

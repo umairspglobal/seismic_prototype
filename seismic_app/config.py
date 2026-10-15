@@ -8,6 +8,7 @@ it to the visual concept it was trained/prompted on.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,6 +117,27 @@ def _checkpoint_key(path: str) -> str:
     return raw.lower()
 
 
+def prompt_for_checkpoint(path: str | None = None) -> str:
+    """Text prompt a checkpoint was trained for.
+
+    Quick fine-tunes record it in ``finetune_info.json``. Official SAM 3 and
+    older converted folders keep the app's facies prompt.
+    """
+    raw = text_checkpoint() if path is None else path
+    folder = Path(raw)
+    if not folder.is_dir():
+        folder = FINETUNED_CHECKPOINTS_DIR / raw
+    info = folder / "finetune_info.json"
+    if info.is_file():
+        try:
+            prompt = json.loads(info.read_text(encoding="utf-8")).get("prompt", "")
+        except (OSError, json.JSONDecodeError):
+            prompt = ""
+        if isinstance(prompt, str) and prompt.strip():
+            return prompt.strip()
+    return FACIES_PROMPT
+
+
 def list_text_checkpoints() -> list[dict[str, str]]:
     """Official SAM 3 plus every converted HF folder under finetuned_checkpoints/."""
     items: list[dict[str, str]] = [
@@ -124,6 +146,7 @@ def list_text_checkpoints() -> list[dict[str, str]]:
             "label": "SAM 3 (official)",
             "path": OFFICIAL_TEXT_CHECKPOINT,
             "source": "official",
+            "prompt": FACIES_PROMPT,
         }
     ]
     seen = {_checkpoint_key(OFFICIAL_TEXT_CHECKPOINT)}
@@ -141,6 +164,7 @@ def list_text_checkpoints() -> list[dict[str, str]]:
                     "label": child.name,
                     "path": str(child),
                     "source": "local",
+                    "prompt": prompt_for_checkpoint(str(child)),
                 }
             )
     env = os.environ.get("SAM3_TEXT_CHECKPOINT", "").strip()
@@ -151,6 +175,7 @@ def list_text_checkpoints() -> list[dict[str, str]]:
                 "label": Path(env).name or env,
                 "path": env,
                 "source": "env",
+                "prompt": prompt_for_checkpoint(env),
             }
         )
     return items

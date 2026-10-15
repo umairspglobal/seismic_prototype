@@ -48,6 +48,8 @@ export interface TextCheckpointInfo {
   label: string;
   path: string;
   source: "official" | "local" | "env";
+  /** Prompt this checkpoint was trained for. Official SAM 3 uses seismic facies. */
+  prompt?: string;
 }
 
 export interface Point {

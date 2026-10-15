@@ -406,7 +406,7 @@ def _load_text_segmenter_locked() -> Sam3SeismicSegmenter:
     log.info("Loading text-prompt detector from %s", checkpoint)
     _text_segmenter = Sam3SeismicSegmenter(
         checkpoint=checkpoint,
-        prompts=[config.FACIES_PROMPT],
+        prompts=[config.prompt_for_checkpoint(checkpoint)],
     )
     return _text_segmenter
 
@@ -701,8 +701,8 @@ def _mask_png_base64(mask: np.ndarray, object_id: int = 0) -> str:
     return _rgba_png_base64(rgba)
 
 
-def _facies_mask_png_base64(mask: np.ndarray) -> str:
-    color = config.LABEL_COLORS[config.FACIES_PROMPT]
+def _facies_mask_png_base64(mask: np.ndarray, prompt: str = config.FACIES_PROMPT) -> str:
+    color = config.LABEL_COLORS.get(prompt, config.LABEL_COLORS[config.FACIES_PROMPT])
     rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
     rgba[mask] = (*color, MASK_ALPHA)
     return _rgba_png_base64(rgba)
@@ -1168,7 +1168,8 @@ def auto_segment(req: SliceRef) -> dict:
     _validate_slice(volume, req.axis, req.index)
     rgb = _volume_rgb(volume, req.axis, req.index)
     started = time.perf_counter()
-    prompts = [config.FACIES_PROMPT]
+    prompt = config.prompt_for_checkpoint()
+    prompts = [prompt]
     with _gpu_lock:
         segmenter, unloaded_tracker = _ensure_text_segmenter_locked()
         try:
@@ -1183,11 +1184,11 @@ def auto_segment(req: SliceRef) -> dict:
             segmenter = _load_text_segmenter_locked()
             prob_maps = _segment_section_rgb(rgb, segmenter, prompts)
     masks = binarize(prob_maps, config.MASK_THRESHOLD)
-    mask = np.asarray(masks[config.FACIES_PROMPT], dtype=bool)
+    mask = np.asarray(masks[prompt], dtype=bool)
     return {
-        "mask": _facies_mask_png_base64(mask),
+        "mask": _facies_mask_png_base64(mask, prompt),
         "coverage": float(mask.mean()),
-        "prompt": config.FACIES_PROMPT,
+        "prompt": prompt,
         "checkpoint": config.text_checkpoint(),
         "unloaded_tracker": unloaded_tracker,
         "timings": {"server_total": time.perf_counter() - started},

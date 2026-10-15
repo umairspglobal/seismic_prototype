@@ -1,5 +1,35 @@
 # Fine-tuning SAM 3 for seismic facies
 
+## Quick fine-tune (GUI)
+
+Double-click `start_finetune_gui.cmd` (or run `python -m finetuning.finetune_gui`).
+
+The window trains one text prompt at a time and writes a Hugging Face
+`Sam3Model` folder. Saved under `finetuned_checkpoints/`, it shows up in the
+app's text-checkpoint list.
+
+- **Faults** uses `Seis75` as the image and `Fault75` as a binary mask, prompt `fault`.
+- **Facies** uses `Seis75` as the image and stratigraphic layers cut from
+  `TauAtT75` (relative geologic time), prompt `seismic facies`. There is no
+  facies mask in `Seis75` itself.
+
+In the app, pick the new folder under Fine-tuned checkpoint and press Detect.
+The button runs the prompt that model was trained with (`fault` or
+`seismic facies`). Point clicks still use the official tracker.
+
+The ViT backbone and text encoder stay frozen (the last few ViT blocks can
+be unfrozen). A few thousand sections finish in minutes on the laptop GPU.
+The log, loss chart, validation IoU and preview images update while it runs.
+`Stop and save` finishes the current step, scores the held-out sections and
+keeps the best epoch.
+
+`python -m finetuning.quick_finetune --help` runs the same trainer without the GUI.
+
+The rest of this document is the earlier full-trainer pipeline (COCO export
+and the sam3 repo's own trainer). It is not what the GUI runs.
+
+## Earlier full-trainer pipeline
+
 This folder is self-contained: it does not import from or get imported by
 `seismic_app/`, except to reuse two small, already-tested pieces of
 preprocessing code (`normalize_to_uint8`, `inline_to_rgb_25d`) so training
