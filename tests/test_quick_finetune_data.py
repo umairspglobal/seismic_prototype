@@ -14,7 +14,7 @@ from finetuning.quick_data import (
     rgt_to_layers,
     split_stems,
 )
-from finetuning.quick_finetune import lr_factor, summarize
+from finetuning.quick_finetune import build_parser, lr_factor, summarize
 
 
 def _write_dat(folder, stem: str, array: np.ndarray) -> None:
@@ -91,6 +91,10 @@ def test_split_holds_out_validation_and_caps_it():
     assert len(val) == 6
     assert len(train) == 34
     assert set(train).isdisjoint(val)
+
+
+def test_epoch_default_is_thirty():
+    assert build_parser().get_default("epochs") == 30
 
 
 def test_loss_schedule_and_scores():

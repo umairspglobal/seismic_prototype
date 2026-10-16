@@ -626,7 +626,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-samples", type=int, default=2000, help="0 = use every matched file.")
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--max-val", type=int, default=256)
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--mosaic", type=int, choices=(1, 2, 3, 4), default=4)
     p.add_argument("--lr", type=float, default=1e-4)

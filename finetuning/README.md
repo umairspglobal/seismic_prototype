@@ -18,10 +18,11 @@ The button runs the prompt that model was trained with (`fault` or
 `seismic facies`). Point clicks still use the official tracker.
 
 The ViT backbone and text encoder stay frozen (the last few ViT blocks can
-be unfrozen). A few thousand sections finish in minutes on the laptop GPU.
-The log, loss chart, validation IoU and preview images update while it runs.
-`Stop and save` finishes the current step, scores the held-out sections and
-keeps the best epoch.
+be unfrozen). The default is 30 epochs on the 2,000-section cap, on the
+order of an hour on the laptop GPU including validation. The log, loss
+chart, validation IoU and preview images update while it runs. `Stop and
+save` finishes the current step, scores the held-out sections and keeps
+the best epoch.
 
 `python -m finetuning.quick_finetune --help` runs the same trainer without the GUI.
 

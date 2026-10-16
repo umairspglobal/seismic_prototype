@@ -163,7 +163,7 @@ class FinetuneGUI:
         self.base_model = v(value="facebook/sam3")
         self.max_samples = tk.IntVar(value=2000)
         self.val_percent = tk.IntVar(value=10)
-        self.epochs = tk.IntVar(value=3)
+        self.epochs = tk.IntVar(value=30)
         self.batch_size = tk.IntVar(value=2)
         self.mosaic = v(value=next(iter(MOSAICS)))
         self.lr = v(value="1e-4")
@@ -1113,7 +1113,7 @@ class FinetuneGUI:
             "--model-name", name,
             "--max-samples", str(self._int(self.max_samples, 2000)),
             "--val-fraction", str(self._int(self.val_percent, 10) / 100),
-            "--epochs", str(self._int(self.epochs, 3)),
+            "--epochs", str(self._int(self.epochs, 30)),
             "--batch-size", str(self._int(self.batch_size, 2)),
             "--mosaic", str(MOSAICS[self.mosaic.get()]),
             "--lr", self.lr.get().strip(),
