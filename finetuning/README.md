@@ -13,6 +13,11 @@ app's text-checkpoint list.
   `TauAtT75` (relative geologic time), prompt `seismic facies`. There is no
   facies mask in `Seis75` itself.
 
+To train on synthetic data instead, generate a folder with
+[synthetic_generator](../synthetic_generator/README.md) and use its
+**Send to Quick Fine-Tuner** button (or point Data folder at it): it has the
+same `Seis75` / `Fault75` / `TauAtT75` folders.
+
 In the app, pick the new folder under Fine-tuned checkpoint and press Detect.
 The button runs the prompt that model was trained with (`fault` or
 `seismic facies`). Point clicks still use the official tracker.

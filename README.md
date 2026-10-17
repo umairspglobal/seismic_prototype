@@ -76,6 +76,15 @@ This build runs SAM 3 zero-shot. To fine-tune on your own labeled data (and
 plug the result back in as a one-line checkpoint swap), see
 [finetuning/README.md](finetuning/README.md).
 
+## Synthetic training data
+
+`start_synthetic_generator.cmd` (or `python -m synthetic_generator`) opens a
+generator for faulted synthetic seismic with fault masks, relative geologic
+time and dip / weight / straddle / halo labels, written in the same folder
+layout as `training_10_7_26` so the Quick Fine-Tuner reads it directly. It has
+a live preview of every array and of what SAM 3 is trained on; see
+[synthetic_generator/README.md](synthetic_generator/README.md).
+
 ## Setup
 
 ```powershell
