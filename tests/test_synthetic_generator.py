@@ -45,6 +45,18 @@ def test_default_config_and_presets_are_valid():
         assert preset(name).validate() == [], name
 
 
+def test_default_and_csd_presets():
+    from synthetic_generator.config import DEFAULT_PRESET, default_config
+
+    assert DEFAULT_PRESET == "Noisy field-like data" and "Reference match (training_10_7_26)" not in PRESETS
+    assert default_config().realism.noise_snr == (1.2, 4.0) and not default_config().csd.enabled
+    cfg = preset("CSD: horizon tracks + dip prompts")
+    assert cfg.csd.enabled and cfg.output.arrays == ["seis", "dip", "weight"] and cfg.realism.noise_snr == (1.2, 4.0)
+    cfg.csd.count = (2, 2)
+    back = preset("Complex structure", cfg)
+    assert not back.csd.enabled and back.csd.count == (2, 2)
+
+
 def test_config_round_trip_and_coercion(tmp_path):
     cfg = small_config()
     cfg.seismic.centers = [0.05, 0.1]
@@ -82,7 +94,9 @@ _FUZZ_CAPS = {
     "realism.chaos_count": 3, "realism.chaos_size": 120, "realism.noise_snr": 50,
     "realism.fault_dimming_width": 8, "realism.noise_lateral": 4, "realism.lateral_smoothing": 4,
     "realism.trace_jitter": 2, "labels.dip_smoothing": 4, "labels.corridor_pad": 8, "labels.partner_pad_left": 8,
-    "labels.partner_pad_right": 8,
+    "labels.partner_pad_right": 8, "csd.count": 10, "csd.min_separation": 30, "csd.gap_length": 30,
+    "csd.thickness": 4, "csd.pick_jitter": 5, "csd.jitter_length": 40, "csd.prompt_noise": 5,
+    "csd.prompt_background": 5, "csd.distance_clip": 60,
 }
 
 
@@ -276,6 +290,105 @@ def test_gaussianize_and_clip():
     assert np.abs(generate_block(cfg, 0).seis).max() == pytest.approx(2.5)
 
 
+# --- coarse-scale dips (CSD) ---------------------------------------------------------------------
+
+
+def _faulted_section(throw=6.0):
+    cfg = small_config()
+    H, W = cfg.grid.height, cfg.grid.width
+    strat = Stratigraphy(packages=[Package(folds=[], tilt=0.0, depth_scale=1.0, thickening=0.0)], surfaces=[], H=H, W=W)
+    ys = np.array([-20.0, H + 20.0])
+    xs = np.array([40.0, 40.0 - (ys[1] - ys[0]) / np.tan(np.radians(75))])
+    fault = Fault(xs=xs, ys=ys, dip_dir=-1, radius=1.7, throw=throw, profile="constant", peak=0.5, taper=0.0,
+                  offsets=np.zeros(3), throw_rate=0.0, drag=0.0, drag_strength=0.0, order=0, dip=75.0, through=True)
+    return cfg, build_slice(strat, [fault], 1, cfg, pad=0)
+
+
+def _plan(**changes):
+    from synthetic_generator.csd import HorizonPlan
+
+    values = dict(depth=0.4, window=(0.0, 64.0), seed_x=5.0, gaps=[], thickness=1, connector="line", seed=1,
+                  in_prompt=True)
+    values.update(changes)
+    return HorizonPlan(**values)
+
+
+@pytest.mark.parametrize("connector", ["line", "smooth", "step"])
+def test_csd_horizon_steps_down_at_a_fault_and_continues(connector):
+    from synthetic_generator.csd import section_csd
+
+    cfg, geom = _faulted_section(throw=6.0)
+    cfg.csd.connect_prob, cfg.csd.p_stop_at_fault = 1.0, 0.0
+    labels = lab.section_labels(geom.tau, geom.mask, geom.offsets, geom.inside, cfg.grid.scales, cfg.labels)
+    out, drawn = section_csd(geom.tau, geom.mask.astype(float), [_plan(connector=connector)], labels,
+                             cfg.grid.scales, cfg.csd, np.random.default_rng(0))
+    m = out[("csd_mask", None)] > 0.5
+    assert drawn == 1 and m.any(axis=0).all()
+    rows = [np.nonzero(m[:, x])[0].mean() for x in (2, 60)]
+    assert rows[0] - rows[1] == pytest.approx(6.0, abs=1.0)
+    assert ndi_label(m)[1] == 1
+
+    cfg.csd.connect_prob = 0.0
+    out, _ = section_csd(geom.tau, geom.mask.astype(float), [_plan()], labels, cfg.grid.scales, cfg.csd,
+                         np.random.default_rng(0))
+    assert ndi_label(out[("csd_mask", None)] > 0.5)[1] == 2
+    cfg.csd.connect_prob, cfg.csd.p_stop_at_fault = 1.0, 1.0
+    out, _ = section_csd(geom.tau, geom.mask.astype(float), [_plan(seed_x=5.0)], labels, cfg.grid.scales,
+                         cfg.csd, np.random.default_rng(0))
+    assert not (out[("csd_mask", None)][:, 45:] > 0.5).any()
+
+
+def ndi_label(mask):
+    from scipy import ndimage as ndi
+
+    return ndi.label(mask, structure=np.ones((3, 3)))
+
+
+def test_csd_block_arrays_prompt_and_distance():
+    cfg = small_config(csd__enabled=True, csd__count=(3, 4))
+    block = generate_block(cfg, 3)
+    plain = generate_block(small_config(), 3)
+    assert np.array_equal(block.seis, plain.seis) and np.array_equal(block.tau, plain.tau)
+    assert plain.csd is None and len(block.csd) == cfg.grid.n_slices
+    for s in range(cfg.grid.n_slices):
+        c = block.csd[s]
+        mask, dist = c[("csd_mask", None)], c[("csd_dist", None)]
+        assert set(np.unique(mask)) <= {0.0, 1.0} and mask.any()
+        assert (dist[mask > 0.5] == 0).all() and (dist[mask < 0.5] > 0).all()
+        for S in cfg.grid.scales:
+            shown, prompt = c[("csd_prompt", S)], c[("csd_dip", S)]
+            assert np.array_equal(shown, mask > 0.5)
+            assert np.allclose(prompt[shown], block.labels[s][("dip", S)][shown])
+            assert (prompt[~shown] == 0.0).all()
+    counts = block.meta["csd_horizons"]
+    assert len(counts) == cfg.grid.n_slices and all(1 <= n <= 4 for n in counts)
+
+    noisy = small_config(csd__enabled=True, csd__pick_jitter=(2.0, 2.0), csd__prompt_dropout=0.5,
+                         csd__distance="vertical", csd__distance_clip=10.0, csd__distance_normalize=True,
+                         csd__prompt_background=-1.0)
+    c = generate_block(noisy, 3).csd[0]
+    d = c[("csd_dist", None)]
+    assert d.min() == 0.0 and d.max() <= 1.0
+    shown = c[("csd_prompt", 12)]
+    assert shown.sum() < (c[("csd_mask", None)] > 0.5).sum()
+    assert (c[("csd_dip", 12)][~shown] == -1.0).all()
+
+
+def test_csd_folders_are_written_and_inspected(tmp_path):
+    from synthetic_generator.checks import inspect_dataset
+
+    cfg = small_config(csd__enabled=True)
+    cfg.output.arrays = ["seis", "fault"]
+    cfg.output.num_blocks = 1
+    generate_dataset(cfg, tmp_path)
+    folders = sorted(p.name for p in tmp_path.iterdir() if p.is_dir())
+    assert folders == ["CsdDipXscale12_75", "CsdDipXscale6_75", "CsdDistance75", "CsdHorizon75", "Fault75", "Seis75"]
+    rep = inspect_dataset(tmp_path, sample=6)
+    assert {"csd_mask", "csd_dist", "csd_dip6", "csd_dip12"} <= set(rep["folders"]) and not rep["problems"]
+    data = read_block_from_disk(tmp_path, cfg, 0, 0)
+    assert np.array_equal(data[Product("csd_mask")][0], data[Product("csd_mask")][1])
+
+
 # --- dataset ------------------------------------------------------------------------------------
 
 
@@ -369,16 +482,30 @@ def test_cli_generate_and_inspect(tmp_path, capsys):
 # --- previews / GUI ---------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("view", ["overview", "arrays", "slices", "replicas", "labels", "sam3"])
+@pytest.mark.parametrize("view", ["overview", "arrays", "slices", "replicas", "labels", "sam3", "csd"])
 def test_every_preview_view_renders(view):
     from synthetic_generator.preview import fit_tile, render_view
 
     cfg = small_config()
-    block = generate_block(cfg, 2)
+    block = generate_block(cfg, 2, csd=True)
     image, infos = render_view(block, cfg, view, replica=1, slice_index=2, scale=12, tile=96)
     assert image.width > 96 and image.height > 96
     assert any(i.array is not None for i in infos)
     assert fit_tile(view, cfg, 1200, 700) >= 64
+
+
+def test_overview_shows_csd_when_enabled():
+    from synthetic_generator.preview import render_view
+
+    cfg = small_config()
+    block = generate_block(cfg, 2, csd=True)
+    _, plain = render_view(block, cfg, "overview", tile=96)
+    cfg.csd.enabled = True
+    _, with_csd = render_view(block, cfg, "overview", replica=0, slice_index=0, scale=6, tile=96)
+    assert [i.label for i in plain] == ["Seis s1 r0", "Seis s1 r0", "Fault", "TauAtT", "dip S=6", "weight S=6"]
+    assert [i.label for i in with_csd] == [
+        "Seis", "dip S=6", "weight S=6", "CsdDipXscale6", "CsdHorizon", "CsdDistance",
+    ]
 
 
 def _tk_root():
@@ -410,12 +537,23 @@ def test_gui_builds_and_reads_settings(monkeypatch, tmp_path):
         gui.array_vars["halo"].set(False)
         cfg, errors = gui.read_config()
         assert cfg.faults.stroke_radius[1] == 2.5 and "halo" not in cfg.output.arrays
+        tabs = [gui.notebook.tab(t, "text") for t in gui.notebook.tabs()]
+        assert tabs == ["Dataset", "Structure", "Faults", "Seismic", "Realism", "Labels", "CSD (In-Progress)"]
+        gui.vars["csd.enabled"].set(True)
+        gui.vars["csd.connector"].set("step")
+        cfg, errors = gui.read_config()
+        assert errors == [] and cfg.csd.enabled and cfg.csd.connector == "step"
         gui.vars["faults.count"][0].set("abc")
         assert gui.read_config()[1]
         gui.preset_var.set("Spec: fixed reflections, 2-trace step")
         gui._apply_preset()
         cfg, errors = gui.read_config()
         assert errors == [] and cfg.faults.step_direction == "right" and cfg.structure.slice_drift == (0.0, 0.0)
+        assert gui.view_var.get() == "overview"
+        gui.preset_var.set("CSD: horizon tracks + dip prompts")
+        gui._apply_preset()
+        cfg, errors = gui.read_config()
+        assert errors == [] and cfg.csd.enabled and gui.view_var.get() == "overview"
 
         gui.slice_var.set(99)
         gui.replica_var.set(-4)

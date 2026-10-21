@@ -28,6 +28,10 @@ HALO_MODES = ("2d", "horizontal")
 NORMALIZE_MODES = ("gaussianize", "standardize")
 NORMALIZE_SCOPES = ("block", "slice")
 DTYPES = ("float64", "float32")
+CSD_KINDS = ("csd_mask", "csd_dip", "csd_dist")
+CSD_PLACEMENTS = ("random", "even")
+CSD_CONNECTORS = ("random", "line", "smooth", "step")
+CSD_DISTANCES = ("euclidean", "vertical")
 
 
 @dataclass
@@ -156,6 +160,38 @@ class LabelConfig:
 
 
 @dataclass
+class CsdConfig:
+    """Coarse-scale dips: sparse horizon tracks, the dip sampled on them, and the distance to them."""
+
+    enabled: bool = False
+    count: tuple[int, int] = (3, 7)
+    placement: str = "random"
+    depth_range: tuple[float, float] = (0.04, 0.96)
+    min_separation: float = 14.0
+    same_across_slices: bool = True
+    p_partial: float = 0.3
+    partial_length: tuple[float, float] = (0.15, 0.8)
+    p_stop_at_fault: float = 0.1
+    connect_prob: float = 0.85
+    connector: str = "random"
+    skip_stroke: bool = False
+    gap_prob: float = 0.2
+    gap_count: tuple[int, int] = (1, 2)
+    gap_length: tuple[float, float] = (3.0, 18.0)
+    thickness: tuple[int, int] = (1, 2)
+    pick_jitter: tuple[float, float] = (0.0, 0.0)
+    jitter_length: float = 12.0
+    prompt_noise: tuple[float, float] = (0.0, 0.0)
+    prompt_dropout: float = 0.0
+    prompt_horizon_dropout: float = 0.0
+    prompt_weighted: bool = False
+    prompt_background: float = 0.0
+    distance: str = "euclidean"
+    distance_clip: float = 0.0
+    distance_normalize: bool = False
+
+
+@dataclass
 class GeneratorConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     grid: GridConfig = field(default_factory=GridConfig)
@@ -164,6 +200,7 @@ class GeneratorConfig:
     seismic: SeismicConfig = field(default_factory=SeismicConfig)
     realism: RealismConfig = field(default_factory=RealismConfig)
     labels: LabelConfig = field(default_factory=LabelConfig)
+    csd: CsdConfig = field(default_factory=CsdConfig)
 
     @property
     def ids_per_block(self) -> int:
@@ -357,6 +394,31 @@ class GeneratorConfig:
                         ("Partner pad (right)", la.partner_pad_right)):
             if v < 0:
                 errors.append(f"{name} cannot be negative.")
+
+        cs = self.csd
+        rng("CSD horizon count", cs.count, 0, 40, integer=True)
+        rng("CSD depth range", cs.depth_range, 0.0, 1.0)
+        rng("CSD partial length", cs.partial_length, 0.02, 1.0)
+        rng("CSD gap count", cs.gap_count, 0, 10, integer=True)
+        rng("CSD gap length", cs.gap_length, 0)
+        rng("CSD line thickness", cs.thickness, 1, 9, integer=True)
+        rng("CSD pick jitter", cs.pick_jitter, 0)
+        rng("CSD prompt noise", cs.prompt_noise, 0)
+        for name, p in (("CSD partial probability", cs.p_partial), ("CSD stop-at-fault probability", cs.p_stop_at_fault),
+                        ("CSD connect probability", cs.connect_prob), ("CSD gap probability", cs.gap_prob),
+                        ("CSD prompt pixel dropout", cs.prompt_dropout),
+                        ("CSD prompt horizon dropout", cs.prompt_horizon_dropout)):
+            _prob(errors, name, p)
+        if cs.placement not in CSD_PLACEMENTS:
+            errors.append(f"CSD placement must be one of {CSD_PLACEMENTS}.")
+        if cs.connector not in CSD_CONNECTORS:
+            errors.append(f"CSD connector must be one of {CSD_CONNECTORS}.")
+        if cs.distance not in CSD_DISTANCES:
+            errors.append(f"CSD distance must be one of {CSD_DISTANCES}.")
+        for name, v in (("CSD minimum separation", cs.min_separation), ("CSD jitter length", cs.jitter_length),
+                        ("CSD distance clip", cs.distance_clip)):
+            if v < 0:
+                errors.append(f"{name} cannot be negative.")
         return errors
 
 
@@ -472,28 +534,69 @@ def _faults_only(cfg: GeneratorConfig) -> None:
     cfg.output.arrays = ["seis", "fault"]
 
 
+def _csd(cfg: GeneratorConfig) -> None:
+    """Noisy field-like data plus horizon tracks; writes Seis, dip and weight (the CSD targets) and the CSD folders."""
+    _noisy(cfg)
+    cfg.output.arrays = ["seis", "dip", "weight"]
+    cs = cfg.csd
+    cs.enabled = True
+    cs.count = (3, 8)
+    cs.placement = "random"
+    cs.depth_range = (0.04, 0.96)
+    cs.min_separation = 14.0
+    cs.same_across_slices = True
+    cs.p_partial = 0.3
+    cs.partial_length = (0.2, 0.8)
+    cs.gap_prob = 0.25
+    cs.gap_count = (1, 2)
+    cs.gap_length = (3.0, 15.0)
+    cs.thickness = (1, 2)
+    cs.connect_prob = 0.85
+    cs.connector = "random"
+    cs.p_stop_at_fault = 0.1
+    cs.skip_stroke = False
+    cs.pick_jitter = (0.0, 1.0)
+    cs.jitter_length = 15.0
+    cs.prompt_noise = (0.0, 0.5)
+    cs.prompt_dropout = 0.1
+    cs.prompt_horizon_dropout = 0.1
+    cs.prompt_weighted = False
+    cs.prompt_background = 0.0
+    cs.distance = "euclidean"
+    cs.distance_clip = 0.0
+    cs.distance_normalize = False
+
+
 PRESETS: dict[str, Any] = {
-    "Reference match (training_10_7_26)": None,
+    "Noisy field-like data": _noisy,
+    "CSD: horizon tracks + dip prompts": _csd,
     "Spec: fixed reflections, 2-trace step": _spec,
     "Clean and simple (debugging)": _clean,
     "Complex structure": _complex,
-    "Noisy field-like data": _noisy,
     "Low frequency (poor resolution)": _low_freq,
     "High frequency (sharp)": _high_freq,
     "Faults only (Seis + Fault folders)": _faults_only,
 }
-DEFAULT_PRESET = next(iter(PRESETS))
+DEFAULT_PRESET = "Noisy field-like data"
+
+
+def default_config() -> GeneratorConfig:
+    """What a fresh GUI, Reset and the command line start from."""
+    return preset(DEFAULT_PRESET)
 
 
 def preset(name: str, base: GeneratorConfig | None = None) -> GeneratorConfig:
-    """A fresh config for ``name``; output settings are kept from ``base`` if given."""
+    """A fresh config for ``name``; output and CSD settings are kept from ``base`` if given.
+
+    Only the CSD preset turns CSD writing on; every other preset turns it off.
+    """
     if name not in PRESETS:
         raise KeyError(f"Unknown preset {name!r}; choose from {list(PRESETS)}")
     cfg = GeneratorConfig()
     if base is not None:
         cfg.output = copy.deepcopy(base.output)
         cfg.output.arrays = list(ARRAY_KINDS)
-    apply = PRESETS[name]
-    if apply is not None:
-        apply(cfg)
+        cfg.csd = copy.deepcopy(base.csd)
+        cfg.csd.enabled = False
+    PRESETS[name](cfg)
     return cfg

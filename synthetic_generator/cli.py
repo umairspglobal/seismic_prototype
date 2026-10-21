@@ -17,7 +17,7 @@ import json
 import sys
 from pathlib import Path
 
-from .config import DTYPES, PRESETS, GeneratorConfig, preset
+from .config import DTYPES, PRESETS, GeneratorConfig, default_config, preset
 
 EVENT_PREFIX = "@@"
 
@@ -28,7 +28,7 @@ def _load_config(args: argparse.Namespace) -> GeneratorConfig:
     elif getattr(args, "preset", None):
         cfg = preset(args.preset)
     else:
-        cfg = GeneratorConfig()
+        cfg = default_config()
     if getattr(args, "out", None) and args.command == "generate":
         cfg.output.out_dir = str(args.out)
     for name, path in (("blocks", "output.num_blocks"), ("seed", "output.seed"), ("workers", "output.workers"),
@@ -78,7 +78,7 @@ def cmd_preview(args: argparse.Namespace) -> int:
     from .preview import VIEWS, render_view
 
     cfg = _load_config(args)
-    block = generate_block(cfg, args.block, keep_geology=True)
+    block = generate_block(cfg, args.block, keep_geology=True, csd=True)
     if args.view not in VIEWS:
         print(f"Unknown view {args.view!r}; choose from {list(VIEWS)}", file=sys.stderr)
         return 2
@@ -130,7 +130,7 @@ def cmd_presets(_args: argparse.Namespace) -> int:
 
 
 def cmd_dump(args: argparse.Namespace) -> int:
-    cfg = preset(args.preset) if args.preset else GeneratorConfig()
+    cfg = preset(args.preset) if args.preset else default_config()
     cfg.save(args.out)
     print(f"Saved {args.out}")
     return 0

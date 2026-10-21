@@ -14,7 +14,9 @@ from scipy import ndimage as ndi
 from .block import FOLDER_PREFIX
 from .dataset import CONFIG_NAME
 
-FOLDER_RE = re.compile(r"^(Seis|Fault|TauAtT|dipXscale|wtXscale|wtXStraddleScale|wtXHaloScale)(\d*)_?(.*)$")
+FOLDER_RE = re.compile(r"^(Seis|Fault|TauAtT|dipXscale|wtXscale|wtXStraddleScale|wtXHaloScale|CsdHorizon|CsdDipXscale|"
+                       r"CsdDistance)(\d*)_?(.*)$")
+UNSCALED = ("seis", "fault", "tau", "csd_mask", "csd_dist")
 
 
 def discover(root: Path) -> dict[str, Path]:
@@ -29,7 +31,7 @@ def discover(root: Path) -> dict[str, Path]:
             continue
         prefix, digits, _ = m.groups()
         kind = by_prefix[prefix]
-        if kind in ("seis", "fault", "tau"):
+        if kind in UNSCALED:
             key = kind
         else:
             if not digits:

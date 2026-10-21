@@ -34,7 +34,8 @@ from PIL import Image, ImageTk  # noqa: E402
 
 from synthetic_generator import __version__  # noqa: E402
 from synthetic_generator.block import Block, generate_block, products  # noqa: E402
-from synthetic_generator.config import ARRAY_KINDS, DEFAULT_PRESET, PRESETS, GeneratorConfig, preset  # noqa: E402
+from synthetic_generator.config import (ARRAY_KINDS, DEFAULT_PRESET, PRESETS, GeneratorConfig,  # noqa: E402
+                                        default_config, preset)
 from synthetic_generator.dataset import (CONFIG_NAME, check_disk, dataset_bytes, file_bytes,  # noqa: E402
                                          next_start_id, plan_blocks)
 from synthetic_generator.params import TABS, Param, all_params  # noqa: E402
@@ -454,6 +455,8 @@ class GeneratorGUI:
                     self._param_row(card, row, p)
             if tab_name == "Labels":
                 self._label_notes(sf.body)
+            elif tab_name.startswith("CSD"):
+                self._csd_notes(sf.body)
         self._build_generate_card(parent)
 
     def _param_row(self, card: ttk.Frame, row: int, p: Param) -> None:
@@ -526,6 +529,20 @@ class GeneratorGUI:
             "wtXscaleS: loss weight; 0 near faults, near the right edge and where the pair is invalid.\n"
             "wtXHaloScaleS: blur of the fault mask with radius S, peaking at 1.\n"
             "Only Seis differs between the bandpass replicas; the other arrays are repeated."
+        )
+        ttk.Label(card, text=notes, style="Hint.TLabel", justify="left", wraplength=480).grid(
+            row=1, column=0, columnspan=3, sticky="w")
+
+    def _csd_notes(self, parent) -> None:
+        card = self._card(parent, "What the CSD folders hold (in progress)")
+        card.pack(fill="x", pady=(8, 0), padx=(0, 4))
+        notes = (
+            "A horizon is one reflector (one tau level). Its track follows the folds, steps down by the throw "
+            "where it crosses a fault and then continues.\n"
+            "CsdHorizon: 1 on the tracked horizons (the target mask).\n"
+            "CsdDipXscaleS: the prompt - dipXscaleS on the horizon pixels, the background value elsewhere.\n"
+            "CsdDistance: distance in px to the nearest horizon pixel.\n"
+            "Open the CSD preview view to see them laid out per scale."
         )
         ttk.Label(card, text=notes, style="Hint.TLabel", justify="left", wraplength=480).grid(
             row=1, column=0, columnspan=3, sticky="w")
@@ -825,7 +842,7 @@ class GeneratorGUI:
     def _preview_worker(self, job: PreviewJob, cached: Block | None) -> None:
         try:
             t0 = time.perf_counter()
-            block = cached or generate_block(job.cfg, job.block_index)
+            block = cached or generate_block(job.cfg, job.block_index, csd=True)
             gen_s = time.perf_counter() - t0 if cached is None else None
             t1 = time.perf_counter()
             image, infos = render_view(block, job.cfg, job.view, replica=job.replica, slice_index=job.slice_index,
@@ -1124,14 +1141,17 @@ class GeneratorGUI:
 
     def _apply_preset(self) -> None:
         current, _ = self.read_config()
-        cfg = preset(self.preset_var.get(), current)
-        if self.preset_var.get().startswith("Faults only"):
+        name = self.preset_var.get()
+        cfg = preset(name, current)
+        if name.startswith("Faults only"):
             cfg.output.arrays = ["seis", "fault"]
         self._write_config(cfg)
-        self._log(f"Preset: {self.preset_var.get()}", "info")
+        if name.startswith("CSD") or self.view_var.get() == "csd":
+            self.view_var.set("overview")
+        self._log(f"Preset: {name}", "info")
 
     def _reset(self) -> None:
-        cfg = GeneratorConfig()
+        cfg = default_config()
         cfg.output.out_dir = str(DEFAULT_OUT_DIR)
         self.preset_var.set(DEFAULT_PRESET)
         self._write_config(cfg)
@@ -1256,7 +1276,12 @@ class GeneratorGUI:
                 data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 data = {}
-        cfg = GeneratorConfig.from_dict(data["config"]) if isinstance(data.get("config"), dict) else GeneratorConfig()
+        if isinstance(data.get("config"), dict):
+            cfg = GeneratorConfig.from_dict(data["config"])
+            if data.get("preset") not in PRESETS:
+                cfg = preset(DEFAULT_PRESET, cfg)
+        else:
+            cfg = default_config()
         if not cfg.output.out_dir:
             cfg.output.out_dir = str(DEFAULT_OUT_DIR)
         if data.get("preset") in PRESETS:
@@ -1296,7 +1321,7 @@ class ZoomWindow:
     """One array at a large size with a value readout."""
 
     def __init__(self, master: tk.Misc, info: TileInfo):
-        from synthetic_generator.preview import colorize, seismic_rgb
+        from synthetic_generator.preview import colorize, dip_range, seismic_rgb
 
         a = info.array
         self.array = a
@@ -1307,6 +1332,11 @@ class ZoomWindow:
         lower = info.label.lower()
         if lower.startswith("seis"):
             rgb = seismic_rgb(a, "gray")
+        elif lower.startswith("csddip"):
+            vals = a[a != 0]
+            rgb = colorize(a, "csd", *dip_range(vals if vals.size else a))
+        elif lower.startswith("csddistance"):
+            rgb = colorize(a, "inferno", 0, float(a.max()) or 1.0)
         elif lower.startswith("dip"):
             m = float(np.percentile(np.abs(a), 99)) or 1.0
             rgb = colorize(a, "diverging", -m, m)

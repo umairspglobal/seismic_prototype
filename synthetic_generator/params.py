@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import (CENTER_MODES, DIP_FILLS, DTYPES, HALO_MODES, NORMALIZE_MODES, NORMALIZE_SCOPES, RENDER_MODES,
-                     STEP_DIRECTIONS, THROW_PROFILES, WAVELETS)
+from .config import (CENTER_MODES, CSD_CONNECTORS, CSD_DISTANCES, CSD_PLACEMENTS, DIP_FILLS, DTYPES, HALO_MODES,
+                     NORMALIZE_MODES, NORMALIZE_SCOPES, RENDER_MODES, STEP_DIRECTIONS, THROW_PROFILES, WAVELETS)
 
 
 @dataclass(frozen=True)
@@ -222,6 +222,65 @@ TABS: list[tuple[str, list[tuple[str, list[Param]]]]] = [
             P("labels.halo_quantile", "Peak normalization quantile", "float", 0.5, 1, 0.005,
               help="0.99 = scaled by the 99th percentile and clipped, so it peaks at 1 (reference)."),
             P("labels.halo_mode", "Blur", "choice", choices=HALO_MODES),
+        ]),
+    ]),
+    ("CSD (In-Progress)", [
+        ("Coarse-scale dips", [
+            P("csd.enabled", "Write CSD arrays", "bool",
+              help="Adds CsdHorizon (target mask), CsdDipXscaleS (prompt: dip on the horizons, one per scale) and "
+                   "CsdDistance (distance to the nearest horizon). The CSD preview view works either way."),
+        ]),
+        ("Horizons", [
+            P("csd.count", "Horizons per section", "range_int", 0, 40),
+            P("csd.placement", "Placement", "choice", choices=CSD_PLACEMENTS,
+              help="random: depths drawn with a minimum separation. even: evenly spaced with a little jitter."),
+            P("csd.depth_range", "Depth range (fraction of height)", "range_float", 0, 1, 0.02),
+            P("csd.min_separation", "Minimum separation (px)", "float", 0, 200, 1,
+              help="Random placement only; fewer horizons are drawn if they do not fit."),
+            P("csd.same_across_slices", "Same horizons in every slice", "bool",
+              help="On: every slice of the block tracks the same reflectors (tau levels), like picks in a 3D "
+                   "volume. Off: each slice picks its own."),
+        ]),
+        ("Track extent", [
+            P("csd.p_partial", "Partial-track share", "prob",
+              help="Share of horizons tracked over only part of the section (a picker that stopped)."),
+            P("csd.partial_length", "Partial length (fraction of width)", "range_float", 0.02, 1, 0.05),
+            P("csd.gap_prob", "Gap probability per horizon", "prob",
+              help="Columns where the pick is missing (dropouts)."),
+            P("csd.gap_count", "Gaps per horizon", "range_int", 0, 10),
+            P("csd.gap_length", "Gap length (px)", "range_float", 0, 200, 1),
+            P("csd.thickness", "Line thickness (px)", "range_int", 1, 9),
+        ]),
+        ("Crossing faults", [
+            P("csd.connect_prob", "Connect across a fault", "prob",
+              help="The track steps down (or up) by the throw at a fault. Connected: the step is drawn, so the "
+                   "horizon dips down along the fault and continues. Otherwise it is left open."),
+            P("csd.connector", "Connector shape", "choice", choices=CSD_CONNECTORS,
+              help="line: straight ramp across the stroke. smooth: S-curve (drag-like). step: vertical drop in "
+                   "the middle of the stroke. random: one shape per horizon."),
+            P("csd.p_stop_at_fault", "Stop at a fault", "prob",
+              help="Chance that tracking ends at each fault it reaches (growing outward from a seed column)."),
+            P("csd.skip_stroke", "Leave the fault stroke empty", "bool",
+              help="Removes horizon pixels that fall on the fault stroke (also from the connector)."),
+        ]),
+        ("Prompt (horizon dips)", [
+            P("csd.pick_jitter", "Pick jitter (px)", "range_float", 0, 20, 0.1,
+              help="Smooth vertical error of the prompt picks (an imperfect interpreter). The target mask stays "
+                   "exact."),
+            P("csd.jitter_length", "Jitter correlation (px)", "float", 0.5, 500, 1),
+            P("csd.prompt_noise", "Dip noise (tau samples, std)", "range_float", 0, 20, 0.05),
+            P("csd.prompt_dropout", "Pixel dropout", "prob", help="Random prompt pixels removed (sparser input)."),
+            P("csd.prompt_horizon_dropout", "Horizon dropout", "prob",
+              help="Horizons kept in the target but missing from the prompt."),
+            P("csd.prompt_weighted", "Only where the scale weight is 1", "bool"),
+            P("csd.prompt_background", "Background value", "float", -100, 100, 0.5),
+        ]),
+        ("Distance map", [
+            P("csd.distance", "Metric", "choice", choices=CSD_DISTANCES,
+              help="euclidean: 2D distance to the nearest horizon pixel. vertical: along the trace only."),
+            P("csd.distance_clip", "Clip (px, 0 = off)", "float", 0, 2048, 1),
+            P("csd.distance_normalize", "Normalize to 0..1", "bool",
+              help="Divides by the clip value (or by the section size when the clip is off)."),
         ]),
     ]),
 ]

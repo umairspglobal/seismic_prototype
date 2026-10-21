@@ -16,7 +16,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .config import ARRAY_KINDS, GeneratorConfig
+from .config import ARRAY_KINDS, CSD_KINDS, GeneratorConfig
+from .csd import level_at_depth, plan_horizons, section_csd
 from .geology import BlockGeology, build_slice, crop, make_faults, make_stratigraphy
 from .labels import section_labels
 from .seismic import lowest_center, render_block
@@ -29,6 +30,9 @@ FOLDER_PREFIX = {
     "weight": "wtXscale",
     "straddle": "wtXStraddleScale",
     "halo": "wtXHaloScale",
+    "csd_mask": "CsdHorizon",
+    "csd_dip": "CsdDipXscale",
+    "csd_dist": "CsdDistance",
 }
 KIND_TITLES = {
     "seis": "Seismic",
@@ -38,8 +42,11 @@ KIND_TITLES = {
     "weight": "Scale weight",
     "straddle": "Straddle",
     "halo": "Halo",
+    "csd_mask": "CSD horizon mask",
+    "csd_dip": "CSD horizon dips",
+    "csd_dist": "CSD distance",
 }
-SCALED_KINDS = ("dip", "weight", "straddle", "halo")
+SCALED_KINDS = ("dip", "weight", "straddle", "halo", "csd_dip")
 
 
 @dataclass(frozen=True)
@@ -61,8 +68,10 @@ class Product:
 
 def products(cfg: GeneratorConfig, kinds: list[str] | tuple[str, ...] | None = None) -> list[Product]:
     wanted = set(cfg.output.arrays if kinds is None else kinds)
+    if cfg.csd.enabled:
+        wanted.update(CSD_KINDS)
     out: list[Product] = []
-    for kind in ARRAY_KINDS:
+    for kind in ARRAY_KINDS + CSD_KINDS:
         if kind not in wanted:
             continue
         if kind in SCALED_KINDS:
@@ -81,6 +90,7 @@ class Block:
     labels: list[dict[tuple[str, int], np.ndarray]]
     meta: dict
     geology: BlockGeology | None = None
+    csd: list[dict] | None = None
 
     @property
     def n_replicas(self) -> int:
@@ -97,6 +107,10 @@ class Block:
             return self.fault[slice_index]
         if product.kind == "tau":
             return self.tau[slice_index]
+        if product.kind in CSD_KINDS:
+            if self.csd is None:
+                raise ValueError("This block was generated without CSD arrays (enable them in the CSD tab).")
+            return self.csd[slice_index][(product.kind, product.scale)]
         return self.labels[slice_index][(product.kind, product.scale)]
 
     def sample_ids(self, start_id: int, block_offset: int) -> list[tuple[int, int, int]]:
@@ -106,18 +120,20 @@ class Block:
 
 
 def block_streams(seed: int, index: int) -> list[np.random.Generator]:
-    """Independent streams so editing seismic settings keeps the same geology."""
+    """Independent streams so editing seismic or CSD settings keeps the same geology."""
     root = np.random.SeedSequence([int(seed) & 0xFFFFFFFF, int(index)])
-    return [np.random.default_rng(s) for s in root.spawn(3)]
+    return [np.random.default_rng(s) for s in root.spawn(4)]
 
 
 def vertical_pad(cfg: GeneratorConfig) -> int:
     return int(np.clip(np.ceil(1.6 / max(lowest_center(cfg), 1e-3)) + 6, 16, 128))
 
 
-def generate_block(cfg: GeneratorConfig, index: int, seed: int | None = None, keep_geology: bool = False) -> Block:
+def generate_block(cfg: GeneratorConfig, index: int, seed: int | None = None, keep_geology: bool = False,
+                   csd: bool | None = None) -> Block:
+    """``csd`` = None follows ``cfg.csd.enabled``; the GUI preview passes True to show the CSD view."""
     seed = cfg.output.seed if seed is None else seed
-    strat_rng, fault_rng, seis_rng = block_streams(seed, index)
+    strat_rng, fault_rng, seis_rng, csd_rng = block_streams(seed, index)
     H, N = cfg.grid.height, cfg.grid.n_slices
     pad = vertical_pad(cfg)
 
@@ -142,5 +158,27 @@ def generate_block(cfg: GeneratorConfig, index: int, seed: int | None = None, ke
         "faults_visible": [int(sum(st.any() for st in s.strokes)) for s in sections],
         "tau_range": [round(float(tau.min()), 3), round(float(tau.max()), 3)],
     }
+    csd_arrays = None
+    if cfg.csd.enabled if csd is None else csd:
+        csd_arrays, meta["csd_horizons"] = block_csd(csd_rng, cfg, tau, fault, labels)
     geology = BlockGeology(strat=strat, faults=faults, slices=sections, pad=pad, meta=geo_meta) if keep_geology else None
-    return Block(index=int(index), seis=seismic.seis, tau=tau, fault=fault, labels=labels, meta=meta, geology=geology)
+    return Block(index=int(index), seis=seismic.seis, tau=tau, fault=fault, labels=labels, meta=meta, geology=geology,
+                 csd=csd_arrays)
+
+
+def block_csd(rng: np.random.Generator, cfg: GeneratorConfig, tau: np.ndarray, fault: np.ndarray,
+              labels: list[dict]) -> tuple[list[dict], list[int]]:
+    """CSD arrays of every slice; with ``same_across_slices`` every slice tracks the same tau levels."""
+    cs, (N, H, W) = cfg.csd, tau.shape
+    shared = None
+    if cs.same_across_slices:
+        shared = plan_horizons(rng, cs, H, W)
+        for plan in shared:
+            plan.level = level_at_depth(tau[N // 2], plan.depth)
+    arrays, counts = [], []
+    for s in range(N):
+        plans = shared if shared is not None else plan_horizons(rng, cs, H, W)
+        out, drawn = section_csd(tau[s], fault[s], plans, labels[s], cfg.grid.scales, cs, rng)
+        arrays.append(out)
+        counts.append(drawn)
+    return arrays, counts

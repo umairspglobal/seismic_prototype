@@ -136,10 +136,11 @@ next slice in R / G / B, as the app does for 3D volumes) and a 2 x 2 training mo
 - **Settings tabs**: Dataset, Structure, Faults, Seismic, Realism, Labels. Hover a
   setting marked (i) for its help. Every range is drawn per block (or per fault /
   replica), so one dataset mixes many geological settings.
-- **Presets**: Reference match (default), Spec (the literal 8-step description:
-  fixed reflections, 2-trace step to the right, throw on the right edge, radius 2-3,
-  standardise + clip 2.1-4.7), Clean and simple, Complex structure, Noisy field-like,
-  Low / High frequency, Faults only. Load / Save keep settings as JSON (the same file
+- **Presets**: Noisy field-like (default), CSD (noisy field-like data plus horizon
+  tracks, writing Seis, dip, weight and the CSD folders), Spec (the literal 8-step
+  description: fixed reflections, 2-trace step to the right, throw on the right edge,
+  radius 2-3, standardise + clip 2.1-4.7), Clean and simple, Complex structure,
+  Low / High frequency, Faults only. Only the CSD preset turns CSD writing on. Load / Save keep settings as JSON (the same file
   the command line takes).
 - **Preview views**: Overview (seismic, overlay, mask as written, tau, dip, label
   overlay), All arrays (the 15 files of one id), Slices (the six-slice sequence),

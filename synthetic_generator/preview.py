@@ -24,6 +24,7 @@ VIEWS = {
     "replicas": "Replicas and spectra",
     "labels": "Labels at one scale",
     "sam3": "SAM 3 input",
+    "csd": "CSD",
 }
 SEISMIC_CMAPS = ("gray", "seismic", "petrel")
 
@@ -46,6 +47,8 @@ _CMAP_ANCHORS = {
     "inferno": [(0.0, (0, 0, 4)), (0.25, (87, 16, 110)), (0.5, (188, 55, 84)), (0.75, (249, 142, 9)),
                 (1.0, (252, 255, 164))],
     "diverging": [(0.0, (59, 76, 192)), (0.5, (242, 242, 242)), (1.0, (180, 4, 38))],
+    "csd": [(0.0, (250, 196, 110)), (0.3, (200, 120, 60)), (0.5, (60, 25, 75)), (0.7, (60, 110, 180)),
+            (1.0, (130, 215, 245))],
 }
 
 
@@ -85,6 +88,11 @@ def tau_rgb(tau: np.ndarray, spacing: float = 8.0) -> np.ndarray:
     return rgb.astype(np.uint8)
 
 
+def dip_range(a: np.ndarray) -> tuple[float, float]:
+    lo, hi = (float(v) for v in np.percentile(a, [1, 99]))
+    return (lo, hi) if hi > lo else (lo - 1.0, lo + 1.0)
+
+
 def array_rgb(prod: Product, a: np.ndarray, cmap: str = "gray") -> np.ndarray:
     if prod.kind == "seis":
         return seismic_rgb(a, cmap)
@@ -95,6 +103,11 @@ def array_rgb(prod: Product, a: np.ndarray, cmap: str = "gray") -> np.ndarray:
         return colorize(a, "diverging", -m, m)
     if prod.kind == "halo":
         return colorize(a, "inferno", 0.0, 1.0)
+    if prod.kind == "csd_dip":
+        vals = a[a != 0]
+        return colorize(a, "csd", *dip_range(vals if vals.size else a))
+    if prod.kind == "csd_dist":
+        return colorize(a, "inferno", 0.0, float(a.max()) or 1.0)
     return colorize(a, "gray", 0.0, 1.0)
 
 
@@ -262,6 +275,31 @@ def _finetuner_tools():
         return normalize_to_uint8, rgt_to_layers
 
 
+def csd_tiles(block: Block, s: int, S: int, replica: int, cmap: str) -> dict[str, Tile]:
+    """Seismic + horizon tracks, GT dip, weight, prompt, target mask and distance for one slice and scale."""
+    seis = block.seis[replica, s]
+    c = block.csd[s]
+    mask, dist = c[("csd_mask", None)], c[("csd_dist", None)]
+    dip_s, wt = block.labels[s][("dip", S)], block.labels[s][("weight", S)]
+    shown, prompt = c[("csd_prompt", S)], c[("csd_dip", S)]
+    lo, hi = dip_range(dip_s)
+    colored = colorize(dip_s, "csd", lo, hi)
+    on_seis = seismic_rgb(seis, cmap)
+    on_seis[shown] = colored[shown]
+    prompt_rgb = np.full(seis.shape + (3,), 255, np.uint8)
+    prompt_rgb[shown] = colorize(prompt, "csd", lo, hi)[shown]
+    n_hor = block.meta.get("csd_horizons", [0] * block.n_slices)[s]
+    return {
+        "track": Tile(f"Seis+track S={S}", on_seis, seis, f"{int(shown.any(axis=0).sum())} cols", "Seis"),
+        "dip": Tile(f"GT dip S={S}", colored, dip_s, f"{lo:.1f} .. {hi:.1f}", f"dip S={S}"),
+        "weight": Tile(f"Weight S={S}", colorize(wt, "gray", 0, 1), wt, f"{wt.mean() * 100:.0f}% on", f"weight S={S}"),
+        "prompt": Tile(f"Prompt S={S}", prompt_rgb, prompt, f"{int(shown.sum())} px", f"CsdDipXscale{S}"),
+        "mask": Tile("GT mask", colorize(mask, "gray", 0, 1), mask, f"{n_hor} horizons", "CsdHorizon"),
+        "dist": Tile("Distance", colorize(dist, "inferno", 0.0, float(dist.max()) or 1.0), dist,
+                     f"max {dist.max():.3g}", "CsdDistance"),
+    }
+
+
 def view_grid(view: str, cfg: GeneratorConfig) -> tuple[int, int, float]:
     """(columns, rows, extra rows of chart height) used by ``render_view``."""
     if view == "arrays":
@@ -272,6 +310,8 @@ def view_grid(view: str, cfg: GeneratorConfig) -> tuple[int, int, float]:
         return cfg.grid.n_slices, 2, 0.0
     if view == "replicas":
         return cfg.grid.n_replicas, 1, 0.9
+    if view == "csd":
+        return 6, max(1, len(cfg.grid.scales)), 0.0
     return 3, 2, 0.0
 
 
@@ -305,6 +345,10 @@ def render_view(block: Block, cfg: GeneratorConfig, view: str, replica: int = 0,
         return Tile(title, rgb, block.seis[rr, ss], f"slice {ss + 1}, replica {rr}", f"Seis s{ss + 1} r{rr}")
 
     if view == "overview":
+        if cfg.csd.enabled and block.csd is not None:
+            t = csd_tiles(block, s, scale, replica, cmap)
+            tiles = [t["track"], t["dip"], t["weight"], t["prompt"], t["mask"], t["dist"]]
+            return grid(tiles, 3, tile, head + f"  |  coarse-scale dips at S={scale}")
         mask_rgb = colorize(fault, "gray", 0, 1)
         tiles = [
             seis_tile(replica, s, "Seismic", False),
@@ -391,5 +435,15 @@ def render_view(block: Block, cfg: GeneratorConfig, view: str, replica: int = 0,
             Tile("2x2 training mosaic", mosaic, None, "sections tiled like the fine-tuner", "mosaic"),
         ]
         return grid(tiles, 3, tile, head + "  |  what the Quick Fine-Tuner trains on")
+
+    if view == "csd":
+        if block.csd is None:
+            raise ValueError("This block has no CSD arrays; generate it with csd=True.")
+        tiles = []
+        for S in cfg.grid.scales:
+            t = csd_tiles(block, s, S, replica, cmap)
+            tiles += [t["track"], t["dip"], t["weight"], t["prompt"], t["mask"], t["dist"]]
+        note = "" if cfg.csd.enabled else " (preview only)"
+        return grid(tiles, 6, tile, f"Block {block.index}  |  slice {s + 1}/{N}  |  replica {replica}  |  CSD{note}")
 
     raise ValueError(f"Unknown view {view!r}; choose from {list(VIEWS)}")

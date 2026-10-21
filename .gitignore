@@ -40,3 +40,8 @@ frontend/dist/
 *.SGY
 *.uko
 *.UKO
+1.dat
+
+# Local editor state and task notes
+tasks.md
+.cursor/
