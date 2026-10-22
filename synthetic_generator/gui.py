@@ -3,7 +3,8 @@
     python -m synthetic_generator          (or double-click start_synthetic_generator.cmd)
 
 Left: every generator setting, grouped in tabs, plus the dataset card (output
-folder, size estimate, Generate / Stop, progress). Right: a live preview of the
+folder, size estimate, Generate / Stop, time estimate, progress). The Data Viewer
+tab opens a folder of sections and draws it on the right. Right: a live preview of the
 block that will be written - seismic, fault mask, tau, all labels, the six
 slices, the four bandpass replicas with spectra, and exactly what the Quick
 Fine-Tuner feeds SAM 3. Generation runs in a child process
@@ -17,6 +18,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -33,13 +35,16 @@ import numpy as np  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
 
 from synthetic_generator import __version__  # noqa: E402
-from synthetic_generator.block import Block, generate_block, products  # noqa: E402
+from synthetic_generator.block import Block, block_csd, block_streams, generate_block, products  # noqa: E402
 from synthetic_generator.config import (ARRAY_KINDS, DEFAULT_PRESET, PRESETS, GeneratorConfig,  # noqa: E402
                                         default_config, preset)
-from synthetic_generator.dataset import (CONFIG_NAME, check_disk, dataset_bytes, file_bytes,  # noqa: E402
-                                         next_start_id, plan_blocks)
+from synthetic_generator.dataset import (CONFIG_NAME, DEFAULT_WRITE_BPS, auto_workers, block_bytes,  # noqa: E402
+                                         block_cpu_weight, check_disk, dataset_bytes, estimate_run_seconds,
+                                         file_bytes, measure_write_bps, next_start_id, plan_blocks)
 from synthetic_generator.params import TABS, Param, all_params  # noqa: E402
 from synthetic_generator.preview import SEISMIC_CMAPS, VIEWS, TileInfo, fit_tile, render_view  # noqa: E402
+from synthetic_generator.viewer import (catalog_summary, default_keys, describe_id, fit_sample_tile,  # noqa: E402
+                                        load_sample, render_sample, scan_dataset, step_id)
 
 SETTINGS_FILE = REPO_ROOT / "outputs" / "synthetic_generator_gui.json"
 RUN_DIR = REPO_ROOT / "outputs" / "synthetic_generator"
@@ -91,7 +96,9 @@ def human_bytes(n: float) -> str:
 
 
 def fmt_duration(seconds: float) -> str:
-    seconds = int(max(0, seconds))
+    if seconds < 1:
+        return "<1s" if seconds > 0 else "0s"
+    seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h}h {m:02d}m" if h else (f"{m}m {s:02d}s" if m else f"{s}s")
@@ -187,6 +194,7 @@ class GeneratorGUI:
         self._change_job = None
         self.preview_q: queue.Queue = queue.Queue()
         self.gen_q: queue.Queue = queue.Queue()
+        self.probe_q: queue.Queue = queue.Queue()
         self.preview_busy = False
         self.preview_again = False
         self.cached_key: str | None = None
@@ -194,7 +202,15 @@ class GeneratorGUI:
         self.preview_photo = None
         self.preview_infos: list[TileInfo] = []
         self.preview_offset = (0, 0)
-        self.last_gen_seconds = 0.5
+        # Stand-in until the preview times a block on this computer. The weight
+        # is the config that time belongs to, so later setting changes scale it.
+        self.last_gen_seconds = 0.65
+        self._timed_weight = block_cpu_weight(default_config())
+        self.write_bps = float(DEFAULT_WRITE_BPS)
+        self._probed_drive: str | None = None
+        self._probing_drive: str | None = None
+        self._probe_token = 0
+        self._probe_thread: threading.Thread | None = None
         self.proc: subprocess.Popen | None = None
         self.stop_file = RUN_DIR / "stop.flag"
         self.stop_sent = False
@@ -204,6 +220,12 @@ class GeneratorGUI:
         self._start_cache: tuple[tuple, int, float] | None = None
         self.preview_thread: threading.Thread | None = None
         self._closing = False
+        self.catalog = None
+        self.viewer_checks: dict[str, tk.BooleanVar] = {}
+        self._disk_mode = False
+        self._disk_after = None
+        self._viewer_loading = False
+        self._saved_viewer_arrays: list[str] | None = None
 
         root.title(f"Seismic Synthetic Generator {__version__} - SAM 3 datasets")
         root.configure(bg=APP_BG)
@@ -279,6 +301,7 @@ class GeneratorGUI:
         style.configure("Sub.TLabel", background=APP_BG, foreground=MUTED, font=("Segoe UI", 9))
         style.configure("Field.TLabel", background=CARD, foreground=LABEL)
         style.configure("Hint.TLabel", background=CARD, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("Estimate.TLabel", background=CARD, foreground=MUTED, font=("Segoe UI", 8))
         style.configure("AppHint.TLabel", background=APP_BG, foreground=MUTED, font=("Segoe UI", 9))
         style.configure("Section.TLabel", background=CARD, foreground="#93c5fd", font=("Segoe UI", 10, "bold"))
         style.configure("Warn.TLabel", background=CARD, foreground=WARN, font=("Segoe UI", 9))
@@ -381,12 +404,20 @@ class GeneratorGUI:
         self.block_var = tk.IntVar(value=0)
         self.layers_var = tk.IntVar(value=8)
         self.summary_text = tk.StringVar()
+        self.eta_text = tk.StringVar(value=" ")
         self.errors_text = tk.StringVar()
         self.preview_status = tk.StringVar(value="")
         self.readout_text = tk.StringVar(value="Hover the preview to read values; double-click a tile to zoom.")
         self.info_text = tk.StringVar()
         self.stage_text = tk.StringVar(value="Idle")
         self.progress_text = tk.StringVar()
+        self.viewer_dir = tk.StringVar()
+        self.viewer_id = tk.IntVar(value=0)
+        self.viewer_cmap = tk.StringVar(value="gray")
+        self.viewer_faults = tk.BooleanVar(value=True)
+        self.viewer_status = tk.StringVar(value="Choose a folder, then press View.")
+        self.viewer_place = tk.StringVar(value="")
+        self.viewer_banner_text = tk.StringVar(value="")
         for var in (self.view_var, self.slice_var, self.replica_var, self.scale_var, self.cmap_var, self.faults_var,
                     self.layers_var):
             var.trace_add("write", lambda *_: self._schedule_view())
@@ -424,6 +455,7 @@ class GeneratorGUI:
         paned.add(right, weight=1)
         self._build_settings(left)
         self._build_preview(right)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab)
         self.paned = paned
         root.after(100, lambda: self._place_sash())
 
@@ -457,6 +489,7 @@ class GeneratorGUI:
                 self._label_notes(sf.body)
             elif tab_name.startswith("CSD"):
                 self._csd_notes(sf.body)
+        self._build_viewer_tab()
         self._build_generate_card(parent)
 
     def _param_row(self, card: ttk.Frame, row: int, p: Param) -> None:
@@ -547,6 +580,76 @@ class GeneratorGUI:
         ttk.Label(card, text=notes, style="Hint.TLabel", justify="left", wraplength=480).grid(
             row=1, column=0, columnspan=3, sticky="w")
 
+    def _build_viewer_tab(self) -> None:
+        sf = ScrollFrame(self.notebook)
+        self.notebook.add(sf, text="Data Viewer")
+        card = self._card(sf.body, "Folder")
+        card.pack(fill="x", pady=(8, 0), padx=(0, 4))
+        ttk.Label(card, text="Dataset folder", style="Field.TLabel").grid(row=1, column=0, sticky="w", pady=3,
+                                                                          padx=(0, 10))
+        box = ttk.Frame(card, style="Card.TFrame")
+        box.grid(row=1, column=1, sticky="ew")
+        box.columnconfigure(0, weight=1)
+        entry = ttk.Entry(box, textvariable=self.viewer_dir)
+        entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(box, text="...", style="Tool.TButton", width=3, command=self._browse_viewer).grid(
+            row=0, column=1, padx=(4, 0))
+        Tooltip(entry, "A dataset folder (Seis75, Fault75, ...) or a folder of numbered sections (1.dat, 2.npy).")
+        buttons = ttk.Frame(card, style="Card.TFrame")
+        buttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        view_btn = ttk.Button(buttons, text="View", style="Accent.TButton", command=self._view_folder)
+        view_btn.pack(side="left")
+        Tooltip(view_btn, "Read this folder and show the sample on the right.")
+        use_out = ttk.Button(buttons, text="Use output folder", style="Tool.TButton", command=self._use_output_folder)
+        use_out.pack(side="left", padx=6)
+        Tooltip(use_out, "Open the output folder from Generate dataset.")
+        self.viewer_status_label = ttk.Label(card, textvariable=self.viewer_status, style="Hint.TLabel",
+                                             justify="left", wraplength=480)
+        self.viewer_status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        notes = (
+            "Point at the dataset folder that contains Seis75, Fault75 and the other array folders, "
+            "or at one folder of numbered sections (1.dat, 2.npy). View draws that sample on the right. "
+            "Hover a tile to read a value; double-click to zoom. Other tabs return to the generated-block preview."
+        )
+        ttk.Label(card, text=notes, style="Hint.TLabel", justify="left", wraplength=480).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        sample = self._card(sf.body, "Sample")
+        sample.pack(fill="x", pady=(8, 0), padx=(0, 4))
+        nav = ttk.Frame(sample, style="Card.TFrame")
+        nav.grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Button(nav, text="<", style="Tool.TButton", width=2, command=lambda: self._step_viewer_id(-1)).pack(
+            side="left")
+        self.viewer_spin = ttk.Spinbox(nav, textvariable=self.viewer_id, from_=0, to=10_000_000, width=8)
+        self.viewer_spin.pack(side="left", padx=4)
+        ttk.Button(nav, text=">", style="Tool.TButton", width=2, command=lambda: self._step_viewer_id(1)).pack(
+            side="left")
+        ttk.Label(sample, textvariable=self.viewer_place, style="Hint.TLabel", justify="left", wraplength=480).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        arrays = self._card(sf.body, "Arrays")
+        arrays.pack(fill="x", pady=(8, 0), padx=(0, 4))
+        self.viewer_checks_frame = ttk.Frame(arrays, style="Card.TFrame")
+        self.viewer_checks_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        ttk.Label(self.viewer_checks_frame, text="Press View to list the arrays in the folder.",
+                  style="Hint.TLabel").grid(row=0, column=0, sticky="w")
+        tools = ttk.Frame(arrays, style="Card.TFrame")
+        tools.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(tools, text="Seismic only", style="Tool.TButton",
+                   command=lambda: self._viewer_select("seis")).pack(side="left")
+        ttk.Button(tools, text="All arrays", style="Tool.TButton",
+                   command=lambda: self._viewer_select("all")).pack(side="left", padx=4)
+        row = ttk.Frame(arrays, style="Card.TFrame")
+        row.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(row, text="Colormap", style="Field.TLabel").pack(side="left")
+        cmap = ttk.Combobox(row, textvariable=self.viewer_cmap, values=list(SEISMIC_CMAPS), state="readonly", width=8)
+        cmap.pack(side="left", padx=(4, 12))
+        self.viewer_fault_check = ttk.Checkbutton(row, text="Fault overlay", variable=self.viewer_faults)
+        self.viewer_fault_check.pack(side="left")
+        Tooltip(self.viewer_fault_check, "Draws the fault mask on the seismic section when that sample has a Fault file.")
+        for var in (self.viewer_id, self.viewer_cmap, self.viewer_faults):
+            var.trace_add("write", lambda *_: self._on_viewer_control())
+
     def _build_generate_card(self, parent) -> None:
         card = self._card(parent, "Generate dataset", pad=(14, 10))
         card.pack(fill="x", pady=(10, 0))
@@ -568,12 +671,17 @@ class GeneratorGUI:
         self.errors_label.grid(row=4, column=0, columnspan=4, sticky="w")
         buttons = ttk.Frame(card, style="Card.TFrame")
         buttons.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(6, 4))
-        self.start_btn = ttk.Button(buttons, text="Generate dataset", style="Accent.TButton", command=self.start)
-        self.start_btn.pack(side="left")
+        gen_box = ttk.Frame(buttons, style="Card.TFrame")
+        gen_box.pack(side="left", anchor="n")
+        self.start_btn = ttk.Button(gen_box, text="Generate dataset", style="Accent.TButton", command=self.start)
+        self.start_btn.pack(anchor="w")
+        self.eta_label = ttk.Label(gen_box, textvariable=self.eta_text, style="Estimate.TLabel")
+        self.eta_label.pack(anchor="w", pady=(2, 0))
+        self.eta_tip = Tooltip(self.eta_label, "How long these blocks are expected to take on this computer.")
         self.stop_btn = ttk.Button(buttons, text="Stop", style="Danger.TButton", command=self.stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=6)
+        self.stop_btn.pack(side="left", anchor="n", padx=6)
         resume = ttk.Button(buttons, text="Resume last run", style="Tool.TButton", command=self.resume)
-        resume.pack(side="left")
+        resume.pack(side="left", anchor="n")
         self.resume_btn = resume
         Tooltip(resume, "Reloads the settings of the last run in the output folder (same seed and first id) and "
                         "writes only the blocks that are missing or incomplete.")
@@ -603,6 +711,7 @@ class GeneratorGUI:
     def _build_preview(self, parent) -> None:
         bar = self._card(parent, None, pad=(12, 8))
         bar.pack(fill="x")
+        self.preview_bar = bar
         row1 = ttk.Frame(bar, style="Card.TFrame")
         row1.grid(row=0, column=0, sticky="ew")
         ttk.Label(row1, text="Preview block", style="Field.TLabel").pack(side="left")
@@ -646,8 +755,14 @@ class GeneratorGUI:
         ttk.Spinbox(row3, textvariable=self.layers_var, from_=2, to=40, width=4).pack(side="left", padx=(4, 0))
         bar.columnconfigure(0, weight=1)
 
+        self.viewer_banner = self._card(parent, None, pad=(12, 8))
+        ttk.Label(self.viewer_banner, textvariable=self.viewer_banner_text, style="Field.TLabel", justify="left",
+                  wraplength=980).grid(row=0, column=0, sticky="ew")
+        self.viewer_banner.columnconfigure(0, weight=1)
+
         holder = ttk.Frame(parent, style="App.TFrame")
         holder.pack(fill="both", expand=True, pady=(8, 0))
+        self.canvas_holder = holder
         self.canvas = tk.Canvas(holder, bg=APP_BG, highlightthickness=1, highlightbackground=BORDER, bd=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda e: self._schedule_view(delay=250))
@@ -749,9 +864,87 @@ class GeneratorGUI:
         if not errors and self.auto_var.get():
             self.request_preview(regenerate=True)
 
+    def _scaled_compute(self, cfg: GeneratorConfig) -> float:
+        """Preview time of one block, scaled when the settings have moved on since that preview."""
+        weight = block_cpu_weight(cfg, csd=cfg.csd.enabled)
+        base = self._timed_weight or weight
+        return max(0.0, self.last_gen_seconds) * weight / base
+
+    def _update_eta(self, cfg: GeneratorConfig) -> None:
+        seconds = estimate_run_seconds(cfg, self._scaled_compute(cfg), write_bps=self.write_bps)
+        workers = auto_workers(cfg)
+        self.eta_text.set(f"Estimated time: about {fmt_duration(seconds)}")
+        compute = self._scaled_compute(cfg)
+        write_s = block_bytes(cfg) / max(self.write_bps, 1.0)
+        noun = "worker" if workers == 1 else "workers"
+        self.eta_tip.text = (
+            f"About {fmt_duration(seconds)} for {cfg.output.num_blocks:,} blocks on {workers} {noun}. "
+            f"A block like the preview takes {compute:.2f}s to build and {write_s:.1f}s to write; "
+            f"the workers split that. Blocks already in the folder are skipped, so a resumed run can be shorter."
+        )
+
+    def _drive_key(self, path: Path) -> str | None:
+        try:
+            anchor = path.resolve().anchor or path.anchor
+        except OSError:
+            anchor = path.anchor
+        return anchor.lower() if anchor else None
+
+    def _schedule_write_probe(self, out: Path | None) -> None:
+        """Time a short write on the output drive so the estimate is not stuck at the default rate."""
+        if out is None or self._closing:
+            return
+        probe = out
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        if not probe.exists():
+            return
+        key = self._drive_key(probe)
+        if key is None or key == self._probed_drive or key == self._probing_drive:
+            return
+        # Prefer the system temp folder when it is on the same drive, so the
+        # sample write does not land in the dataset folder.
+        target = probe
+        temp = Path(tempfile.gettempdir())
+        if temp.exists() and self._drive_key(temp) == key:
+            target = temp
+        self._probing_drive = key
+        self._probe_token += 1
+        token = self._probe_token
+        self._probe_thread = threading.Thread(target=self._probe_write, args=(target, key, token), daemon=True)
+        self._probe_thread.start()
+
+    def _probe_write(self, directory: Path, key: str, token: int) -> None:
+        try:
+            bps = measure_write_bps(directory)
+        except OSError:
+            bps = 0.0
+        self.probe_q.put((token, key, bps))
+
+    def _drain_probe(self) -> None:
+        while True:
+            try:
+                token, key, bps = self.probe_q.get_nowait()
+            except queue.Empty:
+                return
+            if self._closing or token != self._probe_token:
+                continue
+            self._probing_drive = None
+            # A few megabytes can land in the write cache and look faster than a real run.
+            if 20_000_000 <= bps <= 2_000_000_000:
+                self.write_bps = bps
+            self._probed_drive = key
+            try:
+                cfg, errors = self.read_config()
+            except (tk.TclError, ValueError):
+                return
+            if not errors:
+                self._update_eta(cfg)
+
     def _update_summary(self, cfg: GeneratorConfig, errors: list[str]) -> None:
         if errors:
             self.summary_text.set("Fix the settings below to see the dataset size.")
+            self.eta_text.set(" ")
             return
         out = Path(cfg.output.out_dir) if cfg.output.out_dir else None
         ids = cfg.output.num_blocks * cfg.ids_per_block
@@ -769,10 +962,9 @@ class GeneratorGUI:
                              + ("" if ok else "  - less than the full size (complete blocks are skipped)"))
             except OSError:
                 pass
-        workers = cfg.output.workers or max(1, min(8, (os.cpu_count() or 2) - 1))
-        est = max(cfg.output.num_blocks * self.last_gen_seconds * 1.4 / workers, size / 300e6)
-        lines.append(f"about {fmt_duration(est)} with {workers} workers (assuming ~300 MB/s disk writes)")
         self.summary_text.set("\n".join(lines))
+        self._update_eta(cfg)
+        self._schedule_write_probe(Path(cfg.output.out_dir) if cfg.output.out_dir.strip() else None)
 
     # --- Preview ---------------------------------------------------------------------
 
@@ -795,6 +987,10 @@ class GeneratorGUI:
     def _schedule_view(self, regenerate: bool = False, delay: int = 60) -> None:
         if getattr(self, "_view_job", None):
             self.root.after_cancel(self._view_job)
+            self._view_job = None
+        if self._disk_mode:
+            self._schedule_disk(delay)
+            return
         self._view_job = self.root.after(delay, lambda: self.request_preview(regenerate=regenerate))
 
     def _preview_key(self, cfg: GeneratorConfig, block_index: int) -> str:
@@ -804,6 +1000,8 @@ class GeneratorGUI:
 
     def request_preview(self, regenerate: bool = False) -> None:
         self._view_job = None
+        if self._disk_mode:
+            return
         cfg, errors = self.read_config()
         if errors:
             self.preview_status.set("Preview paused: fix the settings first.")
@@ -842,8 +1040,19 @@ class GeneratorGUI:
     def _preview_worker(self, job: PreviewJob, cached: Block | None) -> None:
         try:
             t0 = time.perf_counter()
-            block = cached or generate_block(job.cfg, job.block_index, csd=True)
-            gen_s = time.perf_counter() - t0 if cached is None else None
+            if cached is None:
+                # Time only the work a dataset run does. The preview still builds
+                # CSD afterwards so that view can open when CSD writing is off.
+                block = generate_block(job.cfg, job.block_index, csd=job.cfg.csd.enabled)
+                gen_s = time.perf_counter() - t0
+                if block.csd is None:
+                    csd_rng = block_streams(job.cfg.output.seed, job.block_index)[3]
+                    arrays, counts = block_csd(csd_rng, job.cfg, block.tau, block.fault, block.labels)
+                    block.csd = arrays
+                    block.meta["csd_horizons"] = counts
+            else:
+                block = cached
+                gen_s = None
             t1 = time.perf_counter()
             image, infos = render_view(block, job.cfg, job.view, replica=job.replica, slice_index=job.slice_index,
                                        scale=job.scale, tile=job.tile, cmap=job.cmap, show_faults=job.faults,
@@ -857,27 +1066,18 @@ class GeneratorGUI:
         self.cached_key, self.cached_block = job.key, block
         if gen_s is not None:
             self.last_gen_seconds = gen_s
-            self._update_summary(job.cfg, [])
-        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        scale = min(1.0, (cw - 4) / image.width, (ch - 4) / image.height)
-        if scale < 1.0:
-            image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.LANCZOS)
-        self.preview_scale = scale
-        self.preview_photo = ImageTk.PhotoImage(image)
-        self.canvas.delete("all")
-        ox, oy = max(0, (cw - image.width) // 2), max(0, (ch - image.height) // 2)
-        self.canvas.create_image(ox, oy, image=self.preview_photo, anchor="nw")
-        self.preview_offset = (ox, oy)
-        self.preview_infos = infos
+            self._timed_weight = block_cpu_weight(job.cfg, csd=job.cfg.csd.enabled)
+            current, errors = self.read_config()
+            self._update_summary(current, errors)
         timing = f"generated in {gen_s:.2f}s, " if gen_s is not None else ""
-        self.preview_status.set(f"{timing}rendered in {render_s:.2f}s")
         m = block.meta
         faults = m["geology"]["faults"]
         seis = m["seismic"]
         fault_txt = ", ".join(f"{f['dip_deg']:.0f}deg {f['dips']} throw {f['throw']:.1f}" for f in faults) or "none"
         unc = m["geology"]["unconformities"]
         clips = ", ".join(f"{c:.2f}{'*' if k else ''}" for c, k in zip(seis["clips"], seis["clipped"]))
-        self.info_text.set(
+        self._show_image(
+            image, infos, f"{timing}rendered in {render_s:.2f}s",
             f"Block {block.index}: {len(faults)} faults ({fault_txt})  |  unconformities {unc}  |  "
             f"chaotic zones {seis['chaotic_zones']}  |  centers {', '.join(f'{h:.0f}' for h in seis['centers_hz'])} Hz  |  "
             f"max |amp| {clips} (* clipped)  |  fault pixels {m['fault_fraction'][job.slice_index] * 100:.2f}%")
@@ -909,6 +1109,245 @@ class GeneratorGUI:
         self.zoom_windows.append(zoom)
         zoom.top.bind("<Destroy>", lambda e, z=zoom: self.zoom_windows.remove(z)
                       if e.widget is z.top and z in self.zoom_windows else None)
+
+    def _show_image(self, image: Image.Image, infos: list[TileInfo], status: str, info: str) -> None:
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        box_w, box_h = max(cw, 8), max(ch, 8)
+        scale = min(1.0, (box_w - 4) / max(image.width, 1), (box_h - 4) / max(image.height, 1))
+        if scale < 1.0:
+            image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.LANCZOS)
+        self.preview_scale = scale
+        self.preview_photo = ImageTk.PhotoImage(image)
+        self.canvas.delete("all")
+        ox, oy = max(0, (cw - image.width) // 2), max(0, (ch - image.height) // 2)
+        self.canvas.create_image(ox, oy, image=self.preview_photo, anchor="nw")
+        self.preview_offset = (ox, oy)
+        self.preview_infos = infos
+        self.preview_status.set(status)
+        self.info_text.set(info)
+
+    def _show_canvas_message(self, text: str) -> None:
+        self.preview_photo = None
+        self.preview_infos = []
+        self.preview_offset = (0, 0)
+        self.preview_scale = 1.0
+        self.canvas.delete("all")
+        self.canvas.create_text(24, 24, text=text, anchor="nw", fill=MUTED, font=("Segoe UI", 12), width=720)
+        self.preview_status.set("")
+        self.info_text.set("")
+
+    # --- Data viewer -----------------------------------------------------------------
+
+    def _on_tab(self, _event=None) -> None:
+        try:
+            name = self.notebook.tab(self.notebook.select(), "text")
+        except tk.TclError:
+            return
+        if name == "Data Viewer":
+            if not self._disk_mode:
+                self._enter_disk_mode()
+        elif self._disk_mode:
+            self._leave_disk_mode()
+
+    def _enter_disk_mode(self) -> None:
+        if getattr(self, "_view_job", None):
+            try:
+                self.root.after_cancel(self._view_job)
+            except tk.TclError:
+                pass
+            self._view_job = None
+        self._disk_mode = True
+        self.preview_bar.pack_forget()
+        self.viewer_banner.pack(fill="x", before=self.canvas_holder)
+        self._render_disk()
+
+    def _leave_disk_mode(self) -> None:
+        self._disk_mode = False
+        if self._disk_after is not None:
+            try:
+                self.root.after_cancel(self._disk_after)
+            except tk.TclError:
+                pass
+            self._disk_after = None
+        self.viewer_banner.pack_forget()
+        self.preview_bar.pack(fill="x", before=self.canvas_holder)
+        self.request_preview()
+
+    def _schedule_disk(self, delay: int = 60) -> None:
+        if self._viewer_loading or not self._disk_mode or self._closing:
+            return
+        if self._disk_after is not None:
+            try:
+                self.root.after_cancel(self._disk_after)
+            except tk.TclError:
+                pass
+        self._disk_after = self.root.after(delay, self._render_disk)
+
+    def _on_viewer_control(self, *_args) -> None:
+        if self._viewer_loading or not self._disk_mode or self._closing:
+            return
+        self._render_disk()
+
+    def _set_viewer_status(self, text: str, error: bool = False) -> None:
+        self.viewer_status.set(text)
+        self.viewer_status_label.configure(style="Err.TLabel" if error else "Hint.TLabel")
+
+    def _viewer_chosen(self, catalog) -> set[str]:
+        available = {folder.key for folder in catalog.arrays}
+        previous = {key for key, var in self.viewer_checks.items() if var.get()}
+        if self.viewer_checks and previous & available:
+            return previous & available
+        saved = self._saved_viewer_arrays
+        if not self.viewer_checks and isinstance(saved, list) and set(saved) & available:
+            return set(saved) & available
+        return default_keys(catalog.arrays)
+
+    def _fill_viewer_checks(self, catalog) -> None:
+        chosen = self._viewer_chosen(catalog)
+        for child in self.viewer_checks_frame.winfo_children():
+            child.destroy()
+        self.viewer_checks.clear()
+        if not catalog.arrays:
+            ttk.Label(self.viewer_checks_frame, text="No arrays to show.", style="Hint.TLabel").grid(
+                row=0, column=0, sticky="w")
+            return
+        for i, src in enumerate(catalog.arrays):
+            var = tk.BooleanVar(value=src.key in chosen)
+            var.trace_add("write", lambda *_: self._on_viewer_control())
+            ttk.Checkbutton(self.viewer_checks_frame, text=src.name, variable=var).grid(
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 12), pady=1)
+            self.viewer_checks[src.key] = var
+
+    def _apply_catalog(self, catalog) -> None:
+        self._viewer_loading = True
+        try:
+            self.catalog = catalog
+            self._fill_viewer_checks(catalog)
+            self._set_viewer_status(catalog_summary(catalog), error=not catalog.arrays)
+            has_fault = any(folder.kind == "fault" for folder in catalog.arrays)
+            self.viewer_fault_check.configure(state="normal" if has_fault else "disabled")
+            if catalog.ids:
+                lo, hi = catalog.ids[0], catalog.ids[-1]
+                self.viewer_spin.configure(from_=lo, to=hi)
+                cur = self._int(self.viewer_id, lo)
+                if cur < lo or cur > hi:
+                    self.viewer_id.set(lo)
+            self.viewer_place.set(describe_id(catalog.layout, self._int(self.viewer_id, 0)) if catalog.ids else "")
+        finally:
+            self._viewer_loading = False
+
+    def _render_disk(self) -> None:
+        self._disk_after = None
+        if self._closing or not self._disk_mode:
+            return
+        try:
+            self._draw_folder_sample()
+        except Exception:  # noqa: BLE001 - shown in the console
+            self.preview_status.set("Could not draw this sample.")
+            self._log(traceback.format_exc(), "err")
+
+    def _draw_folder_sample(self) -> None:
+        cat = self.catalog
+        if cat is None:
+            self.viewer_banner_text.set("Choose a folder and press View.")
+            self.viewer_place.set("")
+            self._show_canvas_message("Choose a folder in Data Viewer and press View.")
+            return
+        if not cat.arrays:
+            self.viewer_banner_text.set(str(cat.root))
+            self.viewer_place.set("")
+            self._show_canvas_message(catalog_summary(cat))
+            return
+        keys = {key for key, var in self.viewer_checks.items() if var.get()}
+        if not keys:
+            self.viewer_banner_text.set(str(cat.root))
+            self._show_canvas_message("Select at least one array.")
+            self.preview_status.set("Select at least one array.")
+            return
+        sid = self._int(self.viewer_id, cat.ids[0])
+        place = describe_id(cat.layout, sid)
+        self.viewer_place.set(place)
+        self.viewer_banner_text.set(f"{place}    {cat.root}")
+        overlay_fault = bool(self.viewer_faults.get()) and any(folder.kind == "fault" for folder in cat.arrays)
+        sample = load_sample(cat, sid, keys, overlay_fault)
+        if not sample.sections:
+            detail = sample.errors[0] if sample.errors else f"No section files for id {sid} in the selected arrays."
+            self._show_canvas_message(detail)
+            self.preview_status.set(detail)
+            return
+        cw, ch = max(self.canvas.winfo_width(), 200), max(self.canvas.winfo_height(), 200)
+        tile = fit_sample_tile(len(sample.sections), cw - 8, ch - 8)
+        cmap = self.viewer_cmap.get()
+        if cmap not in SEISMIC_CMAPS:
+            cmap = "gray"
+        image, infos = render_sample(cat, sample, sid, cmap, bool(self.viewer_faults.get()), tile)
+        parts = []
+        seis = next((arr for src, arr in sample.sections if src.kind == "seis"), None)
+        if seis is not None and seis.size:
+            parts.append(f"seismic  min {seis.min():.4g}  max {seis.max():.4g}  mean {seis.mean():.4g}")
+        if sample.fault is not None and self.viewer_faults.get():
+            parts.append(f"fault pixels {float((sample.fault > 0.5).mean()) * 100:.2f}%")
+        if cat.shape:
+            parts.append(f"{cat.shape[0]} x {cat.shape[1]}")
+        if sample.errors:
+            parts.append(sample.errors[0])
+        n = len(sample.sections)
+        self._show_image(image, infos, f"{n} array" + ("s" if n != 1 else ""), "   |   ".join(parts))
+
+    def _view_folder(self) -> None:
+        path_text = self.viewer_dir.get().strip()
+        if not path_text:
+            self._set_viewer_status("Choose a folder first.", error=True)
+            return
+        path = Path(path_text).expanduser()
+        self._set_viewer_status("Reading folder...")
+        self.root.update_idletasks()
+        try:
+            catalog = scan_dataset(path)
+        except (OSError, ValueError) as exc:
+            self._set_viewer_status(str(exc), error=True)
+            return
+        self._apply_catalog(catalog)
+        if not self._disk_mode:
+            self._enter_disk_mode()
+        else:
+            self._render_disk()
+
+    def _browse_viewer(self) -> None:
+        before = self.viewer_dir.get()
+        self._browse_dir(self.viewer_dir)
+        if self.viewer_dir.get() != before and Path(self.viewer_dir.get()).is_dir():
+            self._view_folder()
+
+    def _use_output_folder(self) -> None:
+        path = self.vars["output.out_dir"].get().strip()
+        if not path:
+            self._set_viewer_status("Set an output folder on the Dataset tab first.", error=True)
+            return
+        self.viewer_dir.set(path)
+        self._view_folder()
+
+    def _step_viewer_id(self, delta: int) -> None:
+        cat = self.catalog
+        if cat is None or not cat.ids:
+            return
+        cur = self._int(self.viewer_id, cat.ids[0])
+        nxt = step_id(cat.ids, cur, delta)
+        if nxt != cur:
+            self.viewer_id.set(nxt)
+
+    def _viewer_select(self, mode: str) -> None:
+        if not self.viewer_checks or self.catalog is None:
+            return
+        self._viewer_loading = True
+        try:
+            for src in self.catalog.arrays:
+                self.viewer_checks[src.key].set(True if mode == "all" else src.kind == "seis")
+            if mode == "seis" and not any(var.get() for var in self.viewer_checks.values()):
+                self.viewer_checks[self.catalog.arrays[0].key].set(True)
+        finally:
+            self._viewer_loading = False
+        self._on_viewer_control()
 
     # --- Generation ----------------------------------------------------------------------
 
@@ -1213,6 +1652,7 @@ class GeneratorGUI:
         try:
             self._drain_preview()
             self._drain_generation()
+            self._drain_probe()
         except Exception:  # noqa: BLE001 - keep the event loop alive, show the error
             self._log(traceback.format_exc(), "err")
         finally:
@@ -1228,14 +1668,19 @@ class GeneratorGUI:
             self.preview_busy = False
             try:
                 if item[0] == "ok":
-                    _, job, block, image, infos, gen_s, render_s = item
-                    self._show_preview(job, block, image, infos, gen_s, render_s)
+                    if not self._disk_mode:
+                        _, job, block, image, infos, gen_s, render_s = item
+                        self._show_preview(job, block, image, infos, gen_s, render_s)
+                elif self._disk_mode:
+                    self._log(item[2], "err")
                 else:
                     self.preview_status.set("Preview failed - see the console.")
                     self._log(item[2], "err")
             finally:
-                if self.preview_again:
+                if self.preview_again and not self._disk_mode:
                     self._start_preview(self._pending_job)
+                else:
+                    self.preview_again = False
 
     def _drain_generation(self) -> None:
         while True:
@@ -1262,6 +1707,10 @@ class GeneratorGUI:
             "config": cfg.to_dict(), "preset": self.preset_var.get(), "view": self.view_var.get(),
             "block": self._int(self.block_var, 0), "auto": bool(self.auto_var.get()), "cmap": self.cmap_var.get(),
             "faults": bool(self.faults_var.get()), "layers": self._int(self.layers_var, 8),
+            "viewer_dir": self.viewer_dir.get(), "viewer_id": self._int(self.viewer_id, 0),
+            "viewer_cmap": self.viewer_cmap.get(), "viewer_faults": bool(self.viewer_faults.get()),
+            "viewer_arrays": ([key for key, var in self.viewer_checks.items() if var.get()]
+                              if self.viewer_checks else self._saved_viewer_arrays),
         }
         try:
             SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1294,17 +1743,39 @@ class GeneratorGUI:
                          ("layers", self.layers_var)):
             if key in data:
                 var.set(data[key])
+        saved_arrays = data.get("viewer_arrays")
+        if isinstance(saved_arrays, list):
+            self._saved_viewer_arrays = [str(item) for item in saved_arrays]
+        if isinstance(data.get("viewer_dir"), str):
+            self.viewer_dir.set(data["viewer_dir"])
+        viewer_id = data.get("viewer_id")
+        if isinstance(viewer_id, (int, float)) and not isinstance(viewer_id, bool):
+            self.viewer_id.set(int(viewer_id))
+        if data.get("viewer_cmap") in SEISMIC_CMAPS:
+            self.viewer_cmap.set(data["viewer_cmap"])
+        if isinstance(data.get("viewer_faults"), bool):
+            self.viewer_faults.set(data["viewer_faults"])
         self._write_config(cfg)
         self._dark_titlebar()
-        self._log("Ready. Preview block k is exactly dataset block k for the same seed. Hover a tile to read values, "
-                  "double-click to zoom; hover a setting's (i) for help.", "info")
+        self._log("Ready. Preview block k is exactly dataset block k for the same seed. The Data Viewer tab opens a "
+                  "folder of sections. Hover a tile to read values, double-click to zoom; hover a setting's (i) for help.",
+                  "info")
 
     def shutdown(self) -> None:
         """Stop scheduling work and wait for a running preview, before the window is destroyed."""
         self._closing = True
+        if self._disk_after is not None:
+            try:
+                self.root.after_cancel(self._disk_after)
+            except tk.TclError:
+                pass
+            self._disk_after = None
         thread = self.preview_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=15)
+        probe = self._probe_thread
+        if probe is not None and probe.is_alive():
+            probe.join(timeout=15)
 
     def _on_close(self) -> None:
         if self.proc and not messagebox.askyesno(

@@ -13,8 +13,8 @@ import pytest
 from synthetic_generator import labels as lab
 from synthetic_generator.block import Product, generate_block, products
 from synthetic_generator.config import ARRAY_KINDS, PRESETS, GeneratorConfig, LabelConfig, preset
-from synthetic_generator.dataset import (block_id_list, generate_dataset, next_start_id, plan_blocks,
-                                         read_block_from_disk)
+from synthetic_generator.dataset import (block_cpu_weight, block_id_list, estimate_run_seconds, generate_dataset,
+                                         measure_write_bps, next_start_id, plan_blocks, read_block_from_disk)
 from synthetic_generator.geology import Fault, Package, Stratigraphy, build_slice
 from synthetic_generator.params import all_params
 from synthetic_generator.seismic import gaussianize
@@ -465,6 +465,49 @@ def test_plan_counts_only_missing_files_and_requires_a_folder(tmp_path):
         generate_dataset(cfg)
 
 
+def test_run_estimate_follows_blocks_workers_and_bytes():
+    cfg = GeneratorConfig()
+    cfg.output.num_blocks = 10
+    cfg.output.workers = 1
+    one = estimate_run_seconds(cfg, 0.5, write_bps=200_000_000)
+    cfg.output.num_blocks = 20
+    two = estimate_run_seconds(cfg, 0.5, write_bps=200_000_000)
+    assert two == pytest.approx(one * 2)
+    cfg.output.workers = 4
+    parallel = estimate_run_seconds(cfg, 0.5, write_bps=200_000_000)
+    assert parallel < two
+    cfg.output.dtype = "float32"
+    assert estimate_run_seconds(cfg, 0.5, write_bps=200_000_000) < parallel
+    assert estimate_run_seconds(cfg, 0.5, n_blocks=0) == 0.0
+
+
+def test_cpu_weight_tracks_grid_replicas_and_wavelet():
+    base = GeneratorConfig()
+    weight = block_cpu_weight(base)
+    wider = base.copy()
+    wider.grid.width *= 2
+    assert block_cpu_weight(wider) == pytest.approx(weight * 2)
+    fewer = base.copy()
+    fewer.grid.n_slices = 3
+    fewer.grid.n_replicas = 2
+    assert block_cpu_weight(fewer) / weight == pytest.approx(0.414, rel=0.02)
+    quick = base.copy()
+    quick.seismic.supersample = 1
+    mapped = base.copy()
+    mapped.seismic.render_mode = "tau-mapping"
+    assert block_cpu_weight(quick) < weight
+    assert block_cpu_weight(mapped) < weight
+    with_csd = base.copy()
+    with_csd.csd.enabled = True
+    assert block_cpu_weight(with_csd) > weight
+
+
+def test_write_probe_removes_its_files(tmp_path):
+    rate = measure_write_bps(tmp_path, n_files=2)
+    assert rate > 0
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_cli_generate_and_inspect(tmp_path, capsys):
     from synthetic_generator.cli import main
 
@@ -526,10 +569,16 @@ def test_gui_builds_and_reads_settings(monkeypatch, tmp_path):
     import synthetic_generator.gui as gui_mod
 
     monkeypatch.setattr(gui_mod, "SETTINGS_FILE", tmp_path / "gui.json")
+    monkeypatch.setattr(gui_mod, "measure_write_bps", lambda *args, **kwargs: 200_000_000)
     try:
         root.withdraw()
         gui = gui_mod.GeneratorGUI(root)
         root.update()
+        gui._apply_change()
+        assert gui.eta_text.get().startswith("Estimated time: about ")
+        assert gui.eta_label.cget("style") == "Estimate.TLabel"
+        assert "8" in str(gui_mod.ttk.Style(root).lookup("Estimate.TLabel", "font"))
+        assert "MB/s" not in gui.summary_text.get()
         assert root.cget("bg") == gui_mod.APP_BG
         cfg, errors = gui.read_config()
         assert errors == [] and cfg.validate() == []
@@ -538,7 +587,8 @@ def test_gui_builds_and_reads_settings(monkeypatch, tmp_path):
         cfg, errors = gui.read_config()
         assert cfg.faults.stroke_radius[1] == 2.5 and "halo" not in cfg.output.arrays
         tabs = [gui.notebook.tab(t, "text") for t in gui.notebook.tabs()]
-        assert tabs == ["Dataset", "Structure", "Faults", "Seismic", "Realism", "Labels", "CSD (In-Progress)"]
+        assert tabs == ["Dataset", "Structure", "Faults", "Seismic", "Realism", "Labels", "CSD (In-Progress)",
+                        "Data Viewer"]
         gui.vars["csd.enabled"].set(True)
         gui.vars["csd.connector"].set("step")
         cfg, errors = gui.read_config()
@@ -582,6 +632,7 @@ def test_send_to_finetuner_writes_its_settings(monkeypatch, tmp_path):
     import synthetic_generator.gui as gui_mod
 
     monkeypatch.setattr(gui_mod, "SETTINGS_FILE", tmp_path / "gui.json")
+    monkeypatch.setattr(gui_mod, "measure_write_bps", lambda *args, **kwargs: 200_000_000)
     monkeypatch.setattr(ft, "SETTINGS_FILE", tmp_path / "ft.json")
     launched = []
     monkeypatch.setattr(gui_mod.subprocess, "Popen", lambda *a, **k: launched.append(a[0]))
@@ -602,5 +653,170 @@ def test_send_to_finetuner_writes_its_settings(monkeypatch, tmp_path):
         assert launched and launched[0][1:] == ["-m", "finetuning.finetune_gui"]
     finally:
         if "gui" in locals():
+            gui.shutdown()
+        root.destroy()
+
+
+def _write_dat(directory, sid: int, values: np.ndarray) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    np.ascontiguousarray(values, dtype="<f8").tofile(directory / f"{sid}.dat")
+
+
+def test_scan_dataset_reads_array_folders_and_one_section_folder(tmp_path):
+    from synthetic_generator.viewer import (SampleLayout, default_keys, describe_id, load_sample, render_sample,
+                                            scan_dataset, step_id)
+
+    root = tmp_path / "set"
+    _write_dat(root / "Fault75", 2, np.zeros((4, 4)))
+    _write_dat(root / "Seis75", 2, np.linspace(-1.2, 1.2, 16).reshape(4, 4))
+    _write_dat(root / "dipXscale12_75", 2, np.full((4, 4), 0.5))
+    _write_dat(root / "wtXscale12_75", 2, np.ones((4, 4)))
+    _write_dat(root / "wtXStraddleScale60_75", 2, np.zeros((4, 4)))
+    _write_dat(root / "CsdHorizon75", 2, np.ones((4, 4)))
+    _write_dat(root / "CsdDipXscale12_75", 2, np.zeros((4, 4)))
+    (root / "generator_config.json").write_text(json.dumps({"grid": {"n_slices": 3, "n_replicas": 2}}))
+    cat = scan_dataset(root)
+    assert [(a.kind, a.scale) for a in cat.arrays] == [
+        ("seis", None), ("fault", None), ("dip", 12), ("weight", 12), ("straddle", 60),
+        ("csd_mask", None), ("csd_dip", 12),
+    ]
+    assert cat.ids == (2,) and cat.shape == (4, 4) and cat.layout == SampleLayout(3, 2)
+    assert default_keys(cat.arrays) == {"seis", "fault"}
+    assert describe_id(cat.layout, 2) == "id 2  |  block 0  |  slice 3/3  |  replica 0"
+    assert describe_id(None, 4) == "id 4"
+    assert step_id((0, 1, 2, 10), 2, 1) == 10
+    assert step_id((0, 1, 2, 10), 2, -1) == 1
+    assert step_id((0, 1, 2, 10), 0, -1) == 0
+    assert step_id((0, 1, 2, 10), 10, 1) == 10
+    assert step_id((0, 1, 2, 10), 5, 1) == 10
+    assert step_id((0, 1, 2, 10), 5, -1) == 2
+
+    seis = np.linspace(-1.2, 1.2, 16).reshape(4, 4)
+    fault = np.zeros((4, 4))
+    fault[1, 2] = 1
+    _write_dat(root / "Seis75", 2, seis)
+    _write_dat(root / "Fault75", 2, fault)
+    loaded = load_sample(cat, 2, {"seis", "fault"}, True)
+    assert np.allclose(loaded.sections[0][1], seis) and loaded.fault[1, 2] == 1
+    plain, infos = render_sample(cat, loaded, 2, "gray", False, 64)
+    over, _ = render_sample(cat, loaded, 2, "gray", True, 64)
+    assert plain.tobytes() != over.tobytes()
+    assert infos[0].label == "Seis" and np.allclose(infos[0].array, seis)
+
+    broken = tmp_path / "broken"
+    _write_dat(broken / "Seis75", 1, np.ones((4, 4)))
+    (broken / "generator_config.json").write_text("{not json")
+    assert scan_dataset(broken).layout is None
+
+    lone = tmp_path / "pack" / "Seis75"
+    _write_dat(lone, 3, np.ones((4, 4)))
+    (lone.parent / "generator_config.json").write_text(
+        json.dumps({"grid": {"n_slices": 6, "n_replicas": 4}}))
+    one = scan_dataset(lone)
+    assert one.arrays[0].kind == "seis" and one.ids == (3,)
+    assert one.layout == SampleLayout(6, 4)
+    assert describe_id(one.layout, 3) == "id 3  |  block 0  |  slice 4/6  |  replica 0"
+
+    lines = tmp_path / "lines"
+    section = np.linspace(-1.5, 1.5, 64).reshape(8, 8)
+    _write_dat(lines, 4, section)
+    np.save(lines / "4.npy", np.zeros((8, 8)))
+    loose = scan_dataset(lines)
+    assert loose.arrays[0].kind == "section" and loose.ids == (4,)
+    got = load_sample(loose, 4, {"section"}, False)
+    assert np.allclose(got.sections[0][1], section)
+    _, tiles = render_sample(loose, got, 4, "gray", False, 48)
+    assert tiles[0].label == "Seis"
+
+    rect = tmp_path / "rect"
+    rect.mkdir()
+    np.save(rect / "8.npy", np.arange(15, dtype=np.float64).reshape(3, 5))
+    wide = scan_dataset(rect)
+    assert wide.shape == (3, 5)
+    wide_sample = load_sample(wide, 8, {"section"}, False)
+    assert wide_sample.sections[0][1].shape == (3, 5)
+
+    empty = tmp_path / "empty"
+    (empty / "Seis75").mkdir(parents=True)
+    assert "Seis75" in scan_dataset(empty).hint
+
+    survey = tmp_path / "survey"
+    survey.mkdir()
+    (survey / "vol.sgy").write_bytes(b"x")
+    assert "SEG-Y" in scan_dataset(survey).hint
+
+    outer = tmp_path / "outer"
+    _write_dat(outer / "synthetic_75" / "Seis75", 1, np.zeros((4, 4)))
+    assert "synthetic_75" in scan_dataset(outer).hint
+
+    with pytest.raises(FileNotFoundError):
+        scan_dataset(tmp_path / "missing")
+    text = tmp_path / "file.txt"
+    text.write_text("x")
+    with pytest.raises(NotADirectoryError):
+        scan_dataset(text)
+
+
+def test_load_sample_rejects_a_file_that_is_not_one_section(tmp_path, monkeypatch):
+    import synthetic_generator.viewer as viewer
+
+    monkeypatch.setattr(viewer, "MAX_SECTION_BYTES", 16)
+    folder = tmp_path / "Seis75"
+    folder.mkdir()
+    (folder / "1.dat").write_bytes(b"0123456789abcdef" * 4)
+    cat = viewer.scan_dataset(folder)
+    sample = viewer.load_sample(cat, 1, {"seis"}, False)
+    assert sample.sections == [] and sample.errors
+
+
+def test_data_viewer_tab_shows_a_folder(monkeypatch, tmp_path):
+    root = _tk_root()
+    import synthetic_generator.gui as gui_mod
+
+    monkeypatch.setattr(gui_mod, "SETTINGS_FILE", tmp_path / "gui.json")
+    monkeypatch.setattr(gui_mod, "measure_write_bps", lambda *args, **kwargs: 200_000_000)
+    data = tmp_path / "data"
+    _write_dat(data / "Seis75", 0, np.full((8, 8), 0.25))
+    _write_dat(data / "Seis75", 1, np.full((8, 8), -0.5))
+    fault = np.zeros((8, 8))
+    fault[1, 1] = 1.0
+    _write_dat(data / "Fault75", 0, fault)
+    _write_dat(data / "Fault75", 1, fault)
+    (data / "generator_config.json").write_text(json.dumps({"grid": {"n_slices": 3, "n_replicas": 2}}))
+    try:
+        root.withdraw()
+        gui = gui_mod.GeneratorGUI(root)
+        root.update()
+        tab = next(t for t in gui.notebook.tabs() if gui.notebook.tab(t, "text") == "Data Viewer")
+        gui.notebook.select(tab)
+        root.update()
+        assert gui._disk_mode and gui.viewer_banner.winfo_manager() == "pack"
+        gui.viewer_dir.set(str(data))
+        gui._view_folder()
+        seis = next(info for info in gui.preview_infos if info.label == "Seis")
+        assert seis.array[0, 0] == pytest.approx(0.25)
+        assert any(info.label == "Fault" for info in gui.preview_infos)
+        assert "Seis75" in gui.viewer_status.get() and "slice 1/3" in gui.viewer_place.get()
+        assert gui.viewer_status_label.cget("style") == "Hint.TLabel"
+
+        gui._step_viewer_id(1)
+        seis = next(info for info in gui.preview_infos if info.label == "Seis")
+        assert gui.viewer_id.get() == 1 and seis.array[0, 0] == pytest.approx(-0.5)
+        assert "slice 2/3" in gui.viewer_place.get()
+
+        gui._viewer_select("seis")
+        assert [info.label for info in gui.preview_infos] == ["Seis"]
+        gui._save_settings()
+        saved = json.loads((tmp_path / "gui.json").read_text(encoding="utf-8"))
+        assert saved["viewer_dir"] == str(data) and saved["viewer_arrays"] == ["seis"] and saved["viewer_id"] == 1
+
+        gui._start_preview = lambda *args, **kwargs: None
+        gui.notebook.select(gui.notebook.tabs()[0])
+        root.update()
+        assert not gui._disk_mode
+        assert gui.preview_bar.winfo_manager() == "pack" and gui.viewer_banner.winfo_manager() == ""
+    finally:
+        if "gui" in locals():
+            gui.proc = None
             gui.shutdown()
         root.destroy()

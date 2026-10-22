@@ -18,6 +18,7 @@ import csv
 import json
 import os
 import shutil
+import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime
@@ -174,6 +175,84 @@ def auto_workers(cfg: GeneratorConfig) -> int:
     if cfg.output.workers > 0:
         return cfg.output.workers
     return max(1, min(8, (os.cpu_count() or 2) - 1))
+
+
+# One full default block (15 arrays, 144 MB) wrote at about this rate with
+# ``ndarray.tofile``, the same call the generator uses. The GUI replaces it
+# with a measurement of the output drive when it can.
+DEFAULT_WRITE_BPS = 200_000_000
+
+# Spawning the process pool (each worker imports this package) measured about
+# 0.9s plus 0.12s per worker on Windows. One worker stays in-process, so it
+# pays no startup. Checked against timed runs of the default preset:
+# 8 blocks / 1 worker 11.6s, 8 / 4 workers 4.4s, 8 / 8 workers 3.3s.
+_POOL_START_S = 0.9
+_POOL_START_PER_WORKER_S = 0.12
+
+
+def block_cpu_weight(cfg: GeneratorConfig, *, csd: bool | None = None) -> float:
+    """Relative CPU cost of building one block. Only ratios between configs are used.
+
+    Timed ``generate_block`` calls track the section area. Each slice pays for
+    the geology, reflectivity and labels; each replica pays for filtering the
+    wavelet, and that part grows with the supersample. Tau-mapping filters one
+    impedance log instead of a supersampled section. Halo blurs get wider as the
+    scale S grows, so the label cost follows both the number of scales and their
+    sum. CSD adds a smaller pass over the same grid.
+    """
+    grid = cfg.grid
+    area = max(1, int(grid.height)) * max(1, int(grid.width))
+    scales = [max(1, int(s)) for s in grid.scales] or [1]
+    scale_units = 0.62 * (len(scales) / 3) + 0.38 * (sum(scales) / 108)
+    per_slice = 0.73 + 0.27 * scale_units
+    if cfg.seismic.render_mode == "convolution":
+        per_replica = 0.131 * max(1, int(cfg.seismic.supersample)) / 4
+    else:
+        per_replica = 0.036
+    slices = max(1, int(grid.n_slices))
+    replicas = max(1, int(grid.n_replicas))
+    weight = area * slices * (per_slice + replicas * per_replica)
+    include_csd = cfg.csd.enabled if csd is None else csd
+    if include_csd:
+        horizons = max(1.0, 0.5 * float(sum(cfg.csd.count)))
+        weight += area * slices * (0.22 + 0.03 * horizons)
+    return float(weight)
+
+
+def estimate_run_seconds(cfg: GeneratorConfig, block_compute_s: float, *,
+                         write_bps: float = DEFAULT_WRITE_BPS, n_blocks: int | None = None) -> float:
+    """Wall-clock seconds to build and write ``n_blocks`` (the configured count by default).
+
+    ``block_compute_s`` is one ``generate_block`` on this machine, usually the
+    live preview. The worker then writes that block, and timed runs show those
+    two steps add. Extra workers split the blocks evenly (compute and writing
+    both sped up on the machine this was checked on). A process pool pays a
+    small startup; a single worker does not, because it stays in-process.
+    """
+    n = cfg.output.num_blocks if n_blocks is None else int(n_blocks)
+    if n <= 0:
+        return 0.0
+    workers = min(auto_workers(cfg), n)
+    per_block = max(0.0, float(block_compute_s)) + block_bytes(cfg) / max(float(write_bps), 1.0)
+    if workers == 1:
+        return n * per_block
+    return _POOL_START_S + _POOL_START_PER_WORKER_S * workers + n * per_block / workers
+
+
+def measure_write_bps(directory: str | Path, n_files: int = 40) -> float:
+    """Bytes per second writing section files the way a run does. The files are removed."""
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix=".wprobe_", dir=root))
+    blob = np.random.default_rng(0).random(224 * 224).astype("<f8")
+    try:
+        t0 = time.perf_counter()
+        for i in range(n_files):
+            blob.tofile(folder / f"{i}.dat")
+        elapsed = time.perf_counter() - t0
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    return n_files * int(blob.nbytes) / max(elapsed, 1e-6)
 
 
 def check_disk(out_dir: Path, needed: int) -> tuple[bool, int]:
