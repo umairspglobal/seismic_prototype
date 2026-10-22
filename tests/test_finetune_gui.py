@@ -83,3 +83,48 @@ def test_data_and_output_follow_the_log_sash():
         assert gui.epochs.get() == 4
     finally:
         root.destroy()
+
+
+def test_csd_preset_follows_the_generator_suffix(monkeypatch, tmp_path):
+    tk = pytest.importorskip("tkinter")
+    import time
+
+    root = None
+    error = None
+    for _ in range(3):
+        try:
+            root = tk.Tk()
+            break
+        except tk.TclError as exc:
+            error = exc
+            time.sleep(0.3)
+    if root is None:
+        pytest.skip(f"Tk display is not available: {error}")
+
+    import json
+
+    import finetuning.finetune_gui as ft
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "generator_config.json").write_text(json.dumps({"output": {"suffix": "80"}}), encoding="utf-8")
+    (data / "Seis75").mkdir()
+    monkeypatch.setattr(ft, "SETTINGS_FILE", tmp_path / "ft.json")
+    try:
+        root.withdraw()
+        gui = ft.FinetuneGUI(root)
+        gui.data_root.set(str(data))
+        gui.preset.set(next(k for k, v in ft.PRESETS.items() if v and v["task"] == "csd"))
+        gui._apply_preset()
+        assert gui.image_dir.get() == str(data / "Seis80")
+        assert gui.label_dir.get() == str(data / "CsdHorizon80")
+        assert gui.prompt.get() == "horizon"
+        assert ft.LABEL_MODES[gui.label_mode.get()] == "binary"
+        assert str(gui.layers_spin.cget("state")) == "disabled"
+
+        gui.preset.set(next(k for k, v in ft.PRESETS.items() if v and v["task"] == "facies"))
+        gui._apply_preset()
+        assert gui.label_dir.get() == str(data / "TauAtT80")
+        assert str(gui.layers_spin.cget("state")) == "normal"
+    finally:
+        root.destroy()

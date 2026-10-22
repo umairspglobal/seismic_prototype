@@ -184,6 +184,14 @@ def inspect_dataset(root: str | Path, sample: int = 120, seed: int = 0) -> dict:
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
             report["problems"].append(f"Quick Fine-Tuner cannot read the data: {exc}")
 
+    if "seis" in folders and "csd_mask" in folders:
+        try:
+            from finetuning.quick_data import list_pairs
+
+            report["finetuner_csd_pairs"] = len(list_pairs(folders["seis"], folders["csd_mask"]))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+            report["problems"].append(f"Quick Fine-Tuner cannot read the CSD labels: {exc}")
+
     rng = np.random.default_rng(seed)
     chosen = sorted(rng.choice(sorted(common), size=min(sample, len(common)), replace=False).tolist())
     report["stats"] = section_stats(root, folders, chosen)

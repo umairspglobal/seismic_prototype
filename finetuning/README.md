@@ -12,6 +12,9 @@ app's text-checkpoint list.
 - **Facies** uses `Seis75` as the image and stratigraphic layers cut from
   `TauAtT75` (relative geologic time), prompt `seismic facies`. There is no
   facies mask in `Seis75` itself.
+- **CSD: coarse-scale dips** uses `Seis75` as the image and `CsdHorizon75`
+  (horizon tracks) as a binary mask, prompt `horizon`. Generate that folder
+  with the synthetic generator's CSD preset.
 
 To train on synthetic data instead, generate a folder with
 [synthetic_generator](../synthetic_generator/README.md) and use its
@@ -19,8 +22,8 @@ To train on synthetic data instead, generate a folder with
 same `Seis75` / `Fault75` / `TauAtT75` folders.
 
 In the app, pick the new folder under Fine-tuned checkpoint and press Detect.
-The button runs the prompt that model was trained with (`fault` or
-`seismic facies`). Point clicks still use the official tracker.
+The button runs the prompt that model was trained with (`fault`,
+`seismic facies`, or `horizon`). Point clicks still use the official tracker.
 
 The ViT backbone and text encoder stay frozen (the last few ViT blocks can
 be unfrozen). The default is 30 epochs on the 2,000-section cap, on the

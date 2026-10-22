@@ -2,7 +2,7 @@
 
     python -m finetuning.finetune_gui        (or double-click start_finetune_gui.cmd)
 
-Pick a preset (faults / facies), check the folders, name the model and press
+Pick a preset (faults / facies / coarse-scale dips), check the folders, name the model and press
 Start. Training runs in a child process; its log is shown underneath with
 progress, metrics, a loss chart and validation previews alongside.
 """
@@ -27,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from finetuning.presets import PRESETS, dataset_suffix, folders_for  # noqa: E402
 from finetuning.quick_data import list_pairs  # noqa: E402
 
 DEFAULT_DATA_ROOT = Path(r"C:\Users\umair_tariq\Downloads\Downloads\Data\training_10_7_26")
@@ -34,15 +35,6 @@ DEFAULT_OUTPUT_ROOT = REPO_ROOT / "finetuned_checkpoints"
 SETTINGS_FILE = REPO_ROOT / "outputs" / "finetune_gui_settings.json"
 EVENT_PREFIX = "@@"
 
-PRESETS = {
-    "Faults  (Seis75 + Fault75)": {
-        "image": "Seis75", "label": "Fault75", "mode": "binary", "prompt": "fault", "name": "faults",
-    },
-    "Facies  (Seis75 + layers from TauAtT75)": {
-        "image": "Seis75", "label": "TauAtT75", "mode": "rgt_layers", "prompt": "seismic facies", "name": "facies",
-    },
-    "Custom": None,
-}
 LABEL_MODES = {
     "Binary mask (values 0/1)": "binary",
     "Layers from relative geologic time": "rgt_layers",
@@ -955,8 +947,9 @@ class FinetuneGUI:
         if not preset:
             return
         root = Path(self.data_root.get())
-        self.image_dir.set(str(root / preset["image"]))
-        self.label_dir.set(str(root / preset["label"]))
+        image, label = folders_for(preset, dataset_suffix(root))
+        self.image_dir.set(str(root / image))
+        self.label_dir.set(str(root / label))
         self.label_mode.set(next(k for k, v in LABEL_MODES.items() if v == preset["mode"]))
         self.prompt.set(preset["prompt"])
         self.model_name.set(f"{preset['name']}_{datetime.now():%Y%m%d_%H%M}")

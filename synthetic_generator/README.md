@@ -19,7 +19,8 @@ python -m synthetic_generator.cli --help           # command line
    press **Generate dataset**. A block is one geological model, written as
    6 slices x 4 bandpass replicas = 24 ids.
 4. **Send to Quick Fine-Tuner** writes the fine-tuner's settings
-   (`Seis75` + `Fault75` for faults, or `Seis75` + layers from `TauAtT75` for facies)
+   (`Seis75` + `Fault75` for faults, `Seis75` + layers from `TauAtT75` for facies,
+   or `Seis75` + `CsdHorizon75` for coarse-scale dips)
    and opens it with this folder selected.
 
 Disk use: 15 arrays x 24 ids x 401 KB = about 145 MB per block (float64). 400 blocks
@@ -125,11 +126,13 @@ on 400 sampled ids each (default preset, seed 7):
 SAM 3 takes a 3-channel image, but nothing has to be projected: only `Seis` is an
 image. The Quick Fine-Tuner reads one `Seis` section, percentile-clips it to gray
 (2-98%), feeds it as R = G = B and trains against `Fault` (binary mask, prompt
-`fault`) or against layers cut from `TauAtT` (prompt `seismic facies`). The dip,
-straddle, weight and halo arrays are supervision signals for a custom loss (dip
-regression, weighting, fault proximity) and are ignored by the fine-tuner. The
-**SAM 3 input** preview shows exactly this, plus the 2.5D option (previous / current /
-next slice in R / G / B, as the app does for 3D volumes) and a 2 x 2 training mosaic.
+`fault`), against layers cut from `TauAtT` (prompt `seismic facies`), or against
+`CsdHorizon` (binary horizon tracks, prompt `horizon`) when the CSD preset wrote
+that folder. The dip, straddle, weight and halo arrays, and the CSD dip prompt
+and distance map, are supervision signals for a custom loss and are ignored by
+the fine-tuner. The **SAM 3 input** preview shows exactly this, plus the 2.5D
+option (previous / current / next slice in R / G / B, as the app does for 3D
+volumes) and a 2 x 2 training mosaic.
 
 ## GUI
 

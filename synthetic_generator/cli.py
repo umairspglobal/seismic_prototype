@@ -102,6 +102,8 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         print(f"  ids present in every folder: {report.get('common_ids', 0)}")
         if "finetuner_pairs" in report:
             print(f"  Quick Fine-Tuner pairs (Seis/Fault): {report['finetuner_pairs']}")
+        if "finetuner_csd_pairs" in report:
+            print(f"  Quick Fine-Tuner pairs (Seis/CsdHorizon): {report['finetuner_csd_pairs']}")
         if "replicas_share_labels" in report:
             print(f"  labels repeated across replicas: {report['replicas_share_labels']}")
         for note in report.get("notes", []):

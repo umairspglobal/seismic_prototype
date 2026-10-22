@@ -312,6 +312,8 @@ def view_grid(view: str, cfg: GeneratorConfig) -> tuple[int, int, float]:
         return cfg.grid.n_replicas, 1, 0.9
     if view == "csd":
         return 6, max(1, len(cfg.grid.scales)), 0.0
+    if view == "sam3":
+        return 3, 3 if cfg.csd.enabled else 2, 0.0
     return 3, 2, 0.0
 
 
@@ -432,8 +434,17 @@ def render_view(block: Block, cfg: GeneratorConfig, view: str, replica: int = 0,
                  "Seis"),
             Tile(f"Facies target ({facies_layers} layers)", facies, layers.astype(float),
                  "TauAtT -> rgt_layers, prompt: seismic facies", "facies"),
-            Tile("2x2 training mosaic", mosaic, None, "sections tiled like the fine-tuner", "mosaic"),
         ]
+        if cfg.csd.enabled and block.csd is not None:
+            horizon = block.csd[s][("csd_mask", None)]
+            tiles.append(Tile(
+                "CSD target: horizon tracks",
+                overlay(gray_rgb, horizon, (0, 255, 255), 0.85),
+                horizon,
+                "CsdHorizon, prompt: horizon",
+                "CsdHorizon",
+            ))
+        tiles.append(Tile("2x2 training mosaic", mosaic, None, "sections tiled like the fine-tuner", "mosaic"))
         return grid(tiles, 3, tile, head + "  |  what the Quick Fine-Tuner trains on")
 
     if view == "csd":

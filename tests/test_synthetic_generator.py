@@ -57,6 +57,51 @@ def test_default_and_csd_presets():
     assert not back.csd.enabled and back.csd.count == (2, 2)
 
 
+def test_finetune_presets_match_generator_folders():
+    from finetuning.presets import PRESETS as FT
+    from finetuning.presets import folders_for
+    from synthetic_generator.block import products
+
+    suffix = GeneratorConfig().output.suffix
+    live = {v["task"]: (k, v) for k, v in FT.items() if v}
+    assert list(live) == ["faults", "facies", "csd"]
+    assert list(FT)[-1] == "Custom" and FT["Custom"] is None
+
+    expected = {
+        "faults": ("fault", "binary", "fault"),
+        "facies": ("tau", "rgt_layers", "seismic facies"),
+        "csd": ("csd_mask", "binary", "horizon"),
+    }
+    for task, (kind, mode, prompt) in expected.items():
+        key, spec = live[task]
+        image, label = Product("seis").folder(suffix), Product(kind).folder(suffix)
+        assert spec["image"] == image and spec["label"] == label
+        assert spec["mode"] == mode and spec["prompt"] == prompt
+        assert image in key and label in key
+        assert folders_for(spec, "80") == (Product("seis").folder("80"), Product(kind).folder("80"))
+
+    noisy = {p.folder(suffix) for p in products(preset("Noisy field-like data"))}
+    assert live["faults"][1]["image"] in noisy and live["faults"][1]["label"] in noisy
+    assert live["facies"][1]["label"] in noisy
+    faults_only = {p.folder(suffix) for p in products(preset("Faults only (Seis + Fault folders)"))}
+    assert faults_only == {live["faults"][1]["image"], live["faults"][1]["label"]}
+    csd_names = {p.folder(suffix) for p in products(preset("CSD: horizon tracks + dip prompts"))}
+    assert live["csd"][1]["image"] in csd_names and live["csd"][1]["label"] in csd_names
+    assert live["faults"][1]["label"] not in csd_names and live["facies"][1]["label"] not in csd_names
+
+
+def test_dataset_suffix_follows_the_generator(tmp_path):
+    from finetuning.presets import DEFAULT_SUFFIX, dataset_suffix
+
+    assert dataset_suffix(tmp_path / "missing") == DEFAULT_SUFFIX
+    (tmp_path / "Seis80").mkdir()
+    assert dataset_suffix(tmp_path) == "80"
+    (tmp_path / "Seis75").mkdir()
+    assert dataset_suffix(tmp_path) == DEFAULT_SUFFIX
+    (tmp_path / "generator_config.json").write_text(json.dumps({"output": {"suffix": "80"}}), encoding="utf-8")
+    assert dataset_suffix(tmp_path) == "80"
+
+
 def test_config_round_trip_and_coercion(tmp_path):
     cfg = small_config()
     cfg.seismic.centers = [0.05, 0.1]
@@ -385,6 +430,7 @@ def test_csd_folders_are_written_and_inspected(tmp_path):
     assert folders == ["CsdDipXscale12_75", "CsdDipXscale6_75", "CsdDistance75", "CsdHorizon75", "Fault75", "Seis75"]
     rep = inspect_dataset(tmp_path, sample=6)
     assert {"csd_mask", "csd_dist", "csd_dip6", "csd_dip12"} <= set(rep["folders"]) and not rep["problems"]
+    assert rep["finetuner_csd_pairs"] == 6
     data = read_block_from_disk(tmp_path, cfg, 0, 0)
     assert np.array_equal(data[Product("csd_mask")][0], data[Product("csd_mask")][1])
 
@@ -549,6 +595,10 @@ def test_overview_shows_csd_when_enabled():
     assert [i.label for i in with_csd] == [
         "Seis", "dip S=6", "weight S=6", "CsdDipXscale6", "CsdHorizon", "CsdDistance",
     ]
+    _, sam_off = render_view(block, small_config(), "sam3", tile=96)
+    assert "CsdHorizon" not in [i.label for i in sam_off]
+    _, sam_on = render_view(block, cfg, "sam3", tile=96)
+    assert [i.label for i in sam_on].count("CsdHorizon") == 1
 
 
 def _tk_root():
@@ -589,6 +639,9 @@ def test_gui_builds_and_reads_settings(monkeypatch, tmp_path):
         tabs = [gui.notebook.tab(t, "text") for t in gui.notebook.tabs()]
         assert tabs == ["Dataset", "Structure", "Faults", "Seismic", "Realism", "Labels", "CSD (In-Progress)",
                         "Data Viewer"]
+        menu = gui.root.nametowidget(gui.ft_btn["menu"])
+        labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
+        assert labels == [spec["menu"] for spec in gui_mod.FINETUNE_PRESETS.values() if spec]
         gui.vars["csd.enabled"].set(True)
         gui.vars["csd.connector"].set("step")
         cfg, errors = gui.read_config()
@@ -637,7 +690,7 @@ def test_send_to_finetuner_writes_its_settings(monkeypatch, tmp_path):
     launched = []
     monkeypatch.setattr(gui_mod.subprocess, "Popen", lambda *a, **k: launched.append(a[0]))
     data = tmp_path / "data"
-    for name in ("Seis75", "Fault75", "TauAtT75"):
+    for name in ("Seis75", "Fault75", "TauAtT75", "CsdHorizon75"):
         (data / name).mkdir(parents=True)
     try:
         root.withdraw()
@@ -650,6 +703,17 @@ def test_send_to_finetuner_writes_its_settings(monkeypatch, tmp_path):
         gui.send_to_finetuner("facies")
         saved = json.loads((tmp_path / "ft.json").read_text(encoding="utf-8"))
         assert saved["label_dir"] == str(data / "TauAtT75") and ft.LABEL_MODES[saved["label_mode"]] == "rgt_layers"
+        gui.send_to_finetuner("csd")
+        saved = json.loads((tmp_path / "ft.json").read_text(encoding="utf-8"))
+        assert saved["image_dir"] == str(data / "Seis75") and saved["label_dir"] == str(data / "CsdHorizon75")
+        assert ft.PRESETS[saved["preset"]]["task"] == "csd" and saved["prompt"] == "horizon"
+        assert ft.LABEL_MODES[saved["label_mode"]] == "binary"
+        gui.vars["output.suffix"].set("80")
+        for name in ("Seis80", "CsdHorizon80"):
+            (data / name).mkdir()
+        gui.send_to_finetuner("csd")
+        saved = json.loads((tmp_path / "ft.json").read_text(encoding="utf-8"))
+        assert saved["image_dir"] == str(data / "Seis80") and saved["label_dir"] == str(data / "CsdHorizon80")
         assert launched and launched[0][1:] == ["-m", "finetuning.finetune_gui"]
     finally:
         if "gui" in locals():

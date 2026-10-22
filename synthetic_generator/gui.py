@@ -34,6 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 from PIL import Image, ImageTk  # noqa: E402
 
+from finetuning.presets import PRESETS as FINETUNE_PRESETS, folders_for  # noqa: E402
 from synthetic_generator import __version__  # noqa: E402
 from synthetic_generator.block import Block, block_csd, block_streams, generate_block, products  # noqa: E402
 from synthetic_generator.config import (ARRAY_KINDS, DEFAULT_PRESET, PRESETS, GeneratorConfig,  # noqa: E402
@@ -572,7 +573,8 @@ class GeneratorGUI:
         notes = (
             "A horizon is one reflector (one tau level). Its track follows the folds, steps down by the throw "
             "where it crosses a fault and then continues.\n"
-            "CsdHorizon: 1 on the tracked horizons (the target mask).\n"
+            "CsdHorizon: 1 on the tracked horizons (the target mask). The Quick Fine-Tuner coarse-scale dips "
+            "preset trains on this folder with the text prompt horizon.\n"
             "CsdDipXscaleS: the prompt - dipXscaleS on the horizon pixels, the background value elsewhere.\n"
             "CsdDistance: distance in px to the nearest horizon pixel.\n"
             "Open the CSD preview view to see them laid out per scale."
@@ -691,12 +693,15 @@ class GeneratorGUI:
         ttk.Button(tools, text="Inspect", style="Tool.TButton", command=self.inspect).pack(side="left", padx=4)
         self.ft_btn = ttk.Menubutton(tools, text="Send to Quick Fine-Tuner", style="Tool.TMenubutton")
         menu = tk.Menu(self.ft_btn, tearoff=0, bg=FIELD, fg=FG, activebackground=ACCENT, activeforeground="#fff")
-        menu.add_command(label="Faults model (Seis + Fault)", command=lambda: self.send_to_finetuner("faults"))
-        menu.add_command(label="Facies model (Seis + layers from TauAtT)",
-                         command=lambda: self.send_to_finetuner("facies"))
+        for spec in FINETUNE_PRESETS.values():
+            if not spec:
+                continue
+            task = spec["task"]
+            menu.add_command(label=spec["menu"], command=lambda t=task: self.send_to_finetuner(t))
         self.ft_btn["menu"] = menu
         self.ft_btn.pack(side="left")
-        Tooltip(self.ft_btn, "Points the Quick Fine-Tuner at this folder (Seis/Fault or Seis/TauAtT) and opens it.")
+        Tooltip(self.ft_btn, "Points the Quick Fine-Tuner at this folder (faults, facies, or coarse-scale dips) "
+                             "and opens it.")
         self.button_rows = (buttons, tools)
         status = ttk.Frame(card, style="Card.TFrame")
         status.grid(row=7, column=0, columnspan=4, sticky="ew")
@@ -1532,6 +1537,8 @@ class GeneratorGUI:
                   + (f", image {rep['image_size']}x{rep['image_size']}" if "image_size" in rep else ""), "info")
         if "finetuner_pairs" in rep:
             self._log(f"Quick Fine-Tuner sees {rep['finetuner_pairs']:,} Seis/Fault pairs.", "ok")
+        if "finetuner_csd_pairs" in rep:
+            self._log(f"Quick Fine-Tuner sees {rep['finetuner_csd_pairs']:,} Seis/CsdHorizon pairs.", "ok")
         if "replicas_share_labels" in rep:
             self._log(f"Labels repeated across replicas: {rep['replicas_share_labels']}", "muted")
         st = rep.get("stats", {})
@@ -1543,16 +1550,20 @@ class GeneratorGUI:
 
     def send_to_finetuner(self, mode: str) -> None:
         cfg, _ = self.read_config()
+        spec = next((v for v in FINETUNE_PRESETS.values() if v and v["task"] == mode), None)
+        if spec is None:
+            messagebox.showerror("Quick Fine-Tuner", f"Unknown preset {mode!r}.", parent=self.root)
+            return
+
         root = Path(cfg.output.out_dir)
-        sfx = cfg.output.suffix
-        image = root / f"Seis{sfx}"
-        label = root / (f"Fault{sfx}" if mode == "faults" else f"TauAtT{sfx}")
+        image_name, label_name = folders_for(spec, cfg.output.suffix)
+        image, label = root / image_name, root / label_name
         if not image.is_dir() or not label.is_dir():
             messagebox.showinfo("Quick Fine-Tuner", f"Generate a dataset first: {image.name} and {label.name} are "
                                                     f"needed in\n{root}", parent=self.root)
             return
         try:
-            from finetuning.finetune_gui import LABEL_MODES, PRESETS as FT_PRESETS, SETTINGS_FILE as FT_SETTINGS
+            from finetuning.finetune_gui import LABEL_MODES, SETTINGS_FILE as FT_SETTINGS
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Quick Fine-Tuner", f"Cannot load the fine-tuner: {exc}", parent=self.root)
             return
@@ -1562,13 +1573,11 @@ class GeneratorGUI:
                 settings = json.loads(FT_SETTINGS.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 settings = {}
-        label_mode = "binary" if mode == "faults" else "rgt_layers"
-        preset_name = next((k for k, v in FT_PRESETS.items()
-                            if v and v["image"] == image.name and v["label"] == label.name), "Custom")
+        preset_name = next(k for k, v in FINETUNE_PRESETS.items() if v and v["task"] == mode)
         settings.update({
             "preset": preset_name, "data_root": str(root), "image_dir": str(image), "label_dir": str(label),
-            "label_mode": next(k for k, v in LABEL_MODES.items() if v == label_mode),
-            "prompt": "fault" if mode == "faults" else "seismic facies",
+            "label_mode": next(k for k, v in LABEL_MODES.items() if v == spec["mode"]),
+            "prompt": spec["prompt"],
         })
         FT_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
         FT_SETTINGS.write_text(json.dumps(settings, indent=2), encoding="utf-8")
