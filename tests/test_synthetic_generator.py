@@ -766,6 +766,15 @@ def test_scan_dataset_reads_array_folders_and_one_section_folder(tmp_path):
     over, _ = render_sample(cat, loaded, 2, "gray", True, 64)
     assert plain.tobytes() != over.tobytes()
     assert infos[0].label == "Seis" and np.allclose(infos[0].array, seis)
+    horizon = np.zeros((4, 4))
+    horizon[2, 1] = 1
+    _write_dat(root / "CsdHorizon75", 2, horizon)
+    cat = scan_dataset(root)
+    with_horizon = load_sample(cat, 2, {"seis"}, False, True)
+    assert with_horizon.horizon[2, 1] == 1 and len(with_horizon.sections) == 1
+    bare, _ = render_sample(cat, with_horizon, 2, "gray", False, 64)
+    lined, _ = render_sample(cat, with_horizon, 2, "gray", False, 64, True)
+    assert bare.tobytes() != lined.tobytes()
 
     broken = tmp_path / "broken"
     _write_dat(broken / "Seis75", 1, np.ones((4, 4)))
@@ -821,6 +830,40 @@ def test_scan_dataset_reads_array_folders_and_one_section_folder(tmp_path):
         scan_dataset(text)
 
 
+def test_overlay_tints_marks_and_leaves_the_rest_of_the_section(tmp_path):
+    from synthetic_generator.viewer import blend_overlay, load_sample, render_sample, scan_dataset
+
+    base = np.full((2, 2, 3), 40, np.uint8)
+    mask = np.zeros((2, 2))
+    mask[0, 0] = 1
+    tinted = blend_overlay(base, mask, (255, 0, 0), 0.4)
+    assert tuple(tinted[0, 0]) == (126, 24, 24)
+    assert tuple(tinted[1, 1]) == (40, 40, 40)
+    faint = blend_overlay(base, mask, (255, 0, 0), 0.2)
+    assert int(faint[0, 0, 0]) < int(tinted[0, 0, 0])
+    dip = np.zeros((2, 2))
+    dip[0, 1] = 5
+    dipped = blend_overlay(base, dip, (0, 0, 255), 1)
+    assert tuple(dipped[0, 1]) == (0, 0, 255)
+    assert tuple(dipped[0, 0]) == (40, 40, 40)
+
+    root = tmp_path / "set"
+    seis = np.linspace(-1, 1, 16).reshape(4, 4)
+    fault = np.zeros((4, 4))
+    fault[1, 1] = 1
+    _write_dat(root / "Seis75", 2, seis)
+    _write_dat(root / "Fault75", 2, fault)
+    _write_dat(root / "CsdHorizon75", 2, np.eye(4))
+    cat = scan_dataset(root)
+    loaded = load_sample(cat, 2, {"seis", "fault", "csd_mask"}, False, False)
+    solid, infos = render_sample(cat, loaded, 2, "gray", False, 64, stack=True, stack_opacity=1,
+                                  stack_colors={"fault": (255, 0, 0), "csd_mask": (0, 255, 255)})
+    light, _ = render_sample(cat, loaded, 2, "gray", False, 64, stack=True, stack_opacity=0.25,
+                              stack_colors={"fault": (255, 0, 0), "csd_mask": (0, 255, 255)})
+    assert len(infos) == 1 and np.allclose(infos[0].array, seis)
+    assert solid.tobytes() != light.tobytes()
+
+
 def test_load_sample_rejects_a_file_that_is_not_one_section(tmp_path, monkeypatch):
     import synthetic_generator.viewer as viewer
 
@@ -870,6 +913,15 @@ def test_data_viewer_tab_shows_a_folder(monkeypatch, tmp_path):
 
         gui._viewer_select("seis")
         assert [info.label for info in gui.preview_infos] == ["Seis"]
+        gui.viewer_checks["fault"].set(True)
+        gui.viewer_overlay.set(True)
+        root.update()
+        assert len(gui.preview_infos) == 1 and gui.preview_infos[0].label == "Seis"
+        assert "overlay 40%" in gui.info_text.get() and "Fault75" in gui.info_text.get()
+        assert gui.preview_infos[0].array[0, 0] == pytest.approx(-0.5)
+        gui.viewer_overlay.set(False)
+        gui._viewer_select("seis")
+        root.update()
         gui._save_settings()
         saved = json.loads((tmp_path / "gui.json").read_text(encoding="utf-8"))
         assert saved["viewer_dir"] == str(data) and saved["viewer_arrays"] == ["seis"] and saved["viewer_id"] == 1

@@ -44,8 +44,8 @@ from synthetic_generator.dataset import (CONFIG_NAME, DEFAULT_WRITE_BPS, auto_wo
                                          file_bytes, measure_write_bps, next_start_id, plan_blocks)
 from synthetic_generator.params import TABS, Param, all_params  # noqa: E402
 from synthetic_generator.preview import SEISMIC_CMAPS, VIEWS, TileInfo, fit_tile, render_view  # noqa: E402
-from synthetic_generator.viewer import (catalog_summary, default_keys, describe_id, fit_sample_tile,  # noqa: E402
-                                        load_sample, render_sample, scan_dataset, step_id)
+from synthetic_generator.viewer import (catalog_summary, default_keys, default_overlay_color, describe_id,  # noqa: E402
+                                        fit_sample_tile, load_sample, render_sample, scan_dataset, step_id)
 
 SETTINGS_FILE = REPO_ROOT / "outputs" / "synthetic_generator_gui.json"
 RUN_DIR = REPO_ROOT / "outputs" / "synthetic_generator"
@@ -416,6 +416,12 @@ class GeneratorGUI:
         self.viewer_id = tk.IntVar(value=0)
         self.viewer_cmap = tk.StringVar(value="gray")
         self.viewer_faults = tk.BooleanVar(value=True)
+        self.viewer_horizons = tk.BooleanVar(value=True)
+        self.viewer_overlay = tk.BooleanVar(value=False)
+        self.viewer_opacity = tk.DoubleVar(value=0.4)
+        self.viewer_opacity_text = tk.StringVar(value="40%")
+        self._overlay_colors: dict[str, tuple[int, int, int]] = {}
+        self._overlay_chip_sig: tuple | None = None
         self.viewer_status = tk.StringVar(value="Choose a folder, then press View.")
         self.viewer_place = tk.StringVar(value="")
         self.viewer_banner_text = tk.StringVar(value="")
@@ -649,8 +655,33 @@ class GeneratorGUI:
         self.viewer_fault_check = ttk.Checkbutton(row, text="Fault overlay", variable=self.viewer_faults)
         self.viewer_fault_check.pack(side="left")
         Tooltip(self.viewer_fault_check, "Draws the fault mask on the seismic section when that sample has a Fault file.")
-        for var in (self.viewer_id, self.viewer_cmap, self.viewer_faults):
+        self.viewer_horizon_check = ttk.Checkbutton(row, text="Horizon overlay", variable=self.viewer_horizons)
+        self.viewer_horizon_check.pack(side="left", padx=(12, 0))
+        Tooltip(self.viewer_horizon_check,
+                "Draws the CsdHorizon tracks in cyan on the seismic section. Those tracks are the coarse-scale-dip label.")
+        overlay_row = ttk.Frame(arrays, style="Card.TFrame")
+        overlay_row.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.viewer_overlay_check = ttk.Checkbutton(overlay_row, text="Overlay checked arrays",
+                                                    variable=self.viewer_overlay)
+        self.viewer_overlay_check.pack(side="left")
+        Tooltip(self.viewer_overlay_check,
+                "Paints the checked arrays on the seismic, each in its own color, so the section stays visible "
+                "underneath. The slider sets how solid those colors are. Click a color chip to change that array. "
+                "Fault overlay and Horizon overlay are included while those boxes are checked. A mask colors pixels "
+                "above 0.5. Dip colors the strong values and leaves the flat areas clear.")
+        ttk.Label(overlay_row, text="Opacity", style="Field.TLabel").pack(side="left", padx=(12, 4))
+        self.viewer_opacity_scale = ttk.Scale(overlay_row, from_=0.1, to=0.85, variable=self.viewer_opacity,
+                                              length=120)
+        self.viewer_opacity_scale.pack(side="left")
+        self.viewer_opacity_label = ttk.Label(overlay_row, textvariable=self.viewer_opacity_text, style="Hint.TLabel",
+                                              width=4)
+        self.viewer_opacity_label.pack(side="left", padx=(4, 0))
+        self.viewer_colors_frame = ttk.Frame(arrays, style="Card.TFrame")
+        self.viewer_colors_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        for var in (self.viewer_id, self.viewer_cmap, self.viewer_faults, self.viewer_horizons, self.viewer_overlay):
             var.trace_add("write", lambda *_: self._on_viewer_control())
+        self.viewer_opacity.trace_add("write", self._on_overlay_opacity)
+        self._refresh_overlay_chips()
 
     def _build_generate_card(self, parent) -> None:
         card = self._card(parent, "Generate dataset", pad=(14, 10))
@@ -1188,9 +1219,95 @@ class GeneratorGUI:
                 pass
         self._disk_after = self.root.after(delay, self._render_disk)
 
+    def _on_overlay_opacity(self, *_args) -> None:
+        try:
+            pct = int(round(float(self.viewer_opacity.get()) * 100))
+        except (tk.TclError, ValueError):
+            return
+        self.viewer_opacity_text.set(f"{pct}%")
+        self._schedule_disk(40)
+
+    def _color_for_key(self, key: str) -> tuple[int, int, int]:
+        saved = self._overlay_colors.get(key)
+        if saved is not None:
+            return saved
+        src = next((folder for folder in (self.catalog.arrays if self.catalog else []) if folder.key == key), None)
+        if src is None:
+            return default_overlay_color("fault")
+        return default_overlay_color(src.kind, src.scale)
+
+    def _overlay_targets(self) -> list:
+        """Arrays painted on top of the base image while Overlay is on."""
+        cat = self.catalog
+        if cat is None or not self.viewer_overlay.get():
+            return []
+        checked = [src for src in cat.arrays if self.viewer_checks.get(src.key) and self.viewer_checks[src.key].get()]
+        if not checked:
+            return []
+        base = next((src for src in checked if src.kind == "seis"), checked[0])
+        layers = [src for src in checked if src.key != base.key]
+        kinds = {src.kind for src in checked}
+        if self.viewer_faults.get() and "fault" not in kinds:
+            fault = next((src for src in cat.arrays if src.kind == "fault"), None)
+            if fault is not None:
+                layers.append(fault)
+        if self.viewer_horizons.get() and "csd_mask" not in kinds:
+            horizon = next((src for src in cat.arrays if src.kind == "csd_mask"), None)
+            if horizon is not None:
+                layers.append(horizon)
+        return layers
+
+    def _overlay_chip_signature(self) -> tuple:
+        if not self.viewer_overlay.get():
+            return ("off",)
+        return tuple((src.key, _rgb_hex(self._color_for_key(src.key))) for src in self._overlay_targets())
+
+    def _refresh_overlay_chips(self) -> None:
+        signature = self._overlay_chip_signature()
+        if signature == self._overlay_chip_sig:
+            return
+        self._overlay_chip_sig = signature
+        frame = self.viewer_colors_frame
+        for child in frame.winfo_children():
+            child.destroy()
+        on = bool(self.viewer_overlay.get())
+        self.viewer_opacity_scale.state(["!disabled"] if on else ["disabled"])
+        if not on:
+            ttk.Label(frame, text="Turn this on to paint the checked arrays on the seismic.",
+                      style="Hint.TLabel").grid(row=0, column=0, sticky="w")
+            return
+        layers = self._overlay_targets()
+        if not layers:
+            ttk.Label(frame, text="Check another array to lay it on the seismic.",
+                      style="Hint.TLabel").grid(row=0, column=0, sticky="w")
+            return
+        for i, src in enumerate(layers):
+            color = _rgb_hex(self._color_for_key(src.key))
+            btn = tk.Button(frame, bg=color, activebackground=color, width=2, relief="flat", cursor="hand2",
+                            command=lambda key=src.key: self._pick_overlay_color(key))
+            btn.grid(row=i // 2, column=(i % 2) * 2, sticky="w", padx=(0, 4), pady=1)
+            ttk.Label(frame, text=src.name, style="Hint.TLabel").grid(
+                row=i // 2, column=(i % 2) * 2 + 1, sticky="w", padx=(0, 12))
+
+    def _pick_overlay_color(self, key: str) -> None:
+        from tkinter import colorchooser
+
+        chosen = colorchooser.askcolor(color=_rgb_hex(self._color_for_key(key)), parent=self.root,
+                                       title="Overlay color")
+        if not chosen or not chosen[1]:
+            return
+        rgb = _hex_rgb(chosen[1])
+        if rgb is None:
+            return
+        self._overlay_colors[key] = rgb
+        self._overlay_chip_sig = None
+        self._refresh_overlay_chips()
+        self._schedule_disk(1)
+
     def _on_viewer_control(self, *_args) -> None:
         if self._viewer_loading or not self._disk_mode or self._closing:
             return
+        self._refresh_overlay_chips()
         self._render_disk()
 
     def _set_viewer_status(self, text: str, error: bool = False) -> None:
@@ -1230,7 +1347,11 @@ class GeneratorGUI:
             self._fill_viewer_checks(catalog)
             self._set_viewer_status(catalog_summary(catalog), error=not catalog.arrays)
             has_fault = any(folder.kind == "fault" for folder in catalog.arrays)
+            has_horizon = any(folder.kind == "csd_mask" for folder in catalog.arrays)
             self.viewer_fault_check.configure(state="normal" if has_fault else "disabled")
+            self.viewer_horizon_check.configure(state="normal" if has_horizon else "disabled")
+            self._overlay_chip_sig = None
+            self._refresh_overlay_chips()
             if catalog.ids:
                 lo, hi = catalog.ids[0], catalog.ids[-1]
                 self.viewer_spin.configure(from_=lo, to=hi)
@@ -1274,30 +1395,46 @@ class GeneratorGUI:
         self.viewer_place.set(place)
         self.viewer_banner_text.set(f"{place}    {cat.root}")
         overlay_fault = bool(self.viewer_faults.get()) and any(folder.kind == "fault" for folder in cat.arrays)
-        sample = load_sample(cat, sid, keys, overlay_fault)
+        overlay_horizon = bool(self.viewer_horizons.get()) and any(folder.kind == "csd_mask" for folder in cat.arrays)
+        sample = load_sample(cat, sid, keys, overlay_fault, overlay_horizon)
         if not sample.sections:
             detail = sample.errors[0] if sample.errors else f"No section files for id {sid} in the selected arrays."
             self._show_canvas_message(detail)
             self.preview_status.set(detail)
             return
         cw, ch = max(self.canvas.winfo_width(), 200), max(self.canvas.winfo_height(), 200)
-        tile = fit_sample_tile(len(sample.sections), cw - 8, ch - 8)
+        stack = bool(self.viewer_overlay.get())
+        tile = fit_sample_tile(1 if stack else len(sample.sections), cw - 8, ch - 8)
         cmap = self.viewer_cmap.get()
         if cmap not in SEISMIC_CMAPS:
             cmap = "gray"
-        image, infos = render_sample(cat, sample, sid, cmap, bool(self.viewer_faults.get()), tile)
+        colors = {src.key: self._color_for_key(src.key) for src in cat.arrays} if stack else None
+        try:
+            opacity = float(self.viewer_opacity.get())
+        except (tk.TclError, ValueError):
+            opacity = 0.4
+        image, infos = render_sample(cat, sample, sid, cmap, bool(self.viewer_faults.get()), tile,
+                                      show_horizons=bool(self.viewer_horizons.get()), stack=stack,
+                                      stack_opacity=opacity, stack_colors=colors)
         parts = []
         seis = next((arr for src, arr in sample.sections if src.kind == "seis"), None)
         if seis is not None and seis.size:
             parts.append(f"seismic  min {seis.min():.4g}  max {seis.max():.4g}  mean {seis.mean():.4g}")
         if sample.fault is not None and self.viewer_faults.get():
             parts.append(f"fault pixels {float((sample.fault > 0.5).mean()) * 100:.2f}%")
+        if sample.horizon is not None and self.viewer_horizons.get():
+            parts.append(f"horizon pixels {float((sample.horizon > 0.5).mean()) * 100:.2f}%")
+        if stack:
+            names = [src.name for src in self._overlay_targets()]
+            listed = ", ".join(names) if names else "nothing else checked"
+            parts.append(f"overlay {int(round(opacity * 100))}%: {listed}")
         if cat.shape:
             parts.append(f"{cat.shape[0]} x {cat.shape[1]}")
         if sample.errors:
             parts.append(sample.errors[0])
         n = len(sample.sections)
-        self._show_image(image, infos, f"{n} array" + ("s" if n != 1 else ""), "   |   ".join(parts))
+        status = "overlay" if stack else f"{n} array" + ("s" if n != 1 else "")
+        self._show_image(image, infos, status, "   |   ".join(parts))
 
     def _view_folder(self) -> None:
         path_text = self.viewer_dir.get().strip()
@@ -1718,6 +1855,10 @@ class GeneratorGUI:
             "faults": bool(self.faults_var.get()), "layers": self._int(self.layers_var, 8),
             "viewer_dir": self.viewer_dir.get(), "viewer_id": self._int(self.viewer_id, 0),
             "viewer_cmap": self.viewer_cmap.get(), "viewer_faults": bool(self.viewer_faults.get()),
+            "viewer_horizons": bool(self.viewer_horizons.get()),
+            "viewer_overlay": bool(self.viewer_overlay.get()),
+            "viewer_overlay_opacity": float(self.viewer_opacity.get()),
+            "viewer_overlay_colors": {key: _rgb_hex(color) for key, color in self._overlay_colors.items()},
             "viewer_arrays": ([key for key, var in self.viewer_checks.items() if var.get()]
                               if self.viewer_checks else self._saved_viewer_arrays),
         }
@@ -1764,6 +1905,23 @@ class GeneratorGUI:
             self.viewer_cmap.set(data["viewer_cmap"])
         if isinstance(data.get("viewer_faults"), bool):
             self.viewer_faults.set(data["viewer_faults"])
+        if isinstance(data.get("viewer_horizons"), bool):
+            self.viewer_horizons.set(data["viewer_horizons"])
+        if isinstance(data.get("viewer_overlay"), bool):
+            self.viewer_overlay.set(data["viewer_overlay"])
+        opacity = data.get("viewer_overlay_opacity")
+        if isinstance(opacity, (int, float)) and not isinstance(opacity, bool):
+            self.viewer_opacity.set(float(min(0.85, max(0.1, opacity))))
+        saved_colors = data.get("viewer_overlay_colors")
+        if isinstance(saved_colors, dict):
+            parsed: dict[str, tuple[int, int, int]] = {}
+            for key, value in saved_colors.items():
+                rgb = _hex_rgb(str(value))
+                if rgb is not None:
+                    parsed[str(key)] = rgb
+            self._overlay_colors = parsed
+            self._overlay_chip_sig = None
+        self._refresh_overlay_chips()
         self._write_config(cfg)
         self._dark_titlebar()
         self._log("Ready. Preview block k is exactly dataset block k for the same seed. The Data Viewer tab opens a "
@@ -1844,6 +2002,20 @@ class ZoomWindow:
         col = min(W - 1, max(0, int(event.x / self.size[0] * W)))
         row = min(H - 1, max(0, int(event.y / self.size[1] * H)))
         self.text.set(f"{self.label}   x={col}  y={row}   value = {self.array[row, col]:.5f}")
+
+
+def _rgb_hex(color: tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*(int(channel) for channel in color))
+
+
+def _hex_rgb(text: str) -> tuple[int, int, int] | None:
+    text = text.strip().lstrip("#")
+    if len(text) != 6:
+        return None
+    try:
+        return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
 
 
 def _fmt(value) -> str:

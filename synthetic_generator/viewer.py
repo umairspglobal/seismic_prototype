@@ -21,7 +21,7 @@ from PIL import Image
 
 from .block import FOLDER_PREFIX, KIND_TITLES, SCALED_KINDS, Product
 from .dataset import CONFIG_NAME
-from .preview import Tile, TileInfo, array_rgb, colorize, grid, overlay, seismic_rgb
+from .preview import HORIZON_RGB, Tile, TileInfo, array_rgb, colorize, grid, overlay, seismic_rgb
 
 # One section, not a volume. 64 MB is a square of about 2896 float64 samples.
 MAX_SECTION_BYTES = 64 * 1024 * 1024
@@ -88,6 +88,7 @@ class LoadedSample:
     sections: list[tuple[ArrayFolder, np.ndarray]]
     fault: np.ndarray | None
     errors: list[str]
+    horizon: np.ndarray | None = None
 
 
 def _parse_folder_name(name: str) -> tuple[str, int | None] | None:
@@ -356,14 +357,17 @@ def read_section_file(path: Path) -> np.ndarray:
     return read_square(path)
 
 
-def load_sample(catalog: Catalog, sid: int, keys: set[str], overlay_fault: bool) -> LoadedSample:
-    """Read the selected arrays for one id. The fault array is included when an overlay is requested."""
+def load_sample(catalog: Catalog, sid: int, keys: set[str], overlay_fault: bool,
+                overlay_horizon: bool = False) -> LoadedSample:
+    """Read the selected arrays for one id. Fault and horizon masks are included when an overlay is requested."""
     sections: list[tuple[ArrayFolder, np.ndarray]] = []
     fault = None
+    horizon = None
     errors: list[str] = []
     for src in catalog.arrays:
         wanted = src.key in keys
-        if not wanted and not (overlay_fault and src.kind == "fault"):
+        extra = (overlay_fault and src.kind == "fault") or (overlay_horizon and src.kind == "csd_mask")
+        if not wanted and not extra:
             continue
         path = src.files.get(sid)
         if path is None:
@@ -377,9 +381,11 @@ def load_sample(catalog: Catalog, sid: int, keys: set[str], overlay_fault: bool)
             continue
         if src.kind == "fault":
             fault = arr
+        elif src.kind == "csd_mask":
+            horizon = arr
         if wanted:
             sections.append((src, arr))
-    return LoadedSample(sections, fault, errors)
+    return LoadedSample(sections, fault, errors, horizon)
 
 
 def _finite(values: np.ndarray) -> np.ndarray:
@@ -423,6 +429,77 @@ def _cols(n: int) -> int:
     return 5
 
 
+# One color per array kind. A second scale of the same kind steps along the list.
+OVERLAY_PALETTE = (
+    (255, 64, 64),
+    (0, 220, 220),
+    (251, 191, 36),
+    (251, 146, 60),
+    (244, 114, 182),
+    (167, 139, 250),
+    (52, 211, 153),
+    (96, 165, 250),
+    (248, 113, 113),
+    (250, 204, 21),
+    (45, 212, 191),
+    (196, 181, 253),
+)
+_KIND_COLOR = {
+    "fault": 0, "csd_mask": 1, "dip": 2, "csd_dip": 3, "straddle": 4,
+    "halo": 5, "weight": 6, "tau": 7, "csd_dist": 8,
+}
+
+
+def default_overlay_color(kind: str, scale: int | None = None) -> tuple[int, int, int]:
+    """Stable color for an array. Two scales of one kind land on different colors."""
+    index = _KIND_COLOR.get(kind, 9)
+    if scale is not None:
+        index += 1 + int(scale) // 24
+    return OVERLAY_PALETTE[index % len(OVERLAY_PALETTE)]
+
+
+def overlay_alpha(values: np.ndarray) -> np.ndarray:
+    """How strongly each pixel should take the overlay color, from 0 to 1.
+
+    A mask colors the pixels above one half. A continuous field such as dip colors
+    the strong values and leaves the near-zero pixels clear.
+    """
+    finite = np.nan_to_num(np.asarray(values, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if finite.size == 0:
+        return finite
+    lo = float(finite.min())
+    hi = float(finite.max())
+    if hi <= lo:
+        if abs(hi) < 1e-8:
+            fill = 0.0
+        elif -1e-6 <= hi <= 1.0 + 1e-6:
+            fill = 1.0 if hi > 0.5 else 0.0
+        else:
+            fill = 1.0
+        return np.full(finite.shape, fill, dtype=np.float32)
+    if -1e-6 <= lo and hi <= 1.0 + 1e-6 and np.unique(np.round(finite, 3)).size <= 4:
+        return (finite > 0.5).astype(np.float32)
+    if -1e-6 <= lo and hi <= 1.0 + 1e-6:
+        return np.clip(finite, 0.0, 1.0)
+    peak = float(np.percentile(np.abs(finite), 99))
+    if peak <= 1e-8:
+        return np.zeros(finite.shape, dtype=np.float32)
+    return np.clip(np.abs(finite) / peak, 0.0, 1.0)
+
+
+def blend_overlay(rgb: np.ndarray, values: np.ndarray, color: tuple[int, int, int], opacity: float) -> np.ndarray:
+    """Tint ``rgb`` with ``color``. ``opacity`` is the strength on a fully marked pixel."""
+    if values.shape != rgb.shape[:2]:
+        return rgb
+    amount = float(np.clip(opacity, 0.0, 1.0)) * overlay_alpha(values)
+    if not float(amount.max()):
+        return rgb
+    alpha = amount[..., None]
+    tint = np.array(color, dtype=np.float32)
+    out = rgb.astype(np.float32) * (1.0 - alpha) + tint * alpha
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
 def fit_sample_tile(n: int, width: int, height: int, gap: int = 10) -> int:
     """Largest tile so ``n`` sections fit in ``width x height`` pixels."""
     n = max(1, n)
@@ -433,10 +510,52 @@ def fit_sample_tile(n: int, width: int, height: int, gap: int = 10) -> int:
     return int(max(48, min(tw, th)))
 
 
+def _stack_color(src: ArrayFolder, colors: dict[str, tuple[int, int, int]] | None) -> tuple[int, int, int]:
+    if colors is not None and src.key in colors:
+        return tuple(int(c) for c in colors[src.key])
+    return default_overlay_color(src.kind, src.scale)
+
+
 def render_sample(catalog: Catalog, sample: LoadedSample, sid: int, cmap: str, show_faults: bool,
-                  tile: int) -> tuple[Image.Image, list[TileInfo]]:
-    """Draw the loaded sections. A fault overlay is painted on seismic tiles; the readout array stays the amplitude."""
+                  tile: int, show_horizons: bool = False, stack: bool = False, stack_opacity: float = 0.4,
+                  stack_colors: dict[str, tuple[int, int, int]] | None = None) -> tuple[Image.Image, list[TileInfo]]:
+    """Draw the loaded sections. The readout array stays the amplitude under any tint.
+
+    ``stack`` paints every section on the seismic (or the first array) at ``stack_opacity``.
+    Otherwise each array is its own tile, with the fault and horizon masks painted on seismic.
+    """
     fault = sample.fault
+    horizon = sample.horizon
+    title = f"{describe_id(catalog.layout, sid)}  |  {catalog.root.name}"
+    if stack and sample.sections:
+        base_i = next((i for i, (src, _) in enumerate(sample.sections) if src.kind == "seis"), 0)
+        base_src, base_arr = sample.sections[base_i]
+        rgb = paint_section(base_src, base_arr, cmap)
+        label = base_src.zoom_label
+        if base_src.kind == "section" and _looks_seismic(_finite(base_arr)):
+            label = "Seis"
+        names: list[str] = []
+        seen = {src.kind for src, _ in sample.sections}
+        for i, (src, arr) in enumerate(sample.sections):
+            if i == base_i:
+                continue
+            rgb = blend_overlay(rgb, arr, _stack_color(src, stack_colors), stack_opacity)
+            names.append(src.name)
+        if show_horizons and horizon is not None and "csd_mask" not in seen and horizon.shape == base_arr.shape:
+            color = (stack_colors or {}).get("csd_mask", default_overlay_color("csd_mask"))
+            rgb = blend_overlay(rgb, horizon, color, stack_opacity)
+            names.append("CsdHorizon")
+        if show_faults and fault is not None and "fault" not in seen and fault.shape == base_arr.shape:
+            color = (stack_colors or {}).get("fault", default_overlay_color("fault"))
+            rgb = blend_overlay(rgb, fault, color, stack_opacity)
+            names.append("Fault")
+        pct = int(round(float(np.clip(stack_opacity, 0.0, 1.0)) * 100))
+        subtitle = f"overlay {pct}%"
+        if names:
+            subtitle += "  |  " + ", ".join(names)
+        subtitle += "  |  " + _range_text(base_arr)
+        return grid([Tile(base_src.name, rgb, base_arr, subtitle, label)], 1, tile, title)
+
     tiles: list[Tile] = []
     for src, arr in sample.sections:
         rgb = paint_section(src, arr, cmap)
@@ -444,9 +563,14 @@ def render_sample(catalog: Catalog, sample: LoadedSample, sid: int, cmap: str, s
         label = src.zoom_label
         if src.kind == "section" and _looks_seismic(_finite(arr)):
             label = "Seis"
+        notes: list[str] = []
+        if show_horizons and src.kind == "seis" and horizon is not None and horizon.shape == arr.shape:
+            rgb = overlay(rgb, horizon, HORIZON_RGB, 0.85)
+            notes.append("horizon overlay")
         if show_faults and src.kind == "seis" and fault is not None and fault.shape == arr.shape:
             rgb = overlay(rgb, fault)
-            subtitle = "fault overlay  |  " + subtitle
+            notes.append("fault overlay")
+        if notes:
+            subtitle = "  |  ".join(notes) + "  |  " + subtitle
         tiles.append(Tile(src.name, rgb, arr, subtitle, label))
-    title = f"{describe_id(catalog.layout, sid)}  |  {catalog.root.name}"
     return grid(tiles, _cols(len(tiles)), tile, title)
